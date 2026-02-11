@@ -295,7 +295,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
             ),
           // Annotation overlay (when active)
           if (widget.annotationService.enabled)
-            _AnnotationOverlay(service: widget.annotationService),
+            _AnnotationOverlay(
+              service: widget.annotationService,
+              onAnnotationSubmitted: _sendToAgent,
+            ),
           // Text message overlay — kept in tree to preserve state across dismiss
           if (_textOverlayEverShown)
             _TextMessageOverlay(
@@ -531,9 +534,13 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
 
 /// Annotation overlay: allows drawing rectangles and typing labels.
 class _AnnotationOverlay extends StatefulWidget {
-  const _AnnotationOverlay({required this.service});
+  const _AnnotationOverlay({
+    required this.service,
+    required this.onAnnotationSubmitted,
+  });
 
   final AnnotationService service;
+  final VoidCallback onAnnotationSubmitted;
 
   @override
   State<_AnnotationOverlay> createState() => _AnnotationOverlayState();
@@ -572,7 +579,22 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
             child: Listener(
               behavior: HitTestBehavior.opaque,
               onPointerDown: (event) {
-                widget.service.startDrawing(event.position);
+                final tappedExisting =
+                    widget.service.startDrawing(event.position);
+                if (tappedExisting) {
+                  final idx = widget.service.editingIndex;
+                  if (idx != null) {
+                    _textController.text =
+                        widget.service.annotations[idx].text;
+                    _textController.selection = TextSelection(
+                      baseOffset: 0,
+                      extentOffset: _textController.text.length,
+                    );
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      _textFocusNode.requestFocus();
+                    });
+                  }
+                }
               },
               onPointerMove: (event) {
                 widget.service.updateDrawing(event.position);
@@ -594,12 +616,13 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
                   dragCurrent: widget.service.dragCurrent,
                   pendingRect: widget.service.pendingRect,
                   drawState: widget.service.drawState,
+                  editingIndex: widget.service.editingIndex,
                 ),
                 size: Size.infinite,
               ),
             ),
           ),
-          // Text input field when editing
+          // Text input field when creating a new annotation
           if (widget.service.drawState == AnnotationDrawState.editing &&
               widget.service.pendingRect != null)
             Builder(
@@ -607,6 +630,21 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
                 final screenSize = MediaQuery.of(context).size;
                 return _buildTextField(
                   widget.service.pendingRect!,
+                  screenSize,
+                );
+              },
+            ),
+          // Text input field when editing an existing annotation
+          if (widget.service.drawState ==
+                  AnnotationDrawState.editingExisting &&
+              widget.service.editingIndex != null)
+            Builder(
+              builder: (context) {
+                final screenSize = MediaQuery.of(context).size;
+                final annotation = widget.service
+                    .annotations[widget.service.editingIndex!];
+                return _buildEditTextField(
+                  annotation.bounds,
                   screenSize,
                 );
               },
@@ -665,6 +703,66 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
             backgroundCursorColor: const Color(0xFF333333),
             onSubmitted: (text) {
               widget.service.submitAnnotationText(text);
+              widget.onAnnotationSubmitted();
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEditTextField(Rect rect, Size screenSize) {
+    const fieldHeight = 28.0;
+    const gap = 4.0;
+    final fieldWidth = rect.width.clamp(120.0, 400.0);
+
+    var top = rect.bottom + gap;
+    if (top + fieldHeight > screenSize.height) {
+      top = rect.top - fieldHeight - gap;
+    }
+    top = top.clamp(0.0, screenSize.height - fieldHeight);
+
+    var left = rect.left;
+    if (left + fieldWidth > screenSize.width) {
+      left = screenSize.width - fieldWidth;
+    }
+    if (left < 0) left = 0;
+
+    return Positioned(
+      left: left,
+      top: top,
+      width: fieldWidth,
+      height: fieldHeight,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: const Color(0xFF1A1A2E),
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(
+            color: const Color(0xFFFF6600),
+            width: 1,
+          ),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x66000000),
+              blurRadius: 4,
+              offset: Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          child: EditableText(
+            controller: _textController,
+            focusNode: _textFocusNode,
+            style: const TextStyle(
+              color: Color(0xFFE0E0E0),
+              fontSize: 13,
+            ),
+            cursorColor: const Color(0xFFFF6600),
+            backgroundCursorColor: const Color(0xFF333333),
+            onSubmitted: (text) {
+              widget.service.submitEditedAnnotationText(text);
+              widget.onAnnotationSubmitted();
             },
           ),
         ),

@@ -12,6 +12,7 @@ class AnnotationPainter extends CustomPainter {
     this.dragCurrent,
     this.pendingRect,
     required this.drawState,
+    this.editingIndex,
   });
 
   final List<Annotation> annotations;
@@ -19,6 +20,7 @@ class AnnotationPainter extends CustomPainter {
   final Offset? dragCurrent;
   final Rect? pendingRect;
   final AnnotationDrawState drawState;
+  final int? editingIndex;
 
   static const _annotationFill = Color(0x22FF6600);
   static const _annotationBorder = Color(0xCCFF6600);
@@ -31,8 +33,12 @@ class AnnotationPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     // Draw completed annotations
-    for (final annotation in annotations) {
-      _drawAnnotation(canvas, annotation);
+    for (var i = 0; i < annotations.length; i++) {
+      if (i == editingIndex) {
+        _drawEditingRect(canvas, annotations[i].bounds);
+      } else {
+        _drawAnnotation(canvas, annotations[i]);
+      }
     }
 
     // Draw the drag rectangle while drawing
@@ -132,6 +138,7 @@ class AnnotationPainter extends CustomPainter {
         oldDelegate.dragStart != dragStart ||
         oldDelegate.dragCurrent != dragCurrent ||
         oldDelegate.pendingRect != pendingRect ||
-        oldDelegate.drawState != drawState;
+        oldDelegate.drawState != drawState ||
+        oldDelegate.editingIndex != editingIndex;
   }
 }

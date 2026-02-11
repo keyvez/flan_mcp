@@ -46,6 +46,9 @@ enum AnnotationDrawState {
 
   /// Rectangle is drawn, text field is visible for labeling.
   editing,
+
+  /// An existing annotation is selected for editing its text.
+  editingExisting,
 }
 
 /// Minimum annotation box dimension in pixels.
@@ -64,12 +67,16 @@ class AnnotationService extends ChangeNotifier {
   Offset? _dragCurrent;
   Rect? _pendingRect;
 
+  // Editing existing annotation state
+  int? _editingIndex;
+
   bool get enabled => _enabled;
   AnnotationDrawState get drawState => _drawState;
   List<Annotation> get annotations => List.unmodifiable(_annotations);
   Rect? get pendingRect => _pendingRect;
   Offset? get dragStart => _dragStart;
   Offset? get dragCurrent => _dragCurrent;
+  int? get editingIndex => _editingIndex;
 
   void enable() {
     _enabled = true;
@@ -90,12 +97,27 @@ class AnnotationService extends ChangeNotifier {
   }
 
   /// Called when the user starts dragging to draw a rectangle.
-  void startDrawing(Offset position) {
-    if (!_enabled || _drawState == AnnotationDrawState.editing) return;
+  /// Returns true if an existing annotation was tapped for editing.
+  bool startDrawing(Offset position) {
+    if (!_enabled) return false;
+    if (_drawState == AnnotationDrawState.editing ||
+        _drawState == AnnotationDrawState.editingExisting) return false;
+
+    // Check if the tap is on an existing annotation (last drawn = top)
+    for (var i = _annotations.length - 1; i >= 0; i--) {
+      if (_annotations[i].bounds.contains(position)) {
+        _editingIndex = i;
+        _drawState = AnnotationDrawState.editingExisting;
+        notifyListeners();
+        return true;
+      }
+    }
+
     _drawState = AnnotationDrawState.drawing;
     _dragStart = position;
     _dragCurrent = position;
     notifyListeners();
+    return false;
   }
 
   /// Called as the user drags to update the rectangle.
@@ -108,6 +130,9 @@ class AnnotationService extends ChangeNotifier {
   /// Called when the user finishes dragging. If the rectangle is large
   /// enough, transitions to the editing state for text input.
   void finishDrawing() {
+    // Don't interfere with editing an existing annotation
+    if (_drawState == AnnotationDrawState.editingExisting) return;
+
     if (_drawState != AnnotationDrawState.drawing ||
         _dragStart == null ||
         _dragCurrent == null) {
@@ -142,8 +167,27 @@ class AnnotationService extends ChangeNotifier {
     _resetDrawing();
   }
 
+  /// Submits updated text for the annotation being edited.
+  void submitEditedAnnotationText(String text) {
+    if (_drawState != AnnotationDrawState.editingExisting ||
+        _editingIndex == null) {
+      return;
+    }
+    if (text.isEmpty) {
+      // Empty text deletes the annotation
+      _annotations.removeAt(_editingIndex!);
+    } else {
+      _annotations[_editingIndex!] =
+          _annotations[_editingIndex!].copyWith(text: text);
+    }
+    _editingIndex = null;
+    _drawState = AnnotationDrawState.normal;
+    notifyListeners();
+  }
+
   /// Cancels the current editing state without creating an annotation.
   void cancelEditing() {
+    _editingIndex = null;
     _resetDrawing();
   }
 
