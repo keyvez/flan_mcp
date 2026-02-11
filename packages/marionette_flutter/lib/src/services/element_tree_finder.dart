@@ -9,6 +9,15 @@ class ElementTreeFinder {
 
   final MarionetteConfiguration configuration;
 
+  /// Properties worth keeping from debugFillProperties (small, useful).
+  static const _keepProps = {
+    'tooltip',
+    'enabled',
+    'data',
+    'labelText',
+    'hintText',
+  };
+
   /// Returns a list of interactive elements from the current widget tree.
   List<Map<String, dynamic>> findInteractiveElements() {
     final elements = <Map<String, dynamic>>[];
@@ -61,18 +70,20 @@ class ElementTreeFinder {
       return null;
     }
 
+    final data = <String, Object>{};
+
+    // Only extract a small set of useful diagnostic properties
     final properties = DiagnosticPropertiesBuilder();
     widget.debugFillProperties(properties);
-    final data = Map<String, Object>.fromEntries(
-      properties.properties
-          .where((p) =>
-              p.runtimeType != DiagnosticsProperty &&
-              p.name != null &&
-              p.value != null)
-          .map(
-            (p) => MapEntry(p.name!, p.value.toString()),
-          ),
-    );
+    for (final p in properties.properties) {
+      if (p.name != null && p.value != null && _keepProps.contains(p.name)) {
+        final val = p.value.toString();
+        // Skip very long values (closures, complex objects)
+        if (val.length <= 120) {
+          data[p.name!] = val;
+        }
+      }
+    }
 
     data['type'] = widget.runtimeType.toString();
 

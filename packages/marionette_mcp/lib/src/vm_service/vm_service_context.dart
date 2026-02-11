@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 import 'package:logging/logging.dart' as logging;
 import 'package:marionette_mcp/src/vm_service/vm_service_connector.dart';
 import 'package:mcp_dart/mcp_dart.dart';
@@ -80,26 +78,85 @@ final class VmServiceContext {
       ..registerTool(
         'get_interactive_elements',
         description:
-            'Returns a list of all interactive elements currently visible in the Flutter app UI tree. Each element includes its type, text content (if any), key (if any), and other identifying properties. This is useful for understanding what can be interacted with in the app. Requires an active connection established via connect.',
+            'Returns interactive elements visible in the Flutter app UI tree. '
+            'Each element includes type, text, key, bounds, and visibility. '
+            'Use the filter parameters to reduce output. '
+            'Requires an active connection via connect.',
         annotations: const ToolAnnotations(
           title: 'Get Interactive Elements',
           readOnlyHint: true,
           idempotentHint: true,
         ),
-        inputSchema: const ToolInputSchema(properties: {}),
+        inputSchema: ToolInputSchema(
+          properties: {
+            'types': JsonSchema.string(
+              description:
+                  'Comma-separated widget types to include '
+                  '(e.g. "TextField,IconButton,ElevatedButton"). '
+                  'If omitted, all interactive elements are returned.',
+            ),
+            'with_keys_only': JsonSchema.boolean(
+              description:
+                  'If true, only return elements that have a ValueKey.',
+            ),
+            'text_contains': JsonSchema.string(
+              description:
+                  'Only return elements whose text contains this substring '
+                  '(case-insensitive).',
+            ),
+          },
+        ),
         callback: (args, extra) async {
           _logger.info('Getting interactive elements');
 
           try {
             final response = await connector.getInteractiveElements();
-            final elements = response['elements'] as List<dynamic>;
+            var elements =
+                (response['elements'] as List<dynamic>)
+                    .cast<Map<String, dynamic>>();
 
-            // Format the elements nicely
+            // Apply filters
+            final typesFilter = args['types'] as String?;
+            final withKeysOnly = args['with_keys_only'] as bool? ?? false;
+            final textContains = args['text_contains'] as String?;
+
+            if (typesFilter != null && typesFilter.isNotEmpty) {
+              final allowed =
+                  typesFilter.split(',').map((t) => t.trim()).toSet();
+              elements =
+                  elements
+                      .where(
+                        (e) =>
+                            e['type'] != null &&
+                            allowed.contains(e['type'] as String),
+                      )
+                      .toList();
+            }
+
+            if (withKeysOnly) {
+              elements =
+                  elements
+                      .where(
+                        (e) => e['key'] != null && (e['key'] as String) != '',
+                      )
+                      .toList();
+            }
+
+            if (textContains != null && textContains.isNotEmpty) {
+              final needle = textContains.toLowerCase();
+              elements =
+                  elements.where((e) {
+                    final t = e['text'] as String?;
+                    return t != null && t.toLowerCase().contains(needle);
+                  }).toList();
+            }
+
+            // Format compact
             final buffer = StringBuffer()
-              ..writeln('Found ${elements.length} interactive element(s):\n');
+              ..writeln('Found ${elements.length} element(s):\n');
 
             for (final element in elements) {
-              buffer.writeln(_formatElement(element as Map<String, dynamic>));
+              buffer.writeln(_formatElement(element));
             }
 
             return CallToolResult(
@@ -377,6 +434,51 @@ final class VmServiceContext {
             );
           }
         },
+      )
+      // Hot restart
+      ..registerTool(
+        'hot_restart',
+        description:
+            'Performs a hot restart of the Flutter app. Unlike hot reload, '
+            'this fully restarts the app, resetting all state. Use this when '
+            'hot reload is insufficient (e.g. after changing initializers, '
+            'adding new fields, or modifying main()). '
+            'Requires an active connection established via connect.',
+        annotations: const ToolAnnotations(title: 'Hot Restart'),
+        inputSchema: const ToolInputSchema(properties: {}),
+        callback: (args, extra) async {
+          _logger.info('Performing hot restart');
+
+          try {
+            final restarted = await connector.hotRestart();
+
+            if (restarted) {
+              return CallToolResult(
+                content: [
+                  const TextContent(
+                    text: 'Hot restart completed successfully',
+                  ),
+                ],
+              );
+            } else {
+              return CallToolResult(
+                isError: true,
+                content: [
+                  TextContent(
+                    text:
+                        'Hot restart failed. The app may need a full restart.',
+                  ),
+                ],
+              );
+            }
+          } catch (err) {
+            _logger.warning('Failed to perform hot restart', err);
+            return CallToolResult(
+              isError: true,
+              content: [TextContent(text: 'Hot restart failed: $err')],
+            );
+          }
+        },
       );
   }
 
@@ -400,48 +502,40 @@ final class VmServiceContext {
     return matcher;
   }
 
-  /// Formats an element for display.
+  /// Formats an element compactly for display.
   String _formatElement(Map<String, dynamic> element) {
-    final buffer = StringBuffer();
+    final parts = <String>[];
 
-    // Element type
-    if (element['type'] != null) {
-      buffer.write('Type: ${element['type']}');
+    final type = element['type'];
+    if (type != null) parts.add(type as String);
+
+    final key = element['key'];
+    if (key != null) parts.add('key="$key"');
+
+    final text = element['text'];
+    if (text != null && text != '') parts.add('text="$text"');
+
+    final tooltip = element['tooltip'];
+    if (tooltip != null && tooltip != '') parts.add('tooltip="$tooltip"');
+
+    final enabled = element['enabled'];
+    if (enabled != null && enabled != 'true') parts.add('enabled=$enabled');
+
+    final data = element['data'];
+    if (data != null && data != '' && text == null) parts.add('data="$data"');
+
+    final bounds = element['bounds'];
+    if (bounds != null && bounds is Map) {
+      final x = (bounds['x'] as num).round();
+      final y = (bounds['y'] as num).round();
+      final w = (bounds['width'] as num).round();
+      final h = (bounds['height'] as num).round();
+      parts.add('@($x,$y ${w}x$h)');
     }
 
-    // Key
-    if (element['key'] != null) {
-      buffer.write(', Key: "${element['key']}"');
-    }
+    final visible = element['visible'];
+    if (visible == false) parts.add('HIDDEN');
 
-    // Text content
-    if (element['text'] != null && element['text'] != '') {
-      buffer.write(', Text: "${element['text']}"');
-    }
-
-    // Additional properties
-    final additionalProps = <String>[];
-    element.forEach((key, value) {
-      if (key != 'type' && key != 'key' && key != 'text' && value != null) {
-        additionalProps.add('$key: ${_formatValue(value)}');
-      }
-    });
-
-    if (additionalProps.isNotEmpty) {
-      buffer.write(', ${additionalProps.join(', ')}');
-    }
-
-    return buffer.toString();
-  }
-
-  /// Formats a value for display.
-  String _formatValue(dynamic value) {
-    if (value is String) {
-      return '"$value"';
-    }
-    if (value is Map || value is List) {
-      return jsonEncode(value);
-    }
-    return value.toString();
+    return parts.join(' | ');
   }
 }

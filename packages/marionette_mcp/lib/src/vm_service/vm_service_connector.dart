@@ -275,6 +275,50 @@ class VmServiceConnector {
     }
   }
 
+  /// Performs a hot restart of the Flutter app (full state reset).
+  ///
+  /// Returns true if the restart was successful.
+  /// Throws [NotConnectedException] if not connected.
+  Future<bool> hotRestart() async {
+    _ensureConnected();
+
+    _logger.info('Performing hot restart');
+
+    try {
+      // Hot restart uses reloadSources with pause=false, but the actual
+      // restart is done via the Flutter daemon's 'hotRestart' registered
+      // service method, or by calling reloadSources with force=true.
+      final method = await waitForServiceRegistration('hotRestart');
+      if (method != null) {
+        final result = await _service!.callMethod(
+          method,
+          isolateId: _isolateId!,
+        );
+        _logger.fine('Hot restart completed: result=${result.json}');
+        // After restart, we need to re-find the isolate since it changes
+        _isolateId = await _findIsolateWithMarionetteExtensions();
+        return result.json?['type'] == 'Success';
+      } else {
+        // Fallback: call reloadSources with force compile
+        final report = await _service!.reloadSources(
+          _isolateId!,
+          force: true,
+        );
+        _logger.fine('Hot restart (forced reload): success=${report.success}');
+        return report.success ?? false;
+      }
+    } catch (err) {
+      _logger.severe('Hot restart failed', err);
+      // After restart, isolate ID may have changed, try to re-find
+      try {
+        _isolateId = await _findIsolateWithMarionetteExtensions();
+      } catch (_) {
+        // Ignore if re-find fails
+      }
+      rethrow;
+    }
+  }
+
   /// Finds the first isolate that has the marionette extensions.
   ///
   /// Throws an exception if no suitable isolate is found.
