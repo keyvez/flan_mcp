@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:logging/logging.dart';
-import 'package:marionette_flutter/marionette_flutter.dart';
+import 'package:flan_flutter/flan_flutter.dart';
 
 void main() {
-  MarionetteBinding.ensureInitialized();
+  FlanBinding.ensureInitialized();
 
   Logger.root.level = Level.ALL;
   Logger.root.onRecord.listen((record) {
@@ -23,22 +24,17 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Flutter Demo',
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
+        colorScheme: const ColorScheme(
+          brightness: Brightness.light,
+          primary: Colors.black,
+          onPrimary: Colors.white,
+          secondary: Colors.black54,
+          onSecondary: Colors.white,
+          error: Colors.black,
+          onError: Colors.white,
+          surface: Colors.white,
+          onSurface: Colors.black,
+        ),
       ),
       home: const MyHomePage(title: 'Flutter Demo Home Page'),
     );
@@ -67,16 +63,21 @@ class _MyHomePageState extends State<MyHomePage> {
   final _logger = Logger('MyHomePage');
 
   int _counter = 0;
+  int _direction = 1; // 1 = up (increment), -1 = down (decrement)
 
   void _incrementCounter() {
     _logger.info('Incrementing counter, from $_counter');
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
+      _direction = 1;
       _counter++;
+    });
+  }
+
+  void _decrementCounter() {
+    _logger.info('Decrementing counter, from $_counter');
+    setState(() {
+      _direction = -1;
+      _counter--;
     });
   }
 
@@ -88,12 +89,20 @@ class _MyHomePageState extends State<MyHomePage> {
     // The Flutter framework has been optimized to make rerunning build methods
     // fast, so that you can just rebuild anything that needs updating rather
     // than having to individually change instances of widgets.
-    return Scaffold(
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.arrowUp): _incrementCounter,
+        const SingleActivator(LogicalKeyboardKey.arrowDown): _decrementCounter,
+      },
+      child: Focus(
+        autofocus: true,
+        child: Scaffold(
       appBar: AppBar(
         // TRY THIS: Try changing the color here to a specific color (to
         // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
         // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
         // Here we take the value from the MyHomePage object that was created by
         // the App.build method, and use it to set our appbar title.
         title: Text(widget.title),
@@ -117,19 +126,91 @@ class _MyHomePageState extends State<MyHomePage> {
           // wireframe for each widget.
           mainAxisAlignment: .center,
           children: [
-            const Text('You have pushed the button this many times:'),
             Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+              'You have pushed the button this many times:',
+              style: TextStyle(
+                fontFamily: 'Georgia',
+                fontSize: 28,
+              ),
+            ),
+            ClipRect(
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 300),
+                transitionBuilder: (child, animation) {
+                  final isIncoming = child.key == ValueKey<int>(_counter);
+                  // Tape/odometer effect: both numbers slide together.
+                  // AnimatedSwitcher runs animation 0→1 for incoming,
+                  // and 1→0 (reverse) for outgoing.
+                  //
+                  // Increment (_direction=1): tape moves upward
+                  //   - incoming: begins below (+1), slides to center (0)
+                  //   - outgoing: animation reverses, so Tween(+1→0)
+                  //     plays as 0→+1, but we want it to go 0→-1 (up).
+                  //     So outgoing uses Tween(-1→0), reversed = 0→-1.
+                  final tween = isIncoming
+                      ? Tween<Offset>(
+                          begin: Offset(0, _direction.toDouble()),
+                          end: Offset.zero,
+                        )
+                      : Tween<Offset>(
+                          begin: Offset(0, -_direction.toDouble()),
+                          end: Offset.zero,
+                        );
+                  final curvedAnimation = CurvedAnimation(
+                    parent: animation,
+                    curve: Curves.easeInOut,
+                  );
+                  // Color transition: incoming fades from grey to black,
+                  // outgoing fades from black to grey.
+                  final colorTween = isIncoming
+                      ? ColorTween(
+                          begin: Colors.grey,
+                          end: Colors.black,
+                        )
+                      : ColorTween(
+                          begin: Colors.grey,
+                          end: Colors.black,
+                        );
+                  return SlideTransition(
+                    position: tween.animate(curvedAnimation),
+                    child: AnimatedBuilder(
+                      animation: curvedAnimation,
+                      builder: (context, child) {
+                        return DefaultTextStyle.merge(
+                          style: TextStyle(
+                            color: colorTween.evaluate(curvedAnimation),
+                          ),
+                          child: child!,
+                        );
+                      },
+                      child: child,
+                    ),
+                  );
+                },
+                child: Text(
+                  '$_counter',
+                  key: ValueKey<int>(_counter),
+                  style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                        fontSize: (Theme.of(context)
+                                    .textTheme
+                                    .headlineMedium
+                                    ?.fontSize ??
+                                28) *
+                            4,
+                      ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 24),
+            FloatingActionButton(
+              onPressed: _incrementCounter,
+              tooltip: 'Increment',
+              child: const Icon(Icons.add),
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ),
+    )),
     );
   }
 }

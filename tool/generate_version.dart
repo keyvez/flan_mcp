@@ -6,23 +6,23 @@ import 'package:yaml/yaml.dart';
 
 void main() {
   // Paths to the pubspec.yaml files
-  final mcpPubspecPath = 'packages/marionette_mcp/pubspec.yaml';
-  final flutterPubspecPath = 'packages/marionette_flutter/pubspec.yaml';
-  final outputPath = 'packages/marionette_mcp/lib/src/version.g.dart';
+  final mcpPubspecPath = 'packages/flan_mcp/pubspec.yaml';
+  final flutterPubspecPath = 'packages/flan_flutter/pubspec.yaml';
+  final outputPath = 'packages/flan_mcp/lib/src/version.g.dart';
 
   // Read and parse versions
   final mcpVersion = extractVersion(mcpPubspecPath);
   final flutterVersion = extractVersion(flutterPubspecPath);
 
-  print('marionette_mcp version: $mcpVersion');
-  print('marionette_flutter version: $flutterVersion');
+  print('flan_mcp version: $mcpVersion');
+  print('flan_flutter version: $flutterVersion');
 
   // Check if versions match
   if (mcpVersion != flutterVersion) {
     stderr.writeln(
       'ERROR: Version mismatch!\n'
-      '  marionette_mcp: $mcpVersion\n'
-      '  marionette_flutter: $flutterVersion\n'
+      '  flan_mcp: $mcpVersion\n'
+      '  flan_flutter: $flutterVersion\n'
       'Both packages must have the same version.',
     );
     exit(1);

@@ -1,0 +1,574 @@
+import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart'
+    hide InspectorSelection;
+import 'package:flan_flutter/src/binding/flan_configuration.dart';
+import 'package:flan_flutter/src/overlay/flan_overlay_widget.dart';
+import 'package:flan_flutter/src/services/annotation_service.dart';
+import 'package:flan_flutter/src/services/element_tree_finder.dart';
+import 'package:flan_flutter/src/services/gesture_dispatcher.dart';
+import 'package:flan_flutter/src/services/inspector_service.dart';
+import 'package:flan_flutter/src/services/log_collector.dart';
+import 'package:flan_flutter/src/services/user_message_service.dart';
+import 'package:flan_flutter/src/services/screenshot_service.dart';
+import 'package:flan_flutter/src/services/scroll_simulator.dart';
+import 'package:flan_flutter/src/services/text_input_simulator.dart';
+import 'package:flan_flutter/src/services/widget_finder.dart';
+import 'package:flan_flutter/src/services/widget_matcher.dart';
+
+/// A custom binding that extends Flutter's default binding to provide
+/// integration points for the Flan MCP.
+class FlanBinding extends WidgetsFlutterBinding {
+  /// Creates and initializes the binding with the given configuration.
+  ///
+  /// Returns the singleton instance of [FlanBinding].
+  static FlanBinding ensureInitialized([
+    FlanConfiguration configuration = const FlanConfiguration(),
+  ]) {
+    if (_instance == null) {
+      FlanBinding._(configuration);
+    }
+    return instance;
+  }
+
+  /// The singleton instance of [FlanBinding].
+  static FlanBinding get instance => BindingBase.checkInstance(_instance);
+  static FlanBinding? _instance;
+
+  FlanBinding._(this.configuration);
+
+  /// Configuration for the Flan extensions.
+  final FlanConfiguration configuration;
+
+  // Service instances
+  late final ElementTreeFinder _elementTreeFinder;
+  late final GestureDispatcher _gestureDispatcher;
+  late final LogCollector _logCollector;
+  late final ScreenshotService _screenshotService;
+  late final ScrollSimulator _scrollSimulator;
+  late final TextInputSimulator _textInputSimulator;
+  late final WidgetFinder _widgetFinder;
+  late final InspectorService _inspectorService;
+  late final AnnotationService _annotationService;
+  late final UserMessageService _userMessageService;
+
+  @override
+  void initInstances() {
+    super.initInstances();
+    _instance = this;
+
+    // Initialize services
+    _widgetFinder = WidgetFinder();
+    _elementTreeFinder = ElementTreeFinder(configuration);
+    _gestureDispatcher = GestureDispatcher();
+    _logCollector = LogCollector();
+    _screenshotService = ScreenshotService(
+      maxScreenshotSize: configuration.maxScreenshotSize,
+    );
+    _scrollSimulator = ScrollSimulator(_gestureDispatcher, _widgetFinder);
+    _textInputSimulator = TextInputSimulator(_widgetFinder);
+    _inspectorService = InspectorService();
+    _annotationService = AnnotationService();
+    _userMessageService = UserMessageService();
+
+    // Initialize log collection
+    _logCollector.initialize();
+  }
+
+  @override
+  Widget wrapWithDefaultView(Widget rootWidget) {
+    return super.wrapWithDefaultView(
+      FlanOverlayWidget(
+        inspectorService: _inspectorService,
+        annotationService: _annotationService,
+        userMessageService: _userMessageService,
+        child: rootWidget,
+      ),
+    );
+  }
+
+  @override
+  void initServiceExtensions() {
+    super.initServiceExtensions();
+
+    // Extension: Get interactive elements tree
+    registerServiceExtension(
+      name: 'flan.interactiveElements',
+      callback: (params) async {
+        try {
+          final elements = _elementTreeFinder.findInteractiveElements();
+          return <String, dynamic>{'status': 'Success', 'elements': elements};
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    // Extension: Tap element by matcher
+    registerServiceExtension(
+      name: 'flan.tap',
+      callback: (params) async {
+        try {
+          final matcher = WidgetMatcher.fromJson(params);
+          await _gestureDispatcher.tap(matcher, _widgetFinder, configuration);
+
+          return <String, dynamic>{
+            'status': 'Success',
+            'message': 'Tapped element matching: ${matcher.toJson()}',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    // Extension: Enter text into a text field
+    registerServiceExtension(
+      name: 'flan.enterText',
+      callback: (params) async {
+        try {
+          final matcher = WidgetMatcher.fromJson(params);
+          final input = params['input'];
+
+          if (input == null) {
+            return <String, dynamic>{
+              'status': 'Error',
+              'error': 'Missing required parameter: input',
+            };
+          }
+
+          await _textInputSimulator.enterText(matcher, input, configuration);
+
+          return <String, dynamic>{
+            'status': 'Success',
+            'message':
+                'Entered text into element matching: ${matcher.toJson()}',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    // Extension: Scroll until widget is visible
+    registerServiceExtension(
+      name: 'flan.scrollTo',
+      callback: (params) async {
+        try {
+          final matcher = WidgetMatcher.fromJson(params);
+
+          await _scrollSimulator.scrollUntilVisible(matcher, configuration);
+
+          return <String, dynamic>{
+            'status': 'Success',
+            'message': 'Scrolled to element matching: ${matcher.toJson()}',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    // Extension: Get logs
+    registerServiceExtension(
+      name: 'flan.getLogs',
+      callback: (params) async {
+        try {
+          final logs = _logCollector.getFormattedLogs();
+
+          return <String, dynamic>{
+            'status': 'Success',
+            'logs': logs,
+            'count': logs.length,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    // Extension: Take screenshots
+    registerServiceExtension(
+      name: 'flan.takeScreenshots',
+      callback: (params) async {
+        try {
+          final screenshots = await _screenshotService.takeScreenshots();
+
+          return <String, dynamic>{
+            'status': 'Success',
+            'screenshots': screenshots,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    // --- Inspector extensions ---
+
+    registerServiceExtension(
+      name: 'flan.inspectorEnable',
+      callback: (params) async {
+        try {
+          // Disable annotation mode if active (mutually exclusive)
+          if (_annotationService.enabled) {
+            _annotationService.disable();
+          }
+          _inspectorService.enable();
+          return <String, dynamic>{
+            'status': 'Success',
+            'message': 'Inspector mode enabled',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.inspectorDisable',
+      callback: (params) async {
+        try {
+          _inspectorService.disable();
+          return <String, dynamic>{
+            'status': 'Success',
+            'message': 'Inspector mode disabled',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.inspectorGetSelection',
+      callback: (params) async {
+        try {
+          final selection = _inspectorService.lastSelection;
+          return <String, dynamic>{
+            'status': 'Success',
+            'selection': selection?.toJson(),
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.inspectorCycleElement',
+      callback: (params) async {
+        try {
+          _inspectorService.cycleNextElement();
+          final highlight = _inspectorService.currentHighlight;
+          return <String, dynamic>{
+            'status': 'Success',
+            'currentElement': highlight?.widgetType,
+            'elementCount': _inspectorService.elementsAtPoint.length,
+            'currentIndex': _inspectorService.currentElementIndex,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.inspectorSelectAt',
+      callback: (params) async {
+        try {
+          final x = (params['x'] as num).toDouble();
+          final y = (params['y'] as num).toDouble();
+          final selection = _inspectorService.inspectAt(x, y);
+          return <String, dynamic>{
+            'status': 'Success',
+            'selection': selection?.toJson(),
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    // --- Annotation extensions ---
+
+    registerServiceExtension(
+      name: 'flan.annotationEnable',
+      callback: (params) async {
+        try {
+          // Disable inspector mode if active (mutually exclusive)
+          if (_inspectorService.enabled) {
+            _inspectorService.disable();
+          }
+          _annotationService.enable();
+          return <String, dynamic>{
+            'status': 'Success',
+            'message': 'Annotation mode enabled',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.annotationDisable',
+      callback: (params) async {
+        try {
+          _annotationService.disable();
+          return <String, dynamic>{
+            'status': 'Success',
+            'message': 'Annotation mode disabled',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.annotationGetAll',
+      callback: (params) async {
+        try {
+          final annotations = _annotationService.getAnnotationsData();
+          return <String, dynamic>{
+            'status': 'Success',
+            'annotations': annotations,
+            'count': annotations.length,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.annotationClear',
+      callback: (params) async {
+        try {
+          _annotationService.clearAnnotations();
+          return <String, dynamic>{
+            'status': 'Success',
+            'message': 'All annotations cleared',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.annotationRemove',
+      callback: (params) async {
+        try {
+          final id = params['id'] as String;
+          final removed = _annotationService.removeAnnotationById(id);
+          if (!removed) {
+            return <String, dynamic>{
+              'status': 'Error',
+              'error': 'Annotation with id "$id" not found',
+            };
+          }
+          return <String, dynamic>{
+            'status': 'Success',
+            'message': 'Annotation "$id" removed',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    // --- User message extensions ---
+
+    registerServiceExtension(
+      name: 'flan.sendToAgent',
+      callback: (params) async {
+        try {
+          final message = <String, dynamic>{};
+          if (params.containsKey('text')) {
+            message['text'] = params['text'];
+          }
+          if (params.containsKey('type')) {
+            message['type'] = params['type'];
+          }
+          if (params.containsKey('data')) {
+            message['data'] = params['data'];
+          }
+          _userMessageService.sendMessage(message);
+          return <String, dynamic>{
+            'status': 'Success',
+            'message': 'Message queued for agent',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.consumeUserMessages',
+      callback: (params) async {
+        try {
+          final messages = _userMessageService.consumeMessages();
+          return <String, dynamic>{
+            'status': 'Success',
+            'messages': messages,
+            'count': messages.length,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.peekUserMessages',
+      callback: (params) async {
+        try {
+          final messages = _userMessageService.peekMessages();
+          return <String, dynamic>{
+            'status': 'Success',
+            'count': messages.length,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.setAgentListening',
+      callback: (params) async {
+        try {
+          final listening = params['listening'] == 'true' ||
+              params['listening'] == true;
+          _userMessageService.isAgentListening = listening;
+          return <String, dynamic>{
+            'status': 'Success',
+            'listening': listening,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.annotationAdd',
+      callback: (params) async {
+        try {
+          final x = (params['x'] as num).toDouble();
+          final y = (params['y'] as num).toDouble();
+          final width = (params['width'] as num).toDouble();
+          final height = (params['height'] as num).toDouble();
+          final text = params['text'] as String;
+          final annotation =
+              _annotationService.addAnnotationProgrammatically(
+            x: x,
+            y: y,
+            width: width,
+            height: height,
+            text: text,
+          );
+          return <String, dynamic>{
+            'status': 'Success',
+            'annotation': annotation.toJson(),
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+  }
+
+  @override
+  Future<void> reassembleApplication() {
+    _logCollector.clear();
+    _userMessageService.clearWaiting();
+    return super.reassembleApplication();
+  }
+}

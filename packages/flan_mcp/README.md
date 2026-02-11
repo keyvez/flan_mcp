@@ -284,6 +284,6 @@ Flan MCP shines when used by coding agents to verify their work or explore the a
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](../../LICENSE) file for details.
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
 
 Originally created by [LeanCode](https://leancode.co). Fork maintained by [keyvez](https://github.com/keyvez).

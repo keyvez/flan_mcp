@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "marionette": {
+    "flan": {
       "type": "stdio",
-      "command": "dart run ${workspaceFolder}/packages/marionette_mcp/bin/marionette_mcp.dart -l FINEST"
+      "command": "dart run ${workspaceFolder}/packages/flan_mcp/bin/flan_mcp.dart -l FINEST"
     }
   }
 }

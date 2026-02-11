@@ -1,5 +1,5 @@
-name: marionette_mcp_tools
-description: Build and development tools for marionette_mcp
+name: flan_mcp_tools
+description: Build and development tools for flan_mcp
 publish_to: none
 resolution: workspace
 

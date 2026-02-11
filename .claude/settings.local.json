@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__flan__wait_for_user_message",
+      "mcp__flan__connect"
+    ]
+  }
+}

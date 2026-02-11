@@ -35,42 +35,42 @@ jobs:
           cd tool
           dart pub get
 
-      - name: Install dependencies for marionette_mcp
+      - name: Install dependencies for flan_mcp
         run: |
-          cd packages/marionette_mcp
+          cd packages/flan_mcp
           dart pub get
 
-      - name: Install dependencies for marionette_flutter
+      - name: Install dependencies for flan_flutter
         run: |
-          cd packages/marionette_flutter
+          cd packages/flan_flutter
           flutter pub get
 
       - name: Check version.g.dart is in sync
         run: |
           dart tool/generate_version.dart
-          if ! git diff --exit-code packages/marionette_mcp/lib/src/version.g.dart; then
+          if ! git diff --exit-code packages/flan_mcp/lib/src/version.g.dart; then
             echo "ERROR: version.g.dart is out of sync. Please run 'dart tool/generate_version.dart' and commit the changes."
             exit 1
           fi
 
-      - name: Analyze marionette_mcp
+      - name: Analyze flan_mcp
         run: |
-          cd packages/marionette_mcp
+          cd packages/flan_mcp
           dart analyze --fatal-infos lib bin
 
-      - name: Analyze marionette_flutter
+      - name: Analyze flan_flutter
         run: |
-          cd packages/marionette_flutter
+          cd packages/flan_flutter
           flutter analyze --fatal-infos lib
 
-      - name: Check formatting for marionette_mcp
+      - name: Check formatting for flan_mcp
         run: |
-          cd packages/marionette_mcp
+          cd packages/flan_mcp
           dart format --set-exit-if-changed lib bin
 
-      - name: Check formatting for marionette_flutter
+      - name: Check formatting for flan_flutter
         run: |
-          cd packages/marionette_flutter
+          cd packages/flan_flutter
           dart format --set-exit-if-changed lib
 
       - name: Check formatting for tool

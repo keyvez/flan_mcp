@@ -1,11 +1,11 @@
-name: marionette_mcp_workspace
+name: flan_mcp_workspace
 publish_to: none
 
 environment:
   sdk: ^3.6.0
 
 workspace:
-  - packages/marionette_mcp
-  - packages/marionette_flutter
+  - packages/flan_mcp
+  - packages/flan_flutter
   - example
   - tool
