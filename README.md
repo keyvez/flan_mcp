@@ -332,6 +332,40 @@ The agent receives both annotations with the widgets underneath and can address 
 
 - **Interactions may vary**: Some actions use best-effort simulation of gestures. Depending on platform, custom widgets, or overlays, results may vary. Expose clear widget keys and configure `FlanConfiguration` for your design system.
 
+## Relay Server
+
+The `flan_relay` server provides a camera relay for streaming device camera feeds to the agent. It runs as a standalone binary.
+
+### Starting the Relay Server
+
+```bash
+./server/flan_relay/target/release/flan_relay --port 8080 --camera 1 --debug
+```
+
+| Flag | Description |
+|------|-------------|
+| `--port` | Port to listen on (e.g., `8080`) |
+| `--camera` | Camera device index (e.g., `1`) |
+| `--debug` | Enable debug logging |
+
+### Stopping the Relay Server
+
+Find the process and kill it:
+
+```bash
+# Find the relay server process
+ps aux | grep flan_relay
+
+# Stop it gracefully
+kill <PID>
+```
+
+Or stop it in one command:
+
+```bash
+pkill -f flan_relay
+```
+
 ## Troubleshooting
 
 - **"Not connected to any app"**: The agent must call `connect` with the VM Service URI first.

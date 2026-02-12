@@ -125,6 +125,7 @@ class _MyHomePageState extends State<MyHomePage> {
           // action in the IDE, or press "p" in the console), to see the
           // wireframe for each widget.
           mainAxisAlignment: .center,
+          spacing: 24,
           children: [
             Text(
               'You have pushed the button this many times:',

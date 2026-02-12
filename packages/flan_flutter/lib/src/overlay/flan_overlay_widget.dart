@@ -270,7 +270,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       'data': data,
     });
 
-    // Disable active modes after sending
+    // Clear annotations and disable active modes after sending
+    widget.annotationService.clearAnnotations();
     if (widget.inspectorService.enabled) {
       widget.inspectorService.disable();
     }
@@ -297,6 +298,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           if (widget.annotationService.enabled)
             _AnnotationOverlay(
               service: widget.annotationService,
+              userMessageService: widget.userMessageService,
               onAnnotationSubmitted: _sendToAgent,
             ),
           // Text message overlay — kept in tree to preserve state across dismiss
@@ -536,10 +538,12 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
 class _AnnotationOverlay extends StatefulWidget {
   const _AnnotationOverlay({
     required this.service,
+    required this.userMessageService,
     required this.onAnnotationSubmitted,
   });
 
   final AnnotationService service;
+  final UserMessageService userMessageService;
   final VoidCallback onAnnotationSubmitted;
 
   @override
@@ -549,23 +553,33 @@ class _AnnotationOverlay extends StatefulWidget {
 class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   final TextEditingController _textController = TextEditingController();
   final FocusNode _textFocusNode = FocusNode();
+  bool _showDisconnectedWarning = false;
 
   @override
   void initState() {
     super.initState();
     widget.service.addListener(_onChanged);
+    widget.userMessageService.addListener(_onChanged);
   }
 
   @override
   void dispose() {
     widget.service.removeListener(_onChanged);
+    widget.userMessageService.removeListener(_onChanged);
     _textController.dispose();
     _textFocusNode.dispose();
     super.dispose();
   }
 
   void _onChanged() {
-    if (mounted) setState(() {});
+    if (mounted) {
+      // Dismiss warning when agent connects
+      if (widget.userMessageService.isAgentListening &&
+          _showDisconnectedWarning) {
+        _showDisconnectedWarning = false;
+      }
+      setState(() {});
+    }
   }
 
   @override
@@ -579,6 +593,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
             child: Listener(
               behavior: HitTestBehavior.opaque,
               onPointerDown: (event) {
+                _showDisconnectedWarning = false;
                 final tappedExisting =
                     widget.service.startDrawing(event.position);
                 if (tappedExisting) {
@@ -654,6 +669,81 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
     );
   }
 
+  void _handleNewAnnotationSubmit(String text) {
+    if (!widget.userMessageService.isAgentListening) {
+      setState(() => _showDisconnectedWarning = true);
+      // Re-focus the text field so user can retry
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _textFocusNode.requestFocus();
+      });
+      return;
+    }
+    _showDisconnectedWarning = false;
+    widget.service.submitAnnotationText(text);
+    widget.onAnnotationSubmitted();
+  }
+
+  void _handleEditAnnotationSubmit(String text) {
+    if (!widget.userMessageService.isAgentListening) {
+      setState(() => _showDisconnectedWarning = true);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _textFocusNode.requestFocus();
+      });
+      return;
+    }
+    _showDisconnectedWarning = false;
+    widget.service.submitEditedAnnotationText(text);
+    widget.onAnnotationSubmitted();
+  }
+
+  Widget _buildDisconnectedWarning(double left, double top, double fieldWidth) {
+    return Positioned(
+      left: left,
+      top: top,
+      width: fieldWidth,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xFF2A2A3E),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: const Color(0xFF444466)),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x66000000),
+              blurRadius: 4,
+              offset: Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: const BoxDecoration(
+                shape: BoxShape.circle,
+                color: Color(0xFFFF5252),
+              ),
+            ),
+            const SizedBox(width: 6),
+            const Flexible(
+              child: Text(
+                'Agent disconnected — ask the agent to call watch_flan',
+                style: TextStyle(
+                  color: Color(0xFFFF5252),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500,
+                  decoration: TextDecoration.none,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildTextField(Rect rect, Size screenSize) {
     const fieldHeight = 28.0;
     const gap = 4.0;
@@ -673,41 +763,46 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
     }
     if (left < 0) left = 0;
 
-    return Positioned(
-      left: left,
-      top: top,
-      width: fieldWidth,
-      height: fieldHeight,
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: const Color(0xFF1A1A2E),
-          borderRadius: BorderRadius.circular(4),
-          boxShadow: const [
-            BoxShadow(
-              color: Color(0x66000000),
-              blurRadius: 4,
-              offset: Offset(0, 2),
+    final warningTop = top + fieldHeight + gap;
+
+    return Stack(
+      children: [
+        Positioned(
+          left: left,
+          top: top,
+          width: fieldWidth,
+          height: fieldHeight,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: const Color(0xFF1A1A2E),
+              borderRadius: BorderRadius.circular(4),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x66000000),
+                  blurRadius: 4,
+                  offset: Offset(0, 2),
+                ),
+              ],
             ),
-          ],
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          child: EditableText(
-            controller: _textController,
-            focusNode: _textFocusNode,
-            style: const TextStyle(
-              color: Color(0xFFE0E0E0),
-              fontSize: 13,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: EditableText(
+                controller: _textController,
+                focusNode: _textFocusNode,
+                style: const TextStyle(
+                  color: Color(0xFFE0E0E0),
+                  fontSize: 13,
+                ),
+                cursorColor: const Color(0xFFFF6600),
+                backgroundCursorColor: const Color(0xFF333333),
+                onSubmitted: _handleNewAnnotationSubmit,
+              ),
             ),
-            cursorColor: const Color(0xFFFF6600),
-            backgroundCursorColor: const Color(0xFF333333),
-            onSubmitted: (text) {
-              widget.service.submitAnnotationText(text);
-              widget.onAnnotationSubmitted();
-            },
           ),
         ),
-      ),
+        if (_showDisconnectedWarning)
+          _buildDisconnectedWarning(left, warningTop, fieldWidth),
+      ],
     );
   }
 
@@ -728,45 +823,50 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
     }
     if (left < 0) left = 0;
 
-    return Positioned(
-      left: left,
-      top: top,
-      width: fieldWidth,
-      height: fieldHeight,
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: const Color(0xFF1A1A2E),
-          borderRadius: BorderRadius.circular(4),
-          border: Border.all(
-            color: const Color(0xFFFF6600),
-            width: 1,
-          ),
-          boxShadow: const [
-            BoxShadow(
-              color: Color(0x66000000),
-              blurRadius: 4,
-              offset: Offset(0, 2),
+    final warningTop = top + fieldHeight + gap;
+
+    return Stack(
+      children: [
+        Positioned(
+          left: left,
+          top: top,
+          width: fieldWidth,
+          height: fieldHeight,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: const Color(0xFF1A1A2E),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(
+                color: const Color(0xFFFF6600),
+                width: 1,
+              ),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x66000000),
+                  blurRadius: 4,
+                  offset: Offset(0, 2),
+                ),
+              ],
             ),
-          ],
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          child: EditableText(
-            controller: _textController,
-            focusNode: _textFocusNode,
-            style: const TextStyle(
-              color: Color(0xFFE0E0E0),
-              fontSize: 13,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: EditableText(
+                controller: _textController,
+                focusNode: _textFocusNode,
+                style: const TextStyle(
+                  color: Color(0xFFE0E0E0),
+                  fontSize: 13,
+                ),
+                cursorColor: const Color(0xFFFF6600),
+                backgroundCursorColor: const Color(0xFF333333),
+                onSubmitted: _handleEditAnnotationSubmit,
+              ),
             ),
-            cursorColor: const Color(0xFFFF6600),
-            backgroundCursorColor: const Color(0xFF333333),
-            onSubmitted: (text) {
-              widget.service.submitEditedAnnotationText(text);
-              widget.onAnnotationSubmitted();
-            },
           ),
         ),
-      ),
+        if (_showDisconnectedWarning)
+          _buildDisconnectedWarning(left, warningTop, fieldWidth),
+      ],
     );
   }
 }
