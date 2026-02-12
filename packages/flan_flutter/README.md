@@ -1,7 +1,3 @@
-<a href="https://github.com/keyvez/flan-mcp" align="center">
-  <img alt="flan_mcp" src="https://github.com/user-attachments/assets/12726942-57b3-4967-a1c8-bea06b397500" />
-</a>
-
 # flan_flutter
 
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
