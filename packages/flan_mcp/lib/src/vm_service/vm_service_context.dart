@@ -996,14 +996,25 @@ final class VmServiceContext {
 
             contentList.add(TextContent(text: buffer.toString()));
 
-            // Include drawing images if present
+            // Include images if present (screenshots and drawings)
             for (final m in allMessages) {
               final data = m['data'] as Map<String, dynamic>?;
-              if (data != null && data.containsKey('drawingImage')) {
-                final drawingBase64 = data['drawingImage'] as String;
-                contentList.add(
-                  ImageContent(data: drawingBase64, mimeType: 'image/png'),
-                );
+              if (data != null) {
+                if (data.containsKey('screenshot')) {
+                  final screenshotBase64 = data['screenshot'] as String;
+                  contentList.add(
+                    ImageContent(
+                      data: screenshotBase64,
+                      mimeType: 'image/png',
+                    ),
+                  );
+                }
+                if (data.containsKey('drawingImage')) {
+                  final drawingBase64 = data['drawingImage'] as String;
+                  contentList.add(
+                    ImageContent(data: drawingBase64, mimeType: 'image/png'),
+                  );
+                }
               }
             }
 
@@ -1151,14 +1162,22 @@ final class VmServiceContext {
 
     contentList.add(TextContent(text: buffer.toString()));
 
-    // Include drawing images if present
+    // Include images if present (screenshots and drawings)
     for (final m in messages) {
       final data = m['data'] as Map<String, dynamic>?;
-      if (data != null && data.containsKey('drawingImage')) {
-        final drawingBase64 = data['drawingImage'] as String;
-        contentList.add(
-          ImageContent(data: drawingBase64, mimeType: 'image/png'),
-        );
+      if (data != null) {
+        if (data.containsKey('screenshot')) {
+          final screenshotBase64 = data['screenshot'] as String;
+          contentList.add(
+            ImageContent(data: screenshotBase64, mimeType: 'image/png'),
+          );
+        }
+        if (data.containsKey('drawingImage')) {
+          final drawingBase64 = data['drawingImage'] as String;
+          contentList.add(
+            ImageContent(data: drawingBase64, mimeType: 'image/png'),
+          );
+        }
       }
     }
 

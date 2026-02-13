@@ -81,6 +81,7 @@ class FlanBinding extends WidgetsFlutterBinding {
         inspectorService: _inspectorService,
         annotationService: _annotationService,
         userMessageService: _userMessageService,
+        screenshotService: _screenshotService,
         child: rootWidget,
       ),
     );

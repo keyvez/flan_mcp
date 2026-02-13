@@ -34,6 +34,9 @@ class UserMessageService extends ChangeNotifier {
       _heartbeatTimer = Timer(_heartbeatTimeout, () {
         if (_isAgentListening) {
           _isAgentListening = false;
+          // Also clear waiting state — agent is gone, no activity coming
+          _waitingForActivity = false;
+          _sentMessageText = null;
           notifyListeners();
         }
       });

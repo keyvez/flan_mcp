@@ -8,6 +8,7 @@ import 'package:flan_flutter/src/overlay/inspector_painter.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
 import 'package:flan_flutter/src/services/drawing_service.dart';
 import 'package:flan_flutter/src/services/inspector_service.dart';
+import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
 
 /// Overlay widget injected at the root of the app via
@@ -19,12 +20,14 @@ class FlanOverlayWidget extends StatefulWidget {
     required this.inspectorService,
     required this.annotationService,
     required this.userMessageService,
+    required this.screenshotService,
     required this.child,
   });
 
   final InspectorService inspectorService;
   final AnnotationService annotationService;
   final UserMessageService userMessageService;
+  final ScreenshotService screenshotService;
   final Widget child;
 
   @override
@@ -193,7 +196,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
   /// Packages up the current inspector selection and/or annotations
   /// into a message and sends it to the LLM agent.
-  void _sendToAgent() {
+  Future<void> _sendToAgent() async {
     final parts = <String>[];
     final data = <String, dynamic>{};
 
@@ -262,6 +265,16 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         'User pressed send but no inspector selection or annotations '
         'are active. Ask the user what they need.',
       );
+    }
+
+    // Capture a screenshot to include with the message
+    try {
+      final screenshots = await widget.screenshotService.takeScreenshots();
+      if (screenshots.isNotEmpty) {
+        data['screenshot'] = screenshots.first;
+      }
+    } catch (_) {
+      // Screenshot capture is best-effort; don't block sending the message.
     }
 
     widget.userMessageService.sendMessage({
@@ -745,16 +758,16 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   }
 
   Widget _buildTextField(Rect rect, Size screenSize) {
-    const fieldHeight = 28.0;
+    const maxFieldHeight = 68.0; // ~3 lines of text (13px * 1.4 height * 3 + padding)
     const gap = 4.0;
     final fieldWidth = rect.width.clamp(120.0, 400.0);
 
     // Try below the rect, fall back to above if no space
     var top = rect.bottom + gap;
-    if (top + fieldHeight > screenSize.height) {
-      top = rect.top - fieldHeight - gap;
+    if (top + maxFieldHeight > screenSize.height) {
+      top = rect.top - maxFieldHeight - gap;
     }
-    top = top.clamp(0.0, screenSize.height - fieldHeight);
+    top = top.clamp(0.0, screenSize.height - maxFieldHeight);
 
     // Clamp horizontally
     var left = rect.left;
@@ -763,7 +776,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
     }
     if (left < 0) left = 0;
 
-    final warningTop = top + fieldHeight + gap;
+    final warningTop = top + maxFieldHeight + gap;
 
     return Stack(
       children: [
@@ -771,8 +784,8 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
           left: left,
           top: top,
           width: fieldWidth,
-          height: fieldHeight,
-          child: DecoratedBox(
+          child: Container(
+            constraints: const BoxConstraints(maxHeight: maxFieldHeight),
             decoration: BoxDecoration(
               color: const Color(0xFF1A1A2E),
               borderRadius: BorderRadius.circular(4),
@@ -789,6 +802,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
               child: EditableText(
                 controller: _textController,
                 focusNode: _textFocusNode,
+                maxLines: null,
                 style: const TextStyle(
                   color: Color(0xFFE0E0E0),
                   fontSize: 13,
@@ -807,15 +821,15 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   }
 
   Widget _buildEditTextField(Rect rect, Size screenSize) {
-    const fieldHeight = 28.0;
+    const maxFieldHeight = 68.0; // ~3 lines of text
     const gap = 4.0;
     final fieldWidth = rect.width.clamp(120.0, 400.0);
 
     var top = rect.bottom + gap;
-    if (top + fieldHeight > screenSize.height) {
-      top = rect.top - fieldHeight - gap;
+    if (top + maxFieldHeight > screenSize.height) {
+      top = rect.top - maxFieldHeight - gap;
     }
-    top = top.clamp(0.0, screenSize.height - fieldHeight);
+    top = top.clamp(0.0, screenSize.height - maxFieldHeight);
 
     var left = rect.left;
     if (left + fieldWidth > screenSize.width) {
@@ -823,7 +837,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
     }
     if (left < 0) left = 0;
 
-    final warningTop = top + fieldHeight + gap;
+    final warningTop = top + maxFieldHeight + gap;
 
     return Stack(
       children: [
@@ -831,8 +845,8 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
           left: left,
           top: top,
           width: fieldWidth,
-          height: fieldHeight,
-          child: DecoratedBox(
+          child: Container(
+            constraints: const BoxConstraints(maxHeight: maxFieldHeight),
             decoration: BoxDecoration(
               color: const Color(0xFF1A1A2E),
               borderRadius: BorderRadius.circular(4),
@@ -853,6 +867,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
               child: EditableText(
                 controller: _textController,
                 focusNode: _textFocusNode,
+                maxLines: null,
                 style: const TextStyle(
                   color: Color(0xFFE0E0E0),
                   fontSize: 13,
@@ -1352,7 +1367,7 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
     final ctrlKey = isMac
         ? const _KeyCapIcon(Icons.keyboard_control_key)
         : const _KeyCapText('Ctrl');
-    final shiftKey = const _KeyCapIcon(Icons.keyboard_arrow_up);
+    const shiftKey = _KeyCapText('\u21E7');
     final enterKey = const _KeyCapIcon(Icons.keyboard_return);
     const escKey = _KeyCapText('Esc');
     const scrollKey = _KeyCapIcon(Icons.mouse);
