@@ -1,3 +1,22 @@
+# 0.4.0
+
+- Add in-app command center with widget inspector, annotations, and message overlay
+- Widget inspector (`Ctrl+Shift+H`): select widgets, view source location, send messages to agent
+- Annotation mode (`Ctrl+Shift+A`): draw and label rectangles, auto-correlate with widgets
+- Text message overlay (double-tap `Alt`): free-form text and drawing tools to communicate with agent
+- Add `watch_flan` tool for agents to listen for user messages (long-polling)
+- Add `inspect_widget_at` tool for lightweight coordinate-based widget inspection
+- Add `hot_restart` tool for full app restart
+- Add `enable_inspector`, `disable_inspector`, `get_inspector_selection` tools
+- Add `enable_annotations`, `disable_annotations`, `get_annotations`, `add_annotation`, `clear_annotations` tools
+- Add `get_user_message` tool for retrieving queued user messages
+- Agent listening status indicator in the app
+- Overhaul documentation with full feature coverage
+- Optimize `watch_flan` to use event-driven waiting instead of busy-polling
+- Detect and handle unexpected connection loss (WebSocket close)
+- Suppress redundant logging notifications while `watch_flan` is active
+- Remove redundant "call watch_flan again" instruction from message responses
+
 # 0.3.0
 
 - Add screenshot resizing configuration

@@ -36,7 +36,8 @@ class DrawingPainter extends CustomPainter {
     // Draw completed strokes
     for (final stroke in strokes) {
       final isMoving = movingStrokeId == stroke.id;
-      _drawStroke(canvas, stroke.smoothedPoints, stroke.color, stroke.strokeWidth);
+      _drawStroke(
+          canvas, stroke.smoothedPoints, stroke.color, stroke.strokeWidth);
       if (isMoving) {
         _drawStrokeHighlight(canvas, stroke);
       }
@@ -90,7 +91,8 @@ class DrawingPainter extends CustomPainter {
     }
   }
 
-  void _drawStroke(Canvas canvas, List<Offset> points, Color color, double width) {
+  void _drawStroke(
+      Canvas canvas, List<Offset> points, Color color, double width) {
     if (points.length < 2) return;
     final path = Path()..moveTo(points[0].dx, points[0].dy);
     for (var i = 1; i < points.length; i++) {
@@ -140,7 +142,8 @@ class DrawingPainter extends CustomPainter {
   void _drawStrokeHighlight(Canvas canvas, DrawingStroke stroke) {
     if (stroke.smoothedPoints.length < 2) return;
     // Draw the same path but thicker and with highlight color
-    final path = Path()..moveTo(stroke.smoothedPoints[0].dx, stroke.smoothedPoints[0].dy);
+    final path = Path()
+      ..moveTo(stroke.smoothedPoints[0].dx, stroke.smoothedPoints[0].dy);
     for (var i = 1; i < stroke.smoothedPoints.length; i++) {
       path.lineTo(stroke.smoothedPoints[i].dx, stroke.smoothedPoints[i].dy);
     }

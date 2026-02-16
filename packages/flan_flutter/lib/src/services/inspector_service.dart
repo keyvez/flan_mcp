@@ -1,7 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/rendering.dart';
-import 'package:flutter/widgets.dart'
-    hide InspectorSelection;
+import 'package:flutter/widgets.dart' hide InspectorSelection;
 
 /// Highlight data for a single element at the inspected point.
 class InspectorHighlight {
@@ -66,10 +65,10 @@ class InspectorService extends ChangeNotifier {
   bool get locked => _locked;
   List<InspectorHighlight> get elementsAtPoint => _elementsAtPoint;
   int get currentElementIndex => _currentElementIndex;
-  InspectorHighlight? get currentHighlight =>
-      _currentElementIndex >= 0 && _currentElementIndex < _elementsAtPoint.length
-          ? _elementsAtPoint[_currentElementIndex]
-          : null;
+  InspectorHighlight? get currentHighlight => _currentElementIndex >= 0 &&
+          _currentElementIndex < _elementsAtPoint.length
+      ? _elementsAtPoint[_currentElementIndex]
+      : null;
   InspectorSelection? get lastSelection => _lastSelection;
 
   void enable() {
@@ -103,8 +102,7 @@ class InspectorService extends ChangeNotifier {
   /// Cycles to the next element in the z-index stack at the current point.
   void cycleNextElement() {
     if (_elementsAtPoint.isEmpty) return;
-    _currentElementIndex =
-        (_currentElementIndex + 1) % _elementsAtPoint.length;
+    _currentElementIndex = (_currentElementIndex + 1) % _elementsAtPoint.length;
     notifyListeners();
   }
 

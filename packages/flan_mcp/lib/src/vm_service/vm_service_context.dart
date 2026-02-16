@@ -22,8 +22,13 @@ final class VmServiceContext {
   /// Whether `watch_flan` is actively running.
   bool _isWaitingForMessages = false;
 
+  /// Completer that `watch_flan` waits on. Completed by `_startPolling` when
+  /// new messages arrive, so `watch_flan` doesn't need to poll independently.
+  Completer<void>? _messageArrived;
+
   /// Starts polling the Flutter app for pending user messages.
   /// Consumed messages are buffered so `get_user_message` can retrieve them.
+  /// When `watch_flan` is waiting, it wakes it up via [_messageArrived].
   void _startPolling() {
     _stopPolling();
     _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
@@ -35,15 +40,31 @@ final class VmServiceContext {
           for (final msg in messages) {
             _bufferedMessages.add(msg as Map<String, dynamic>);
           }
-          final count = messages.length;
-          await _server!.sendLoggingMessage(
-            LoggingMessageNotification(
-              level: LoggingLevel.info,
-              logger: 'flan-user',
-              data: '$count message(s) received from the Flutter app user. '
-                  'Call the get_user_message tool to retrieve them.',
-            ),
-          );
+
+          // Wake up watch_flan if it's waiting
+          if (_messageArrived != null && !_messageArrived!.isCompleted) {
+            _messageArrived!.complete();
+          }
+
+          // Only send logging notification when watch_flan is NOT active,
+          // since watch_flan will return the messages directly.
+          if (!_isWaitingForMessages) {
+            final count = messages.length;
+            await _server!.sendLoggingMessage(
+              LoggingMessageNotification(
+                level: LoggingLevel.info,
+                logger: 'flan-user',
+                data:
+                    '$count message(s) received from the Flutter app user. '
+                    'Call the get_user_message tool to retrieve them.',
+              ),
+            );
+          }
+        }
+
+        // Send heartbeat while watch_flan is waiting
+        if (_isWaitingForMessages) {
+          await connector.setAgentListening(true);
         }
       } catch (e) {
         // Silently ignore polling errors (app may have disconnected)
@@ -56,9 +77,30 @@ final class VmServiceContext {
     _pollTimer = null;
   }
 
+  /// Handles unexpected connection loss by cleaning up state and notifying
+  /// the agent via a logging message.
+  void _onConnectionLost() {
+    _stopPolling();
+    _isWaitingForMessages = false;
+    // Wake up watch_flan if it's blocked so it can return an error.
+    if (_messageArrived != null && !_messageArrived!.isCompleted) {
+      _messageArrived!.complete();
+    }
+    _server?.sendLoggingMessage(
+      LoggingMessageNotification(
+        level: LoggingLevel.warning,
+        logger: 'flan',
+        data:
+            'Connection to the Flutter app was lost. '
+            'Use the connect tool to reconnect.',
+      ),
+    );
+  }
+
   /// Registers all VM service related tools with the MCP server.
   void registerTools(McpServer server) {
     _server = server;
+    connector.onDisconnect = _onConnectionLost;
     // Connection management tools
     server
       ..registerTool(
@@ -85,7 +127,8 @@ final class VmServiceContext {
             return CallToolResult(
               content: [
                 TextContent(
-                  text: 'Successfully connected to app at $uri\n\n'
+                  text:
+                      'Successfully connected to app at $uri\n\n'
                       'IMPORTANT: Now call the watch_flan tool '
                       'in the background to listen for messages from the '
                       'user in the Flutter app.',
@@ -164,9 +207,8 @@ final class VmServiceContext {
 
           try {
             final response = await connector.getInteractiveElements();
-            var elements =
-                (response['elements'] as List<dynamic>)
-                    .cast<Map<String, dynamic>>();
+            var elements = (response['elements'] as List<dynamic>)
+                .cast<Map<String, dynamic>>();
 
             // Apply filters
             final typesFilter = args['types'] as String?;
@@ -174,34 +216,31 @@ final class VmServiceContext {
             final textContains = args['text_contains'] as String?;
 
             if (typesFilter != null && typesFilter.isNotEmpty) {
-              final allowed =
-                  typesFilter.split(',').map((t) => t.trim()).toSet();
-              elements =
-                  elements
-                      .where(
-                        (e) =>
-                            e['type'] != null &&
-                            allowed.contains(e['type'] as String),
-                      )
-                      .toList();
+              final allowed = typesFilter
+                  .split(',')
+                  .map((t) => t.trim())
+                  .toSet();
+              elements = elements
+                  .where(
+                    (e) =>
+                        e['type'] != null &&
+                        allowed.contains(e['type'] as String),
+                  )
+                  .toList();
             }
 
             if (withKeysOnly) {
-              elements =
-                  elements
-                      .where(
-                        (e) => e['key'] != null && (e['key'] as String) != '',
-                      )
-                      .toList();
+              elements = elements
+                  .where((e) => e['key'] != null && (e['key'] as String) != '')
+                  .toList();
             }
 
             if (textContains != null && textContains.isNotEmpty) {
               final needle = textContains.toLowerCase();
-              elements =
-                  elements.where((e) {
-                    final t = e['text'] as String?;
-                    return t != null && t.toLowerCase().contains(needle);
-                  }).toList();
+              elements = elements.where((e) {
+                final t = e['text'] as String?;
+                return t != null && t.toLowerCase().contains(needle);
+              }).toList();
             }
 
             // Format compact
@@ -528,9 +567,7 @@ final class VmServiceContext {
             if (restarted) {
               return CallToolResult(
                 content: [
-                  const TextContent(
-                    text: 'Hot restart completed successfully',
-                  ),
+                  const TextContent(text: 'Hot restart completed successfully'),
                 ],
               );
             } else {
@@ -573,9 +610,7 @@ final class VmServiceContext {
             final message = response['message'] as String?;
 
             return CallToolResult(
-              content: [
-                TextContent(text: message ?? 'Inspector mode enabled'),
-              ],
+              content: [TextContent(text: message ?? 'Inspector mode enabled')],
             );
           } catch (err) {
             _logger.warning('Failed to enable inspector', err);
@@ -638,7 +673,8 @@ final class VmServiceContext {
               return CallToolResult(
                 content: [
                   const TextContent(
-                    text: 'No widget selected. Enable inspector mode and '
+                    text:
+                        'No widget selected. Enable inspector mode and '
                         'tap a widget, or use inspect_widget_at.',
                   ),
                 ],
@@ -678,12 +714,10 @@ final class VmServiceContext {
         inputSchema: ToolInputSchema(
           properties: {
             'x': JsonSchema.number(
-              description:
-                  'The x coordinate (horizontal position from left).',
+              description: 'The x coordinate (horizontal position from left).',
             ),
             'y': JsonSchema.number(
-              description:
-                  'The y coordinate (vertical position from top).',
+              description: 'The y coordinate (vertical position from top).',
             ),
           },
           required: ['x', 'y'],
@@ -699,11 +733,7 @@ final class VmServiceContext {
 
             if (selection == null) {
               return CallToolResult(
-                content: [
-                  TextContent(
-                    text: 'No widget found at ($x, $y)',
-                  ),
-                ],
+                content: [TextContent(text: 'No widget found at ($x, $y)')],
               );
             }
 
@@ -807,9 +837,7 @@ final class VmServiceContext {
 
             if (count == 0) {
               return CallToolResult(
-                content: [
-                  const TextContent(text: 'No annotations found'),
-                ],
+                content: [const TextContent(text: 'No annotations found')],
               );
             }
 
@@ -820,7 +848,7 @@ final class VmServiceContext {
               final a = annotation as Map<String, dynamic>;
               final bounds = a['bounds'] as Map<String, dynamic>;
               buffer.writeln(
-                '[${ a['id']}] "${a['text']}" '
+                '[${a['id']}] "${a['text']}" '
                 '@ (${(bounds['x'] as num).round()}, '
                 '${(bounds['y'] as num).round()}) '
                 '${(bounds['width'] as num).round()}x'
@@ -855,9 +883,7 @@ final class VmServiceContext {
             final message = response['message'] as String?;
 
             return CallToolResult(
-              content: [
-                TextContent(text: message ?? 'Annotations cleared'),
-              ],
+              content: [TextContent(text: message ?? 'Annotations cleared')],
             );
           } catch (err) {
             _logger.warning('Failed to clear annotations', err);
@@ -918,7 +944,8 @@ final class VmServiceContext {
             return CallToolResult(
               content: [
                 TextContent(
-                  text: 'Annotation added at ($x, $y) '
+                  text:
+                      'Annotation added at ($x, $y) '
                       '${width}x$height: "$text"',
                 ),
               ],
@@ -977,9 +1004,7 @@ final class VmServiceContext {
 
             if (allMessages.isEmpty) {
               return CallToolResult(
-                content: [
-                  const TextContent(text: 'No pending user messages'),
-                ],
+                content: [const TextContent(text: 'No pending user messages')],
               );
             }
 
@@ -1003,10 +1028,7 @@ final class VmServiceContext {
                 if (data.containsKey('screenshot')) {
                   final screenshotBase64 = data['screenshot'] as String;
                   contentList.add(
-                    ImageContent(
-                      data: screenshotBase64,
-                      mimeType: 'image/png',
-                    ),
+                    ImageContent(data: screenshotBase64, mimeType: 'image/png'),
                   );
                 }
                 if (data.containsKey('drawingImage')) {
@@ -1058,9 +1080,7 @@ final class VmServiceContext {
         ),
         callback: (args, extra) async {
           final timeoutSecs = (args['timeout'] as int?) ?? 300;
-          _logger.info(
-            'Waiting for user message (timeout: ${timeoutSecs}s)',
-          );
+          _logger.info('Waiting for user message (timeout: ${timeoutSecs}s)');
 
           _isWaitingForMessages = true;
 
@@ -1072,53 +1092,54 @@ final class VmServiceContext {
           }
 
           try {
-            final deadline = DateTime.now().add(
-              Duration(seconds: timeoutSecs),
-            );
-
-            var lastHeartbeat = DateTime.now();
+            final deadline = DateTime.now().add(Duration(seconds: timeoutSecs));
 
             while (DateTime.now().isBefore(deadline)) {
-              // Check buffered messages first
+              // Bail out immediately if the connection was lost.
+              if (!connector.isConnected) {
+                return CallToolResult(
+                  isError: true,
+                  content: [
+                    const TextContent(
+                      text:
+                          'Connection to the Flutter app was lost. '
+                          'Use the connect tool to reconnect.',
+                    ),
+                  ],
+                );
+              }
+
+              // Check buffered messages (filled by _startPolling)
               if (_bufferedMessages.isNotEmpty) {
-                final messages =
-                    List<Map<String, dynamic>>.from(_bufferedMessages);
+                final messages = List<Map<String, dynamic>>.from(
+                  _bufferedMessages,
+                );
                 _bufferedMessages.clear();
                 return _formatUserMessages(messages);
               }
 
-              // Check for fresh messages from the app
-              if (connector.isConnected) {
-                final response = await connector.consumeUserMessages();
-                final messages = response['messages'] as List?;
-                if (messages != null && messages.isNotEmpty) {
-                  final typed = messages
-                      .map((m) => m as Map<String, dynamic>)
-                      .toList();
-                  return _formatUserMessages(typed);
-                }
-              }
+              // Wait for the polling loop to signal new messages, or timeout.
+              final remaining = deadline.difference(DateTime.now());
+              if (remaining.isNegative) break;
 
-              // Send heartbeat every 3 seconds to keep listening state alive
-              if (DateTime.now().difference(lastHeartbeat).inSeconds >= 3) {
-                if (connector.isConnected) {
-                  try {
-                    await connector.setAgentListening(true);
-                  } catch (_) {}
-                }
-                lastHeartbeat = DateTime.now();
+              _messageArrived = Completer<void>();
+              try {
+                await _messageArrived!.future.timeout(
+                  // Wake up at most every 2s to re-check deadline, but
+                  // don't exceed the remaining timeout.
+                  remaining < const Duration(seconds: 2)
+                      ? remaining
+                      : const Duration(seconds: 2),
+                );
+              } on TimeoutException {
+                // Normal — just loop back to check deadline and buffer.
               }
-
-              // Wait before polling again
-              await Future<void>.delayed(const Duration(milliseconds: 500));
             }
 
             return CallToolResult(
               content: [
-                TextContent(
-                  text: 'Timed out after ${timeoutSecs}s waiting for a user '
-                      'message. Call watch_flan again to '
-                      'continue listening.',
+                const TextContent(
+                  text: 'Timed out waiting for a user message.',
                 ),
               ],
             );
@@ -1130,6 +1151,7 @@ final class VmServiceContext {
             );
           } finally {
             _isWaitingForMessages = false;
+            _messageArrived = null;
             // Signal the Flutter app that the agent stopped listening.
             if (connector.isConnected) {
               try {
@@ -1153,12 +1175,6 @@ final class VmServiceContext {
       buffer.writeln(text);
       buffer.writeln();
     }
-
-    buffer.writeln(
-      'IMPORTANT: After handling this message, call '
-      'watch_flan again in the background to continue '
-      'listening for user messages.',
-    );
 
     contentList.add(TextContent(text: buffer.toString()));
 

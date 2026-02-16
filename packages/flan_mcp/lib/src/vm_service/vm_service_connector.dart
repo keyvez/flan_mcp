@@ -55,6 +55,10 @@ class VmServiceConnector {
   final Map<String, String?> _registeredServices = {};
   final Map<String, List<Completer<String?>>> _pendingServiceRequests = {};
 
+  /// Called when the connection is lost unexpectedly (e.g. app crash,
+  /// WebSocket close). Set by [VmServiceContext] to clean up polling state.
+  void Function()? onDisconnect;
+
   /// Returns true if currently connected to a VM service.
   bool get isConnected => _service != null && _isolateId != null;
 
@@ -71,6 +75,21 @@ class VmServiceConnector {
 
     try {
       _service = await vmServiceConnectUri(uri);
+
+      // Detect unexpected connection loss (app crash, WebSocket close).
+      unawaited(
+        _service!.onDone.then((_) {
+          if (_service != null) {
+            _logger.warning('VM service connection lost unexpectedly');
+            _service = null;
+            _isolateId = null;
+            _registeredServices.clear();
+            _pendingServiceRequests.clear();
+            onDisconnect?.call();
+          }
+        }),
+      );
+
       _serviceEventSubscription = _service!.onServiceEvent.listen((e) {
         switch (e.kind) {
           case EventKind.kServiceRegistered:
@@ -274,8 +293,9 @@ class VmServiceConnector {
 
   /// Tells the Flutter app whether the agent is actively listening.
   Future<Map<String, dynamic>> setAgentListening(bool listening) {
-    return _callExtension(
-        'flan.setAgentListening', {'listening': listening.toString()});
+    return _callExtension('flan.setAgentListening', {
+      'listening': listening.toString(),
+    });
   }
 
   /// Performs a hot reload of the Flutter app.
@@ -304,7 +324,8 @@ class VmServiceConnector {
         _logger.fine('Hot reload completed: result=${result.json}');
         final json = result.json ?? {};
         final success = json['type'] == 'Success';
-        final reason = json['message'] as String? ??
+        final reason =
+            json['message'] as String? ??
             json['reason'] as String? ??
             (success ? null : json.toString());
         return HotReloadResult(success: success, details: reason);
@@ -411,10 +432,7 @@ class VmServiceConnector {
         return result.json?['type'] == 'Success';
       } else {
         // Fallback: call reloadSources with force compile
-        final report = await _service!.reloadSources(
-          _isolateId!,
-          force: true,
-        );
+        final report = await _service!.reloadSources(_isolateId!, force: true);
         _logger.fine('Hot restart (forced reload): success=${report.success}');
         return report.success ?? false;
       }

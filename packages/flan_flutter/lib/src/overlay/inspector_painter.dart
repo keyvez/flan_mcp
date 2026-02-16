@@ -1,7 +1,6 @@
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart'
-    hide InspectorSelection;
+import 'package:flutter/material.dart' hide InspectorSelection;
 import 'package:flan_flutter/src/services/inspector_service.dart';
 
 /// CustomPainter that draws inspector highlights, selection borders,

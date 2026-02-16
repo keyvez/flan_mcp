@@ -1,6 +1,5 @@
 import 'package:flutter/foundation.dart';
-import 'package:flutter/widgets.dart'
-    hide InspectorSelection;
+import 'package:flutter/widgets.dart' hide InspectorSelection;
 import 'package:flan_flutter/src/binding/flan_configuration.dart';
 import 'package:flan_flutter/src/overlay/flan_overlay_widget.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
@@ -517,8 +516,8 @@ class FlanBinding extends WidgetsFlutterBinding {
       name: 'flan.setAgentListening',
       callback: (params) async {
         try {
-          final listening = params['listening'] == 'true' ||
-              params['listening'] == true;
+          final listening =
+              params['listening'] == 'true' || params['listening'] == true;
           _userMessageService.isAgentListening = listening;
           return <String, dynamic>{
             'status': 'Success',
@@ -543,8 +542,7 @@ class FlanBinding extends WidgetsFlutterBinding {
           final width = (params['width'] as num).toDouble();
           final height = (params['height'] as num).toDouble();
           final text = params['text'] as String;
-          final annotation =
-              _annotationService.addAnnotationProgrammatically(
+          final annotation = _annotationService.addAnnotationProgrammatically(
             x: x,
             y: y,
             width: width,

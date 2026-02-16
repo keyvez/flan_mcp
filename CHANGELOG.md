@@ -12,6 +12,10 @@
 - Add `get_user_message` tool for retrieving queued user messages
 - Agent listening status indicator in the app
 - Overhaul documentation with full feature coverage
+- Optimize `watch_flan` to use event-driven waiting instead of busy-polling
+- Detect and handle unexpected connection loss (WebSocket close)
+- Suppress redundant logging notifications while `watch_flan` is active
+- Remove redundant "call watch_flan again" instruction from message responses
 
 # 0.3.0
 

@@ -1,6 +1,5 @@
 import 'package:flutter/gestures.dart';
-import 'package:flutter/material.dart'
-    hide InspectorSelection;
+import 'package:flutter/material.dart' hide InspectorSelection;
 import 'package:flutter/services.dart';
 import 'package:flan_flutter/src/overlay/annotation_painter.dart';
 import 'package:flan_flutter/src/overlay/drawing_painter.dart';
@@ -318,8 +317,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           if (_textOverlayEverShown)
             _TextMessageOverlay(
               visible: _showTextMessageOverlay,
-              onDismiss: () =>
-                  setState(() => _showTextMessageOverlay = false),
+              onDismiss: () => setState(() => _showTextMessageOverlay = false),
               onSubmitted: _onTextMessageSubmitted,
               userMessageService: widget.userMessageService,
             ),
@@ -612,8 +610,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
                 if (tappedExisting) {
                   final idx = widget.service.editingIndex;
                   if (idx != null) {
-                    _textController.text =
-                        widget.service.annotations[idx].text;
+                    _textController.text = widget.service.annotations[idx].text;
                     _textController.selection = TextSelection(
                       baseOffset: 0,
                       extentOffset: _textController.text.length,
@@ -629,8 +626,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
               },
               onPointerUp: (_) {
                 widget.service.finishDrawing();
-                if (widget.service.drawState ==
-                    AnnotationDrawState.editing) {
+                if (widget.service.drawState == AnnotationDrawState.editing) {
                   _textController.clear();
                   WidgetsBinding.instance.addPostFrameCallback((_) {
                     _textFocusNode.requestFocus();
@@ -663,14 +659,13 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
               },
             ),
           // Text input field when editing an existing annotation
-          if (widget.service.drawState ==
-                  AnnotationDrawState.editingExisting &&
+          if (widget.service.drawState == AnnotationDrawState.editingExisting &&
               widget.service.editingIndex != null)
             Builder(
               builder: (context) {
                 final screenSize = MediaQuery.of(context).size;
-                final annotation = widget.service
-                    .annotations[widget.service.editingIndex!];
+                final annotation =
+                    widget.service.annotations[widget.service.editingIndex!];
                 return _buildEditTextField(
                   annotation.bounds,
                   screenSize,
@@ -758,7 +753,8 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   }
 
   Widget _buildTextField(Rect rect, Size screenSize) {
-    const maxFieldHeight = 68.0; // ~3 lines of text (13px * 1.4 height * 3 + padding)
+    const maxFieldHeight =
+        68.0; // ~3 lines of text (13px * 1.4 height * 3 + padding)
     const gap = 4.0;
     final fieldWidth = rect.width.clamp(120.0, 400.0);
 
@@ -1010,60 +1006,68 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
               // When a tool is active (markup mode), taps route to the tool.
               Positioned.fill(
                 child: GestureDetector(
-                  onTap: isWaiting || isMarkupMode
-                      ? null
-                      : widget.onDismiss,
+                  onTap: isWaiting || isMarkupMode ? null : widget.onDismiss,
                   behavior: HitTestBehavior.opaque,
                   child: Listener(
                     behavior: HitTestBehavior.opaque,
-                    onPointerDown: isWaiting || !isMarkupMode ? null : (event) {
-                      switch (activeTool) {
-                        case DrawingTool.none:
-                          break;
-                        case DrawingTool.pencil:
-                          _drawingService.startStroke(event.position);
-                        case DrawingTool.text:
-                          _drawingService.startTextPlacement(event.position);
-                          _floatingTextController.clear();
-                          WidgetsBinding.instance.addPostFrameCallback((_) {
-                            _floatingTextFocusNode.requestFocus();
-                          });
-                        case DrawingTool.eraser:
-                          setState(() => _eraserPosition = event.position);
-                          _drawingService.eraseAt(event.position, 16.0);
-                        case DrawingTool.move:
-                          _drawingService.startMove(event.position);
-                      }
-                    },
-                    onPointerMove: isWaiting || !isMarkupMode ? null : (event) {
-                      switch (activeTool) {
-                        case DrawingTool.none:
-                          break;
-                        case DrawingTool.pencil:
-                          _drawingService.addPoint(event.position);
-                        case DrawingTool.text:
-                          break;
-                        case DrawingTool.eraser:
-                          setState(() => _eraserPosition = event.position);
-                          _drawingService.eraseAt(event.position, 16.0);
-                        case DrawingTool.move:
-                          _drawingService.updateMove(event.position);
-                      }
-                    },
-                    onPointerUp: isWaiting || !isMarkupMode ? null : (event) {
-                      switch (activeTool) {
-                        case DrawingTool.none:
-                          break;
-                        case DrawingTool.pencil:
-                          _drawingService.finishStroke();
-                        case DrawingTool.text:
-                          break;
-                        case DrawingTool.eraser:
-                          setState(() => _eraserPosition = null);
-                        case DrawingTool.move:
-                          _drawingService.finishMove();
-                      }
-                    },
+                    onPointerDown: isWaiting || !isMarkupMode
+                        ? null
+                        : (event) {
+                            switch (activeTool) {
+                              case DrawingTool.none:
+                                break;
+                              case DrawingTool.pencil:
+                                _drawingService.startStroke(event.position);
+                              case DrawingTool.text:
+                                _drawingService
+                                    .startTextPlacement(event.position);
+                                _floatingTextController.clear();
+                                WidgetsBinding.instance
+                                    .addPostFrameCallback((_) {
+                                  _floatingTextFocusNode.requestFocus();
+                                });
+                              case DrawingTool.eraser:
+                                setState(
+                                    () => _eraserPosition = event.position);
+                                _drawingService.eraseAt(event.position, 16.0);
+                              case DrawingTool.move:
+                                _drawingService.startMove(event.position);
+                            }
+                          },
+                    onPointerMove: isWaiting || !isMarkupMode
+                        ? null
+                        : (event) {
+                            switch (activeTool) {
+                              case DrawingTool.none:
+                                break;
+                              case DrawingTool.pencil:
+                                _drawingService.addPoint(event.position);
+                              case DrawingTool.text:
+                                break;
+                              case DrawingTool.eraser:
+                                setState(
+                                    () => _eraserPosition = event.position);
+                                _drawingService.eraseAt(event.position, 16.0);
+                              case DrawingTool.move:
+                                _drawingService.updateMove(event.position);
+                            }
+                          },
+                    onPointerUp: isWaiting || !isMarkupMode
+                        ? null
+                        : (event) {
+                            switch (activeTool) {
+                              case DrawingTool.none:
+                                break;
+                              case DrawingTool.pencil:
+                                _drawingService.finishStroke();
+                              case DrawingTool.text:
+                                break;
+                              case DrawingTool.eraser:
+                                setState(() => _eraserPosition = null);
+                              case DrawingTool.move:
+                                _drawingService.finishMove();
+                            }
+                          },
                     child: CustomPaint(
                       foregroundPainter: DrawingPainter(
                         strokes: _drawingService.strokes,
@@ -1092,8 +1096,7 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
                     onTap: () {}, // prevent dismiss when tapping the box
                     child: Container(
                       width: dialogWidth,
-                      constraints:
-                          BoxConstraints(maxHeight: maxDialogHeight),
+                      constraints: BoxConstraints(maxHeight: maxDialogHeight),
                       decoration: BoxDecoration(
                         color: const Color(0xFF1A1A2E),
                         borderRadius: BorderRadius.circular(12),
@@ -1109,9 +1112,8 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
                           width: 1.5,
                         ),
                       ),
-                      child: isWaiting
-                          ? _buildWaitingState()
-                          : _buildInputState(),
+                      child:
+                          isWaiting ? _buildWaitingState() : _buildInputState(),
                     ),
                   ),
                 ),
@@ -1383,31 +1385,46 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('Flan Shortcuts', style: TextStyle(
-            color: Color(0xFF00AAFF),
-            fontSize: 14,
-            fontWeight: FontWeight.w600,
-            decoration: TextDecoration.none,
-          )),
+          const Text('Flan Shortcuts',
+              style: TextStyle(
+                color: Color(0xFF00AAFF),
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                decoration: TextDecoration.none,
+              )),
           const SizedBox(height: 12),
           Row(
             children: [
-              Expanded(child: _ShortcutRow(keyCaps: [altKey, altKey], label: 'Open overlay')),
-              Expanded(child: _ShortcutRow(keyCaps: [escKey], label: 'Dismiss')),
+              Expanded(
+                  child: _ShortcutRow(
+                      keyCaps: [altKey, altKey], label: 'Open overlay')),
+              Expanded(
+                  child: _ShortcutRow(keyCaps: [escKey], label: 'Dismiss')),
             ],
           ),
           const SizedBox(height: 8),
           Row(
             children: [
-              Expanded(child: _ShortcutRow(keyCaps: [ctrlKey, shiftKey, const _KeyCapText('H')], label: 'Inspector')),
-              Expanded(child: _ShortcutRow(keyCaps: [ctrlKey, shiftKey, const _KeyCapText('A')], label: 'Annotate')),
+              Expanded(
+                  child: _ShortcutRow(
+                      keyCaps: [ctrlKey, shiftKey, const _KeyCapText('H')],
+                      label: 'Inspector')),
+              Expanded(
+                  child: _ShortcutRow(
+                      keyCaps: [ctrlKey, shiftKey, const _KeyCapText('A')],
+                      label: 'Annotate')),
             ],
           ),
           const SizedBox(height: 8),
           Row(
             children: [
-              Expanded(child: _ShortcutRow(keyCaps: [ctrlKey, shiftKey, enterKey], label: 'Send to agent')),
-              Expanded(child: _ShortcutRow(keyCaps: [scrollKey], label: 'Cycle widgets')),
+              Expanded(
+                  child: _ShortcutRow(
+                      keyCaps: [ctrlKey, shiftKey, enterKey],
+                      label: 'Send to agent')),
+              Expanded(
+                  child: _ShortcutRow(
+                      keyCaps: [scrollKey], label: 'Cycle widgets')),
             ],
           ),
         ],
@@ -1701,9 +1718,8 @@ class _AgentStatusIndicatorState extends State<_AgentStatusIndicator> {
   @override
   Widget build(BuildContext context) {
     final label = widget.isListening ? 'Agent listening' : 'Agent disconnected';
-    final color = widget.isListening
-        ? const Color(0xFF4CAF50)
-        : const Color(0xFFFF5252);
+    final color =
+        widget.isListening ? const Color(0xFF4CAF50) : const Color(0xFFFF5252);
 
     return Column(
       mainAxisSize: MainAxisSize.min,

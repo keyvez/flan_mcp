@@ -300,10 +300,11 @@ class DrawingService extends ChangeNotifier {
     // Draw strokes
     for (final stroke in _strokes) {
       if (stroke.smoothedPoints.length < 2) continue;
-      final path = Path()..moveTo(
-        stroke.smoothedPoints[0].dx,
-        stroke.smoothedPoints[0].dy,
-      );
+      final path = Path()
+        ..moveTo(
+          stroke.smoothedPoints[0].dx,
+          stroke.smoothedPoints[0].dy,
+        );
       for (var i = 1; i < stroke.smoothedPoints.length; i++) {
         path.lineTo(
           stroke.smoothedPoints[i].dx,

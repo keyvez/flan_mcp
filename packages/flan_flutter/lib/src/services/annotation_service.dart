@@ -141,8 +141,7 @@ class AnnotationService extends ChangeNotifier {
     }
 
     final rect = Rect.fromPoints(_dragStart!, _dragCurrent!);
-    if (rect.width < _kMinAnnotationSize ||
-        rect.height < _kMinAnnotationSize) {
+    if (rect.width < _kMinAnnotationSize || rect.height < _kMinAnnotationSize) {
       _resetDrawing();
       return;
     }
