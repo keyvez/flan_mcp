@@ -46,18 +46,27 @@ class HotReloadResult {
 /// wrapper methods for custom flan.* extensions.
 class VmServiceConnector {
   VmServiceConnector() : _logger = logging.Logger('VmServiceConnector');
+  static const String _userMessageQueuedEventKind = 'flan.userMessageQueued';
+  static const String _annotationChangedEventKind = 'flan.annotationChanged';
 
   final logging.Logger _logger;
   VmService? _service;
   String? _isolateId;
   StreamSubscription<Event>? _serviceEventSubscription;
+  StreamSubscription<Event>? _extensionEventSubscription;
 
   final Map<String, String?> _registeredServices = {};
   final Map<String, List<Completer<String?>>> _pendingServiceRequests = {};
 
   /// Called when the connection is lost unexpectedly (e.g. app crash,
-  /// WebSocket close). Set by [VmServiceContext] to clean up polling state.
+  /// WebSocket close). Set by [VmServiceContext] to clean up state.
   void Function()? onDisconnect;
+
+  /// Called when the Flutter app emits a user-message-queued extension event.
+  void Function()? onUserMessageQueued;
+
+  /// Called when the Flutter app emits an annotation-changed extension event.
+  void Function()? onAnnotationChanged;
 
   /// Returns true if currently connected to a VM service.
   bool get isConnected => _service != null && _isolateId != null;
@@ -81,6 +90,10 @@ class VmServiceConnector {
         _service!.onDone.then((_) {
           if (_service != null) {
             _logger.warning('VM service connection lost unexpectedly');
+            unawaited(_serviceEventSubscription?.cancel());
+            unawaited(_extensionEventSubscription?.cancel());
+            _serviceEventSubscription = null;
+            _extensionEventSubscription = null;
             _service = null;
             _isolateId = null;
             _registeredServices.clear();
@@ -111,9 +124,30 @@ class VmServiceConnector {
       });
       await _service!.streamListen(EventStreams.kService);
 
+      _extensionEventSubscription = _service!.onExtensionEvent.listen((e) {
+        if (e.kind == EventKind.kExtension) {
+          if (e.extensionKind == _userMessageQueuedEventKind) {
+            _logger.fine(
+              'Received $_userMessageQueuedEventKind extension event',
+            );
+            onUserMessageQueued?.call();
+          } else if (e.extensionKind == _annotationChangedEventKind) {
+            _logger.fine(
+              'Received $_annotationChangedEventKind extension event',
+            );
+            onAnnotationChanged?.call();
+          }
+        }
+      });
+      await _service!.streamListen(EventStreams.kExtension);
+
       _isolateId = await _findIsolateWithFlanExtensions();
       _logger.info('Connected to isolate: $_isolateId');
     } catch (err) {
+      await _serviceEventSubscription?.cancel();
+      await _extensionEventSubscription?.cancel();
+      _serviceEventSubscription = null;
+      _extensionEventSubscription = null;
       _service = null;
       _isolateId = null;
       _logger.severe('Failed to connect to VM service', err);
@@ -126,7 +160,9 @@ class VmServiceConnector {
     if (_service != null) {
       _logger.info('Disconnecting from VM service');
       await _serviceEventSubscription?.cancel();
+      await _extensionEventSubscription?.cancel();
       _serviceEventSubscription = null;
+      _extensionEventSubscription = null;
       await _service!.dispose();
       _service = null;
       _isolateId = null;
@@ -295,6 +331,17 @@ class VmServiceConnector {
   Future<Map<String, dynamic>> setAgentListening(bool listening) {
     return _callExtension('flan.setAgentListening', {
       'listening': listening.toString(),
+    });
+  }
+
+  /// Tells the Flutter app whether an MCP host is connected and push-capable.
+  Future<Map<String, dynamic>> setHostConnectionState({
+    required bool connected,
+    required bool pushCapable,
+  }) {
+    return _callExtension('flan.setHostConnectionState', {
+      'connected': connected.toString(),
+      'pushCapable': pushCapable.toString(),
     });
   }
 

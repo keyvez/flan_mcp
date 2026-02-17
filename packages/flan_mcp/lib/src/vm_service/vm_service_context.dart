@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:logging/logging.dart' as logging;
 import 'package:flan_mcp/src/utils/num_parser.dart';
@@ -7,83 +8,314 @@ import 'package:mcp_dart/mcp_dart.dart';
 
 /// Context for managing VM service connection and registering MCP tools.
 final class VmServiceContext {
-  VmServiceContext()
-    : connector = VmServiceConnector(),
+  VmServiceContext({VmServiceConnector? connector})
+    : connector = connector ?? VmServiceConnector(),
       _logger = logging.Logger('VmServiceContext');
+
+  static const String _pendingMessagesResourceUri = 'flan://messages/pending';
+  static const String _pendingMessagesResourceMime = 'application/json';
+  static const String _annotationsResourceUri = 'flan://annotations';
+  static const String _annotationsResourceMime = 'application/json';
 
   final VmServiceConnector connector;
   final logging.Logger _logger;
   McpServer? _server;
-  Timer? _pollTimer;
 
-  /// Buffered messages consumed by the polling loop, available for
+  /// Buffered messages consumed from the Flutter app queue, available for
   /// retrieval via `get_user_message`.
   final List<Map<String, dynamic>> _bufferedMessages = [];
 
-  /// Whether `watch_flan` is actively running.
-  bool _isWaitingForMessages = false;
+  /// Whether `process_queue` is actively running.
+  bool _isProcessingQueue = false;
+  Timer? _agentListeningHeartbeat;
 
-  /// Completer that `watch_flan` waits on. Completed by `_startPolling` when
-  /// new messages arrive, so `watch_flan` doesn't need to poll independently.
+  /// Completer that `process_queue` waits on. Completed when new messages arrive.
   Completer<void>? _messageArrived;
 
-  /// Starts polling the Flutter app for pending user messages.
-  /// Consumed messages are buffered so `get_user_message` can retrieve them.
-  /// When `watch_flan` is waiting, it wakes it up via [_messageArrived].
-  void _startPolling() {
-    _stopPolling();
-    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
-      if (!connector.isConnected || _server == null) return;
-      try {
-        final response = await connector.consumeUserMessages();
-        final messages = response['messages'] as List?;
-        if (messages != null && messages.isNotEmpty) {
-          for (final msg in messages) {
-            _bufferedMessages.add(msg as Map<String, dynamic>);
-          }
+  bool _isDrainingMessages = false;
+  bool _drainRequested = false;
+  DateTime? _lastMessageReceivedAt;
+  int _lastKnownAppPendingCount = 0;
+  bool _enableSamplingPush = false;
+  DateTime? _lastSamplingPushAt;
 
-          // Wake up watch_flan if it's waiting
-          if (_messageArrived != null && !_messageArrived!.isCompleted) {
-            _messageArrived!.complete();
-          }
+  void _onUserMessageQueued() {
+    unawaited(_refreshPendingQueueAndNotify(origin: 'extension-event'));
+  }
 
-          // Only send logging notification when watch_flan is NOT active,
-          // since watch_flan will return the messages directly.
-          if (!_isWaitingForMessages) {
-            final count = messages.length;
-            await _server!.sendLoggingMessage(
-              LoggingMessageNotification(
-                level: LoggingLevel.info,
-                logger: 'flan-user',
-                data:
-                    '$count message(s) received from the Flutter app user. '
-                    'Call the get_user_message tool to retrieve them.',
-              ),
-            );
-          }
-        }
+  void _onAnnotationChanged() {
+    unawaited(_notifyAnnotationsResourceUpdated());
+  }
 
-        // Send heartbeat while watch_flan is waiting
-        if (_isWaitingForMessages) {
-          await connector.setAgentListening(true);
-        }
-      } catch (e) {
-        // Silently ignore polling errors (app may have disconnected)
+  Future<void> _notifyAnnotationsResourceUpdated() async {
+    final server = _server;
+    if (server == null || !server.isConnected) return;
+
+    try {
+      await server.server.sendResourceUpdated(
+        const ResourceUpdatedNotification(uri: _annotationsResourceUri),
+      );
+    } catch (err) {
+      _logger.fine('Skipping annotation resource update notification: $err');
+    }
+  }
+
+  Future<void> _refreshPendingQueueAndNotify({required String origin}) async {
+    if (!connector.isConnected || _server == null) return;
+
+    try {
+      final response = await connector.peekUserMessages();
+      final pendingCount = (response['count'] as num?)?.toInt() ?? 0;
+      _lastKnownAppPendingCount = pendingCount;
+      if (pendingCount > 0) {
+        _lastMessageReceivedAt = DateTime.now().toUtc();
       }
+
+      if (_messageArrived != null && !_messageArrived!.isCompleted) {
+        _messageArrived!.complete();
+      }
+
+      // Only send logging notification when process_queue is NOT active,
+      // since process_queue will return the messages directly.
+      if (!_isProcessingQueue && pendingCount > 0) {
+        await _server!.sendLoggingMessage(
+          LoggingMessageNotification(
+            level: LoggingLevel.info,
+            logger: 'flan-user',
+            data:
+                '$pendingCount pending message(s) from the Flutter app user. '
+                'Call process_queue, get_user_message, or read flan://messages/pending.',
+          ),
+        );
+      }
+
+      await _notifyPendingMessagesResourceUpdated();
+      _maybeTriggerSamplingPushForPendingCount(pendingCount);
+    } catch (err, st) {
+      _logger.warning('Failed to refresh pending queue ($origin)', err, st);
+    }
+  }
+
+  Future<void> _drainMessagesAndNotify({required String origin}) async {
+    if (!connector.isConnected || _server == null) return;
+
+    if (_isDrainingMessages) {
+      _drainRequested = true;
+      return;
+    }
+
+    _isDrainingMessages = true;
+    var totalAdded = 0;
+    final allAddedMessages = <Map<String, dynamic>>[];
+
+    try {
+      while (true) {
+        _drainRequested = false;
+        final response = await connector.consumeUserMessages();
+        final messages =
+            (response['messages'] as List<dynamic>?)
+                ?.cast<Map<String, dynamic>>() ??
+            const <Map<String, dynamic>>[];
+
+        if (messages.isNotEmpty) {
+          _bufferedMessages.addAll(messages);
+          allAddedMessages.addAll(messages);
+          _lastMessageReceivedAt = DateTime.now().toUtc();
+          _lastKnownAppPendingCount = 0;
+          totalAdded += messages.length;
+        }
+
+        if (!_drainRequested) {
+          break;
+        }
+      }
+
+      if (totalAdded == 0) return;
+
+      if (_messageArrived != null && !_messageArrived!.isCompleted) {
+        _messageArrived!.complete();
+      }
+
+      await _notifyPendingMessagesResourceUpdated();
+      _maybeTriggerSamplingPush(allAddedMessages);
+    } catch (err, st) {
+      _logger.warning('Failed to drain user messages ($origin)', err, st);
+    } finally {
+      _isDrainingMessages = false;
+    }
+  }
+
+  Future<void> _notifyPendingMessagesResourceUpdated() async {
+    final server = _server;
+    if (server == null || !server.isConnected) return;
+
+    try {
+      await server.server.sendResourceUpdated(
+        const ResourceUpdatedNotification(uri: _pendingMessagesResourceUri),
+      );
+    } catch (err) {
+      // Clients that do not support/subscribe to resources can ignore this.
+      _logger.fine('Skipping resource update notification: $err');
+    }
+  }
+
+  void _maybeTriggerSamplingPush(List<Map<String, dynamic>> newMessages) {
+    if (!_enableSamplingPush || _isProcessingQueue) {
+      return;
+    }
+
+    final server = _server;
+    if (server == null || !server.isConnected) {
+      return;
+    }
+
+    final capabilities = server.server.getClientCapabilities();
+    if (capabilities?.sampling == null) {
+      return;
+    }
+
+    final now = DateTime.now().toUtc();
+    final lastPushAt = _lastSamplingPushAt;
+    if (lastPushAt != null &&
+        now.difference(lastPushAt) < const Duration(milliseconds: 500)) {
+      return;
+    }
+    _lastSamplingPushAt = now;
+
+    final preview = newMessages
+        .take(3)
+        .map((m) => '- ${m['text'] as String? ?? '(no text)'}')
+        .join('\n');
+
+    unawaited(() async {
+      try {
+        final result = await server.server.createMessage(
+          CreateMessageRequest(
+            messages: [
+              SamplingMessage(
+                role: SamplingMessageRole.user,
+                content: SamplingTextContent(
+                  text:
+                      'A Flutter app user sent new message(s) to Flan.\n'
+                      'Call get_user_message (or read flan://messages/pending) '
+                      'to consume them now.\n'
+                      'Preview:\n$preview',
+                ),
+              ),
+            ],
+            maxTokens: 160,
+          ),
+          RequestOptions(timeout: const Duration(seconds: 3)),
+        );
+        _logger.fine(
+          'Triggered sampling push for ${newMessages.length} message(s), model: ${result.model}',
+        );
+      } catch (err) {
+        _logger.warning('Sampling push trigger failed', err);
+      }
+    }());
+  }
+
+  void _maybeTriggerSamplingPushForPendingCount(int pendingCount) {
+    if (!_enableSamplingPush || _isProcessingQueue || pendingCount <= 0) {
+      return;
+    }
+
+    final server = _server;
+    if (server == null || !server.isConnected) {
+      return;
+    }
+
+    final capabilities = server.server.getClientCapabilities();
+    if (capabilities?.sampling == null) {
+      return;
+    }
+
+    final now = DateTime.now().toUtc();
+    final lastPushAt = _lastSamplingPushAt;
+    if (lastPushAt != null &&
+        now.difference(lastPushAt) < const Duration(milliseconds: 500)) {
+      return;
+    }
+    _lastSamplingPushAt = now;
+
+    unawaited(() async {
+      try {
+        final result = await server.server.createMessage(
+          CreateMessageRequest(
+            messages: [
+              SamplingMessage(
+                role: SamplingMessageRole.user,
+                content: SamplingTextContent(
+                  text:
+                      'A Flutter app user sent new message(s) to Flan.\n'
+                      'There are currently $pendingCount pending message(s).\n'
+                      'Call process_queue (or get_user_message) to consume them.',
+                ),
+              ),
+            ],
+            maxTokens: 120,
+          ),
+          RequestOptions(timeout: const Duration(seconds: 3)),
+        );
+        _logger.fine(
+          'Triggered sampling push for pending queue ($pendingCount), model: ${result.model}',
+        );
+      } catch (err) {
+        _logger.warning('Sampling push trigger failed', err);
+      }
+    }());
+  }
+
+  int get debugBufferedMessageCount => _bufferedMessages.length;
+
+  void debugSetSamplingPushEnabled(bool enabled) {
+    _enableSamplingPush = enabled;
+  }
+
+  void _startAgentListeningHeartbeat() {
+    _agentListeningHeartbeat?.cancel();
+    _agentListeningHeartbeat = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (!_isProcessingQueue || !connector.isConnected) return;
+      unawaited(() async {
+        try {
+          await connector.setAgentListening(true);
+        } catch (_) {
+          // Ignore heartbeat errors (e.g. app disconnect in progress).
+        }
+      }());
     });
   }
 
-  void _stopPolling() {
-    _pollTimer?.cancel();
-    _pollTimer = null;
+  void _stopAgentListeningHeartbeat() {
+    _agentListeningHeartbeat?.cancel();
+    _agentListeningHeartbeat = null;
   }
 
   /// Handles unexpected connection loss by cleaning up state and notifying
   /// the agent via a logging message.
   void _onConnectionLost() {
-    _stopPolling();
-    _isWaitingForMessages = false;
-    // Wake up watch_flan if it's blocked so it can return an error.
+    _stopAgentListeningHeartbeat();
+    _isDrainingMessages = false;
+    _drainRequested = false;
+    _isProcessingQueue = false;
+    _lastKnownAppPendingCount = 0;
+    _enableSamplingPush = false;
+    _lastSamplingPushAt = null;
+    unawaited(() async {
+      try {
+        await connector.setHostConnectionState(
+          connected: false,
+          pushCapable: false,
+        );
+      } catch (_) {}
+    }());
+    unawaited(() async {
+      try {
+        await connector.setAgentListening(false);
+      } catch (_) {}
+    }());
+    // Wake up process_queue if it's blocked so it can return an error.
     if (_messageArrived != null && !_messageArrived!.isCompleted) {
       _messageArrived!.complete();
     }
@@ -102,6 +334,31 @@ final class VmServiceContext {
   void registerTools(McpServer server) {
     _server = server;
     connector.onDisconnect = _onConnectionLost;
+    connector.onUserMessageQueued = _onUserMessageQueued;
+    connector.onAnnotationChanged = _onAnnotationChanged;
+
+    server.registerResource(
+      'flan_pending_messages',
+      _pendingMessagesResourceUri,
+      (
+        description:
+            'Snapshot of queued user messages waiting for the agent '
+            'in the connected Flutter app.',
+        mimeType: _pendingMessagesResourceMime,
+      ),
+      (uri, extra) async => _buildPendingMessagesResource(uri),
+    );
+
+    server.registerResource(
+      'flan_annotations',
+      _annotationsResourceUri,
+      (
+        description: 'Current annotations drawn on the Flutter app screen.',
+        mimeType: _annotationsResourceMime,
+      ),
+      (uri, extra) async => _buildAnnotationsResource(uri),
+    );
+
     // Connection management tools
     server
       ..registerTool(
@@ -115,24 +372,49 @@ final class VmServiceContext {
               description:
                   'VM service URI (e.g., ws://127.0.0.1:8181/ws). This is printed in the Flutter app console when running in debug mode.',
             ),
+            'sampling_push': JsonSchema.boolean(
+              description:
+                  'Enable server-initiated sampling/createMessage triggers when user messages arrive. '
+                  'Only works if the MCP client advertises sampling capability.',
+            ),
           },
           required: ['uri'],
         ),
         callback: (args, extra) async {
           final uri = args['uri'] as String;
+          _enableSamplingPush = args['sampling_push'] as bool? ?? false;
           _logger.info('Connecting to app at $uri');
 
           try {
             await connector.connect(uri);
-            _startPolling();
+            await _refreshPendingQueueAndNotify(origin: 'connect');
+            final clientCapabilities = _server?.server.getClientCapabilities();
+            final samplingAvailable = clientCapabilities?.sampling != null;
+            // Resource-updated notifications are server-initiated JSON-RPC
+            // notifications and are available whenever a host is connected.
+            final notificationPushAvailable = _server?.isConnected ?? false;
+            final pushCapable = notificationPushAvailable || samplingAvailable;
+            try {
+              await connector.setHostConnectionState(
+                connected: true,
+                pushCapable: pushCapable,
+              );
+            } catch (err) {
+              _logger.fine('Failed to set host connection state: $err');
+            }
+            final samplingState = !_enableSamplingPush
+                ? 'disabled'
+                : (samplingAvailable ? 'enabled' : 'requested (unsupported)');
             return CallToolResult(
               content: [
                 TextContent(
                   text:
-                      'Successfully connected to app at $uri\n\n'
-                      'IMPORTANT: Now call the watch_flan tool '
-                      'in the background to listen for messages from the '
-                      'user in the Flutter app.',
+                      'Successfully connected to app at $uri.\n\n'
+                      'Message delivery is event-driven now (no timer polling). '
+                      'You can use process_queue to drain pending messages, '
+                      'get_user_message for manual retrieval, '
+                      'or read flan://messages/pending.\n'
+                      'sampling_push: $samplingState',
                 ),
               ],
             );
@@ -155,7 +437,25 @@ final class VmServiceContext {
           _logger.info('Disconnecting from app');
 
           try {
-            _stopPolling();
+            _stopAgentListeningHeartbeat();
+            _isDrainingMessages = false;
+            _drainRequested = false;
+            _isProcessingQueue = false;
+            _lastKnownAppPendingCount = 0;
+            _enableSamplingPush = false;
+            _lastSamplingPushAt = null;
+            if (_messageArrived != null && !_messageArrived!.isCompleted) {
+              _messageArrived!.complete();
+            }
+            try {
+              await connector.setAgentListening(false);
+            } catch (_) {}
+            try {
+              await connector.setHostConnectionState(
+                connected: false,
+                pushCapable: false,
+              );
+            } catch (_) {}
             await connector.disconnect();
             return CallToolResult(
               content: [
@@ -703,8 +1003,11 @@ final class VmServiceContext {
         description:
             'Programmatically inspects the widget at the given screen '
             'coordinates (x, y). Returns the selected widget data including '
-            'type, ancestor path, source location, properties, and bounds. '
+            'type, ancestor path, source location, key/text (when present), '
+            'and bounds. '
             'Does not require inspector mode to be enabled. '
+            'This call is side-effect-free and does not toggle inspector or '
+            'annotation UI state. '
             'Use this tool to verify changes after modifying a widget — '
             'it is much cheaper than taking a screenshot. '
             'Requires an active connection established via connect.',
@@ -987,21 +1290,11 @@ final class VmServiceContext {
           _logger.info('Getting user messages');
 
           try {
-            // First check for messages buffered by the polling loop
-            final allMessages = <Map<String, dynamic>>[];
-            if (_bufferedMessages.isNotEmpty) {
-              allMessages.addAll(_bufferedMessages);
-              _bufferedMessages.clear();
-            }
-
-            // Also check for any new messages not yet polled
-            final response = await connector.consumeUserMessages();
-            final freshMessages = response['messages'] as List?;
-            if (freshMessages != null && freshMessages.isNotEmpty) {
-              for (final msg in freshMessages) {
-                allMessages.add(msg as Map<String, dynamic>);
-              }
-            }
+            await _drainMessagesAndNotify(origin: 'get_user_message');
+            final allMessages = List<Map<String, dynamic>>.from(
+              _bufferedMessages,
+            );
+            _bufferedMessages.clear();
 
             if (allMessages.isEmpty) {
               return CallToolResult(
@@ -1051,39 +1344,43 @@ final class VmServiceContext {
           }
         },
       )
-      // --- Long-polling user message tool ---
+      // --- Queue processing tool ---
       ..registerTool(
-        'watch_flan',
+        'process_queue',
         description:
-            'Waits for a message from the user in the Flutter app. This tool '
-            'blocks until the user sends a message (by selecting a widget and '
-            'typing in the inspector, or by sending annotations). '
-            'IMPORTANT: Call this tool in the background immediately after '
-            'connecting to a Flutter app, and again after handling each '
-            'received message, to continuously listen for user input. '
-            'When a message is received, it includes the selected widget '
-            'details (type, path, source location, bounds) and the user\'s '
-            'instructions. After making requested changes, verify by using '
-            'inspect_widget_at on the same coordinates instead of taking a '
-            'screenshot. Then call watch_flan again in the '
-            'background to continue listening.',
+            'Consumes and returns queued user messages from the Flutter app '
+            'until the queue is drained. Use this after the user sends a batch '
+            'of instructions, then run it once to process all pending items. '
+            'Messages include selected-widget metadata and optional images. '
+            'After applying changes, verify with inspect_widget_at when '
+            'possible instead of full screenshots.',
         annotations: const ToolAnnotations(
-          title: 'Watch Flan',
+          title: 'Process Queue',
           readOnlyHint: true,
         ),
         inputSchema: ToolInputSchema(
           properties: {
-            'timeout': JsonSchema.integer(
+            'idle_timeout_ms': JsonSchema.integer(
               description:
-                  'Maximum time to wait in seconds. Defaults to 300 (5 minutes).',
+                  'How long to wait for more messages after processing begins. '
+                  'Stops when no new messages arrive within this window. '
+                  'Defaults to 500.',
+            ),
+            'max_wait_seconds': JsonSchema.integer(
+              description:
+                  'Safety cap for total processing time. Defaults to 30.',
             ),
           },
         ),
         callback: (args, extra) async {
-          final timeoutSecs = (args['timeout'] as int?) ?? 300;
-          _logger.info('Waiting for user message (timeout: ${timeoutSecs}s)');
+          final idleTimeoutMs = (args['idle_timeout_ms'] as int?) ?? 500;
+          final maxWaitSeconds = (args['max_wait_seconds'] as int?) ?? 30;
+          _logger.info(
+            'Processing message queue '
+            '(idle_timeout_ms: $idleTimeoutMs, max_wait_seconds: $maxWaitSeconds)',
+          );
 
-          _isWaitingForMessages = true;
+          _isProcessingQueue = true;
 
           // Signal the Flutter app that the agent is listening.
           if (connector.isConnected) {
@@ -1091,9 +1388,13 @@ final class VmServiceContext {
               await connector.setAgentListening(true);
             } catch (_) {}
           }
+          _startAgentListeningHeartbeat();
 
           try {
-            final deadline = DateTime.now().add(Duration(seconds: timeoutSecs));
+            final deadline = DateTime.now().add(
+              Duration(seconds: maxWaitSeconds),
+            );
+            final allMessages = <Map<String, dynamic>>[];
 
             while (DateTime.now().isBefore(deadline)) {
               // Bail out immediately if the connection was lost.
@@ -1110,48 +1411,57 @@ final class VmServiceContext {
                 );
               }
 
-              // Check buffered messages (filled by _startPolling)
+              await _drainMessagesAndNotify(origin: 'process_queue');
+
               if (_bufferedMessages.isNotEmpty) {
-                final messages = List<Map<String, dynamic>>.from(
-                  _bufferedMessages,
-                );
+                allMessages.addAll(_bufferedMessages);
                 _bufferedMessages.clear();
-                return _formatUserMessages(messages);
+              } else if (allMessages.isEmpty) {
+                return CallToolResult(
+                  content: [
+                    const TextContent(text: 'No pending user messages'),
+                  ],
+                );
               }
 
-              // Wait for the polling loop to signal new messages, or timeout.
               final remaining = deadline.difference(DateTime.now());
-              if (remaining.isNegative) break;
+              if (remaining <= Duration.zero) {
+                break;
+              }
 
               _messageArrived = Completer<void>();
+              if (_bufferedMessages.isNotEmpty &&
+                  !_messageArrived!.isCompleted) {
+                _messageArrived!.complete();
+              }
+
+              final waitWindow = Duration(milliseconds: idleTimeoutMs);
               try {
                 await _messageArrived!.future.timeout(
-                  // Wake up at most every 2s to re-check deadline, but
-                  // don't exceed the remaining timeout.
-                  remaining < const Duration(seconds: 2)
-                      ? remaining
-                      : const Duration(seconds: 2),
+                  remaining < waitWindow ? remaining : waitWindow,
                 );
               } on TimeoutException {
-                // Normal — just loop back to check deadline and buffer.
+                // Queue stayed idle for the configured window: done.
+                break;
               }
             }
 
-            return CallToolResult(
-              content: [
-                const TextContent(
-                  text: 'Timed out waiting for a user message.',
-                ),
-              ],
-            );
+            if (allMessages.isEmpty) {
+              return CallToolResult(
+                content: [const TextContent(text: 'No pending user messages')],
+              );
+            }
+
+            return _formatUserMessages(allMessages);
           } catch (err) {
-            _logger.warning('Error waiting for user message', err);
+            _logger.warning('Error processing user message queue', err);
             return CallToolResult(
               isError: true,
               content: [TextContent(text: err.toString())],
             );
           } finally {
-            _isWaitingForMessages = false;
+            _stopAgentListeningHeartbeat();
+            _isProcessingQueue = false;
             _messageArrived = null;
             // Signal the Flutter app that the agent stopped listening.
             if (connector.isConnected) {
@@ -1162,6 +1472,87 @@ final class VmServiceContext {
           }
         },
       );
+  }
+
+  ReadResourceResult _buildPendingMessagesResource(Uri uri) {
+    const previewLimit = 10;
+    final previewSource = _bufferedMessages.length <= previewLimit
+        ? _bufferedMessages
+        : _bufferedMessages.sublist(_bufferedMessages.length - previewLimit);
+
+    final preview = previewSource.map((message) {
+      final data = message['data'] as Map<String, dynamic>?;
+      return <String, dynamic>{
+        'timestamp': message['timestamp'],
+        'text': message['text'],
+        'hasScreenshot': data?.containsKey('screenshot') ?? false,
+        'hasDrawing': data?.containsKey('drawingImage') ?? false,
+      };
+    }).toList();
+
+    final bufferedCount = _bufferedMessages.length;
+    final appPendingCount = _lastKnownAppPendingCount;
+    final snapshot = jsonEncode({
+      'count': bufferedCount + appPendingCount,
+      'bufferedCount': bufferedCount,
+      'appPendingCount': appPendingCount,
+      'previewCount': preview.length,
+      'preview': preview,
+      'lastMessageReceivedAt': _lastMessageReceivedAt?.toIso8601String(),
+    });
+
+    return ReadResourceResult(
+      contents: [
+        TextResourceContents(
+          uri: uri.toString(),
+          mimeType: _pendingMessagesResourceMime,
+          text: snapshot,
+        ),
+      ],
+    );
+  }
+
+  Future<ReadResourceResult> _buildAnnotationsResource(Uri uri) async {
+    if (!connector.isConnected) {
+      return ReadResourceResult(
+        contents: [
+          TextResourceContents(
+            uri: uri.toString(),
+            mimeType: _annotationsResourceMime,
+            text: jsonEncode({'error': 'Not connected'}),
+          ),
+        ],
+      );
+    }
+
+    try {
+      final response = await connector.getAnnotations();
+      final annotations = response['annotations'] as List<dynamic>? ?? [];
+      final snapshot = jsonEncode({
+        'count': annotations.length,
+        'annotations': annotations,
+      });
+
+      return ReadResourceResult(
+        contents: [
+          TextResourceContents(
+            uri: uri.toString(),
+            mimeType: _annotationsResourceMime,
+            text: snapshot,
+          ),
+        ],
+      );
+    } catch (err) {
+      return ReadResourceResult(
+        contents: [
+          TextResourceContents(
+            uri: uri.toString(),
+            mimeType: _annotationsResourceMime,
+            text: jsonEncode({'error': err.toString()}),
+          ),
+        ],
+      );
+    }
   }
 
   /// Formats consumed user messages into a CallToolResult.

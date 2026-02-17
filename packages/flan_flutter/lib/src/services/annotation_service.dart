@@ -1,6 +1,10 @@
+import 'dart:developer' as developer;
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
+
+/// Event kind sent when annotations change.
+const String kAnnotationChangedEventKind = 'flan.annotationChanged';
 
 /// A single annotation with bounds, text, and metadata.
 class Annotation {
@@ -163,6 +167,7 @@ class AnnotationService extends ChangeNotifier {
       text: text.isEmpty ? '(no label)' : text,
     );
     _annotations.add(annotation);
+    _postAnnotationChangedEvent();
     _resetDrawing();
   }
 
@@ -181,6 +186,7 @@ class AnnotationService extends ChangeNotifier {
     }
     _editingIndex = null;
     _drawState = AnnotationDrawState.normal;
+    _postAnnotationChangedEvent();
     notifyListeners();
   }
 
@@ -195,6 +201,24 @@ class AnnotationService extends ChangeNotifier {
     final index = _annotations.indexWhere((a) => a.id == id);
     if (index == -1) return false;
     _annotations.removeAt(index);
+    _postAnnotationChangedEvent();
+    notifyListeners();
+    return true;
+  }
+
+  /// Updates an annotation's text by id. Empty text deletes the annotation.
+  /// Returns true if an annotation was found and changed.
+  bool updateAnnotationTextById(String id, String text) {
+    final index = _annotations.indexWhere((a) => a.id == id);
+    if (index == -1) return false;
+
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) {
+      _annotations.removeAt(index);
+    } else {
+      _annotations[index] = _annotations[index].copyWith(text: trimmed);
+    }
+    _postAnnotationChangedEvent();
     notifyListeners();
     return true;
   }
@@ -202,6 +226,7 @@ class AnnotationService extends ChangeNotifier {
   /// Clears all annotations.
   void clearAnnotations() {
     _annotations.clear();
+    _postAnnotationChangedEvent();
     notifyListeners();
   }
 
@@ -219,6 +244,7 @@ class AnnotationService extends ChangeNotifier {
       text: text,
     );
     _annotations.add(annotation);
+    _postAnnotationChangedEvent();
     notifyListeners();
     return annotation;
   }
@@ -234,5 +260,12 @@ class AnnotationService extends ChangeNotifier {
     _dragCurrent = null;
     _pendingRect = null;
     notifyListeners();
+  }
+
+  void _postAnnotationChangedEvent() {
+    developer.postEvent(kAnnotationChangedEventKind, {
+      'count': _annotations.length,
+      'timestamp': DateTime.now().toIso8601String(),
+    });
   }
 }
