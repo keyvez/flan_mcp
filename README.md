@@ -127,7 +127,26 @@ The agent doesn't need to take expensive screenshots or traverse the full widget
 1. **Prepare your Flutter app** — Add `flan_flutter` and initialize `FlanBinding` in your `main.dart`
 2. **Install the MCP server** — `dart pub global activate flan_mcp`
 3. **Configure your AI tool** — Add the `flan_mcp` command to your tool's MCP configuration
-4. **Run your app in debug mode** — Copy the VM service URI from the console (e.g., `ws://127.0.0.1:12345/ws`)
+4. **Run your app in debug mode** — Copy the VM service URI from the console output.
+
+   It looks like this:
+
+   ```text
+   Launching lib/main.dart on Chrome in debug mode...
+   Waiting for connection from debug service on Chrome...             27.1s
+
+   Flutter run key commands.
+   r Hot reload. 🔥🔥🔥
+   R Hot restart.
+   h List all available interactive commands.
+   d Detach (terminate "flutter run" but leave application running).
+   c Clear the screen
+   q Quit (terminate the application on the device).
+
+   This app is linked to the debug service: ws://127.0.0.1:52794/N2Tizytts-E=/ws
+   ```
+
+   Copy this URL: `ws://127.0.0.1:52794/N2Tizytts-E=/ws`
 5. **Connect and interact** — Ask the agent to connect, then start pointing at things
 
 ## Installation
@@ -369,7 +388,7 @@ pkill -f flan_relay
 ## Troubleshooting
 
 - **"Not connected to any app"**: The agent must call `connect` with the VM Service URI first.
-- **Finding the URI**: Run `flutter run` in debug mode. Look for `ws://127.0.0.1:PORT/ws` in the output.
+- **Finding the URI**: Run `flutter run` in debug mode and copy the WebSocket URL from the line `This app is linked to the debug service: ...` (for example, `ws://127.0.0.1:52794/N2Tizytts-E=/ws`).
 - **Elements not found**: Ensure widgets are visible and custom widgets are configured in `FlanConfiguration`.
 - **Agent not receiving messages**: Make sure the agent has called `watch_flan`. The green dot in the message overlay confirms the agent is listening.
 

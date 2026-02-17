@@ -36,6 +36,8 @@ class FlanOverlayWidget extends StatefulWidget {
 class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   bool _showTextMessageOverlay = false;
   bool _textOverlayEverShown = false;
+  bool _showQueuedMessagesPanel = false;
+  List<Map<String, dynamic>> _queuedMessagesSnapshot = const [];
 
   /// Tracks the last time an Alt/Option key was pressed for double-tap detection.
   DateTime? _lastAltPressTime;
@@ -73,11 +75,32 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
   void _onUserMessageServiceChanged() {
     if (!mounted) return;
-    // Dismiss the overlay when the waiting state clears (e.g. after hot reload).
-    if (_showTextMessageOverlay &&
-        !widget.userMessageService.waitingForActivity) {
-      setState(() => _showTextMessageOverlay = false);
-    }
+    final pendingMessages = widget.userMessageService.peekMessages();
+    setState(() {
+      // Dismiss the overlay when the waiting state clears (e.g. after hot
+      // reload).
+      if (_showTextMessageOverlay &&
+          !widget.userMessageService.waitingForActivity) {
+        _showTextMessageOverlay = false;
+      }
+
+      // Keep queue panel stable while still allowing newly queued messages
+      // to appear in the open panel/count.
+      if (_showQueuedMessagesPanel && pendingMessages.isNotEmpty) {
+        final existingIds =
+            _queuedMessagesSnapshot.map(_messageIdentity).toSet();
+        for (final message in pendingMessages) {
+          final id = _messageIdentity(message);
+          if (!existingIds.contains(id)) {
+            _queuedMessagesSnapshot = [
+              ..._queuedMessagesSnapshot,
+              Map<String, dynamic>.from(message),
+            ];
+            existingIds.add(id);
+          }
+        }
+      }
+    });
   }
 
   /// Global keyboard shortcut handler.
@@ -294,6 +317,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
   @override
   Widget build(BuildContext context) {
+    final pendingMessages = widget.userMessageService.peekMessages();
+    final pendingCount = pendingMessages.length;
+    final displayCount =
+        _showQueuedMessagesPanel && _queuedMessagesSnapshot.isNotEmpty
+            ? _queuedMessagesSnapshot.length
+            : pendingCount;
+
     return Directionality(
       textDirection: TextDirection.ltr,
       child: Stack(
@@ -321,9 +351,44 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               onSubmitted: _onTextMessageSubmitted,
               userMessageService: widget.userMessageService,
             ),
+          if (displayCount > 0)
+            Positioned(
+              top: 16,
+              right: 16,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () {
+                  setState(() {
+                    if (_showQueuedMessagesPanel) {
+                      _showQueuedMessagesPanel = false;
+                      _queuedMessagesSnapshot = const [];
+                      return;
+                    }
+                    _queuedMessagesSnapshot =
+                        List<Map<String, dynamic>>.from(pendingMessages);
+                    _showQueuedMessagesPanel =
+                        _queuedMessagesSnapshot.isNotEmpty;
+                  });
+                },
+                child: _QueuedMessagesBadge(count: displayCount),
+              ),
+            ),
+          if (_showQueuedMessagesPanel && _queuedMessagesSnapshot.isNotEmpty)
+            Positioned(
+              top: 56,
+              right: 16,
+              child: _QueuedMessagesPanel(messages: _queuedMessagesSnapshot),
+            ),
         ],
       ),
     );
+  }
+
+  static String _messageIdentity(Map<String, dynamic> message) {
+    final timestamp = message['timestamp']?.toString() ?? '';
+    final type = message['type']?.toString() ?? '';
+    final text = message['text']?.toString() ?? '';
+    return '$timestamp|$type|$text';
   }
 }
 
@@ -564,7 +629,6 @@ class _AnnotationOverlay extends StatefulWidget {
 class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   final TextEditingController _textController = TextEditingController();
   final FocusNode _textFocusNode = FocusNode();
-  bool _showDisconnectedWarning = false;
 
   @override
   void initState() {
@@ -584,11 +648,6 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
 
   void _onChanged() {
     if (mounted) {
-      // Dismiss warning when agent connects
-      if (widget.userMessageService.isAgentListening &&
-          _showDisconnectedWarning) {
-        _showDisconnectedWarning = false;
-      }
       setState(() {});
     }
   }
@@ -604,7 +663,6 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
             child: Listener(
               behavior: HitTestBehavior.opaque,
               onPointerDown: (event) {
-                _showDisconnectedWarning = false;
                 final tappedExisting =
                     widget.service.startDrawing(event.position);
                 if (tappedExisting) {
@@ -678,78 +736,13 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   }
 
   void _handleNewAnnotationSubmit(String text) {
-    if (!widget.userMessageService.isAgentListening) {
-      setState(() => _showDisconnectedWarning = true);
-      // Re-focus the text field so user can retry
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _textFocusNode.requestFocus();
-      });
-      return;
-    }
-    _showDisconnectedWarning = false;
     widget.service.submitAnnotationText(text);
     widget.onAnnotationSubmitted();
   }
 
   void _handleEditAnnotationSubmit(String text) {
-    if (!widget.userMessageService.isAgentListening) {
-      setState(() => _showDisconnectedWarning = true);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _textFocusNode.requestFocus();
-      });
-      return;
-    }
-    _showDisconnectedWarning = false;
     widget.service.submitEditedAnnotationText(text);
     widget.onAnnotationSubmitted();
-  }
-
-  Widget _buildDisconnectedWarning(double left, double top, double fieldWidth) {
-    return Positioned(
-      left: left,
-      top: top,
-      width: fieldWidth,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-        decoration: BoxDecoration(
-          color: const Color(0xFF2A2A3E),
-          borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: const Color(0xFF444466)),
-          boxShadow: const [
-            BoxShadow(
-              color: Color(0x66000000),
-              blurRadius: 4,
-              offset: Offset(0, 2),
-            ),
-          ],
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 8,
-              height: 8,
-              decoration: const BoxDecoration(
-                shape: BoxShape.circle,
-                color: Color(0xFFFF5252),
-              ),
-            ),
-            const SizedBox(width: 6),
-            const Flexible(
-              child: Text(
-                'Agent disconnected — ask the agent to call watch_flan',
-                style: TextStyle(
-                  color: Color(0xFFFF5252),
-                  fontSize: 11,
-                  fontWeight: FontWeight.w500,
-                  decoration: TextDecoration.none,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
   }
 
   Widget _buildTextField(Rect rect, Size screenSize) {
@@ -771,8 +764,6 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
       left = screenSize.width - fieldWidth;
     }
     if (left < 0) left = 0;
-
-    final warningTop = top + maxFieldHeight + gap;
 
     return Stack(
       children: [
@@ -805,13 +796,17 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
                 ),
                 cursorColor: const Color(0xFFFF6600),
                 backgroundCursorColor: const Color(0xFF333333),
+                inputFormatters: [
+                  _SubmitOnEnterFormatter(
+                    onSubmit: () =>
+                        _handleNewAnnotationSubmit(_textController.text),
+                  ),
+                ],
                 onSubmitted: _handleNewAnnotationSubmit,
               ),
             ),
           ),
         ),
-        if (_showDisconnectedWarning)
-          _buildDisconnectedWarning(left, warningTop, fieldWidth),
       ],
     );
   }
@@ -832,8 +827,6 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
       left = screenSize.width - fieldWidth;
     }
     if (left < 0) left = 0;
-
-    final warningTop = top + maxFieldHeight + gap;
 
     return Stack(
       children: [
@@ -870,13 +863,17 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
                 ),
                 cursorColor: const Color(0xFFFF6600),
                 backgroundCursorColor: const Color(0xFF333333),
+                inputFormatters: [
+                  _SubmitOnEnterFormatter(
+                    onSubmit: () =>
+                        _handleEditAnnotationSubmit(_textController.text),
+                  ),
+                ],
                 onSubmitted: _handleEditAnnotationSubmit,
               ),
             ),
           ),
         ),
-        if (_showDisconnectedWarning)
-          _buildDisconnectedWarning(left, warningTop, fieldWidth),
       ],
     );
   }
@@ -1521,6 +1518,160 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
   }
 }
 
+class _QueuedMessagesBadge extends StatelessWidget {
+  const _QueuedMessagesBadge({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: BoxDecoration(
+        color: const Color(0xFF00AAFF),
+        borderRadius: BorderRadius.circular(999),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x66000000),
+            blurRadius: 8,
+            offset: Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Text(
+        '$count',
+        style: const TextStyle(
+          color: Color(0xFF001622),
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          decoration: TextDecoration.none,
+        ),
+      ),
+    );
+  }
+}
+
+class _QueuedMessagesPanel extends StatelessWidget {
+  const _QueuedMessagesPanel({required this.messages});
+
+  final List<Map<String, dynamic>> messages;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 340,
+      constraints: const BoxConstraints(maxHeight: 260),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1A2E),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF00AAFF), width: 1),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x88000000),
+            blurRadius: 16,
+            offset: Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+            child: Text(
+              'Queued messages (${messages.length})',
+              style: const TextStyle(
+                color: Color(0xFF00AAFF),
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                decoration: TextDecoration.none,
+              ),
+            ),
+          ),
+          const Divider(height: 1, color: Color(0xFF333344)),
+          Flexible(
+            child: ListView.separated(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              shrinkWrap: true,
+              itemBuilder: (context, index) {
+                final message = messages[index];
+                final summary = _summarizeMessage(message);
+                final timestamp = _formatTimestamp(
+                  message['timestamp'] as String?,
+                );
+
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        summary,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Color(0xFFE0E0E0),
+                          fontSize: 12,
+                          height: 1.4,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                      if (timestamp != null) ...[
+                        const SizedBox(height: 3),
+                        Text(
+                          timestamp,
+                          style: const TextStyle(
+                            color: Color(0xFF8E8EA0),
+                            fontSize: 10,
+                            decoration: TextDecoration.none,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                );
+              },
+              separatorBuilder: (_, __) =>
+                  const Divider(height: 12, color: Color(0xFF2A2A3A)),
+              itemCount: messages.length,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static String _summarizeMessage(Map<String, dynamic> message) {
+    final text = message['text'] as String?;
+    if (text != null && text.trim().isNotEmpty) {
+      return text.trim();
+    }
+    final data = message['data'];
+    if (data != null) {
+      return data.toString();
+    }
+    return 'Queued message';
+  }
+
+  static String? _formatTimestamp(String? timestamp) {
+    if (timestamp == null || timestamp.isEmpty) {
+      return null;
+    }
+    final parsed = DateTime.tryParse(timestamp);
+    if (parsed == null) {
+      return timestamp;
+    }
+    final local = parsed.toLocal();
+    final year = local.year.toString().padLeft(4, '0');
+    final month = local.month.toString().padLeft(2, '0');
+    final day = local.day.toString().padLeft(2, '0');
+    final hour = local.hour.toString().padLeft(2, '0');
+    final minute = local.minute.toString().padLeft(2, '0');
+    final second = local.second.toString().padLeft(2, '0');
+    return '$year-$month-$day $hour:$minute:$second';
+  }
+}
+
 /// A [TextInputFormatter] that intercepts bare Enter (without Shift) to
 /// trigger submission, while allowing Shift+Enter to insert a newline.
 class _SubmitOnEnterFormatter extends TextInputFormatter {
@@ -1603,19 +1754,23 @@ class _ShortcutRow extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
       child: Row(
-        mainAxisSize: MainAxisSize.min,
         children: [
           for (var i = 0; i < keyCaps.length; i++) ...[
             if (i > 0) const SizedBox(width: 4),
             keyCaps[i],
           ],
           const SizedBox(width: 10),
-          Text(
-            label,
-            style: const TextStyle(
-              color: Color(0xFFAAAAAA),
-              fontSize: 13,
-              decoration: TextDecoration.none,
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              softWrap: false,
+              style: const TextStyle(
+                color: Color(0xFFAAAAAA),
+                fontSize: 13,
+                decoration: TextDecoration.none,
+              ),
             ),
           ),
         ],
@@ -1741,13 +1896,18 @@ class _AgentStatusIndicatorState extends State<_AgentStatusIndicator> {
                 ),
               ),
               const SizedBox(width: 6),
-              Text(
-                label,
-                style: TextStyle(
-                  color: color,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w500,
-                  decoration: TextDecoration.none,
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 130),
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: color,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                    decoration: TextDecoration.none,
+                  ),
                 ),
               ),
             ],

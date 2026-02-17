@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:logging/logging.dart' as logging;
+import 'package:flan_mcp/src/utils/num_parser.dart';
 import 'package:flan_mcp/src/vm_service/vm_service_connector.dart';
 import 'package:mcp_dart/mcp_dart.dart';
 
@@ -723,8 +724,8 @@ final class VmServiceContext {
           required: ['x', 'y'],
         ),
         callback: (args, extra) async {
-          final x = (args['x'] as num).toDouble();
-          final y = (args['y'] as num).toDouble();
+          final x = parseRequiredDoubleArg(args, 'x');
+          final y = parseRequiredDoubleArg(args, 'y');
           _logger.info('Inspecting widget at ($x, $y)');
 
           try {
@@ -923,10 +924,10 @@ final class VmServiceContext {
           required: ['x', 'y', 'width', 'height', 'text'],
         ),
         callback: (args, extra) async {
-          final x = (args['x'] as num).toDouble();
-          final y = (args['y'] as num).toDouble();
-          final width = (args['width'] as num).toDouble();
-          final height = (args['height'] as num).toDouble();
+          final x = parseRequiredDoubleArg(args, 'x');
+          final y = parseRequiredDoubleArg(args, 'y');
+          final width = parseRequiredDoubleArg(args, 'width');
+          final height = parseRequiredDoubleArg(args, 'height');
           final text = args['text'] as String;
           _logger.info(
             'Adding annotation at ($x, $y) ${width}x$height: "$text"',

@@ -13,6 +13,7 @@ import 'package:flan_flutter/src/services/scroll_simulator.dart';
 import 'package:flan_flutter/src/services/text_input_simulator.dart';
 import 'package:flan_flutter/src/services/widget_finder.dart';
 import 'package:flan_flutter/src/services/widget_matcher.dart';
+import 'package:flan_flutter/src/utils/num_parser.dart';
 
 /// A custom binding that extends Flutter's default binding to provide
 /// integration points for the Flan MCP.
@@ -32,6 +33,27 @@ class FlanBinding extends WidgetsFlutterBinding {
   /// The singleton instance of [FlanBinding].
   static FlanBinding get instance => BindingBase.checkInstance(_instance);
   static FlanBinding? _instance;
+
+  /// Attempts to enqueue a message for the connected agent.
+  ///
+  /// Returns `true` if Flan is initialized and the message was queued.
+  /// Returns `false` when Flan is not active (for example, release mode).
+  static bool trySendToAgent({
+    required String text,
+    String type = 'user_message',
+    Map<String, dynamic>? data,
+  }) {
+    final binding = _instance;
+    if (binding == null) return false;
+
+    final payload = <String, dynamic>{
+      'text': text,
+      'type': type,
+      if (data != null) 'data': data,
+    };
+    binding._userMessageService.sendMessage(payload);
+    return true;
+  }
 
   FlanBinding._(this.configuration);
 
@@ -316,8 +338,8 @@ class FlanBinding extends WidgetsFlutterBinding {
       name: 'flan.inspectorSelectAt',
       callback: (params) async {
         try {
-          final x = (params['x'] as num).toDouble();
-          final y = (params['y'] as num).toDouble();
+          final x = parseRequiredDoubleParam(params['x'], 'x');
+          final y = parseRequiredDoubleParam(params['y'], 'y');
           final selection = _inspectorService.inspectAt(x, y);
           return <String, dynamic>{
             'status': 'Success',
@@ -537,10 +559,10 @@ class FlanBinding extends WidgetsFlutterBinding {
       name: 'flan.annotationAdd',
       callback: (params) async {
         try {
-          final x = (params['x'] as num).toDouble();
-          final y = (params['y'] as num).toDouble();
-          final width = (params['width'] as num).toDouble();
-          final height = (params['height'] as num).toDouble();
+          final x = parseRequiredDoubleParam(params['x'], 'x');
+          final y = parseRequiredDoubleParam(params['y'], 'y');
+          final width = parseRequiredDoubleParam(params['width'], 'width');
+          final height = parseRequiredDoubleParam(params['height'], 'height');
           final text = params['text'] as String;
           final annotation = _annotationService.addAnnotationProgrammatically(
             x: x,

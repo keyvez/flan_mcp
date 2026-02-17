@@ -19,6 +19,9 @@ class UserMessageService extends ChangeNotifier {
   /// Whether there are pending messages to deliver.
   bool get hasPendingMessages => _pendingMessages.isNotEmpty;
 
+  /// Number of pending messages in the queue.
+  int get pendingMessageCount => _pendingMessages.length;
+
   /// Whether the agent is actively waiting for user messages.
   /// Automatically expires if no heartbeat is received within
   /// [_heartbeatTimeout].
@@ -90,6 +93,8 @@ class UserMessageService extends ChangeNotifier {
 
   /// Returns pending messages without clearing.
   List<Map<String, dynamic>> peekMessages() {
-    return List.unmodifiable(_pendingMessages);
+    return List.unmodifiable(
+      _pendingMessages.map((m) => Map<String, dynamic>.from(m)),
+    );
   }
 }
