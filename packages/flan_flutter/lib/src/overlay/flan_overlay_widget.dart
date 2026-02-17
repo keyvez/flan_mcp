@@ -256,6 +256,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   bool _textOverlayEverShown = false;
   bool _showQueuedMessagesPanel = false;
   List<Map<String, dynamic>> _queuedMessagesSnapshot = const [];
+  int _lastPendingCount = 0;
+  int _lastAgentConsumeGeneration = 0;
 
   /// Tracks the last time an Alt/Option key was pressed for double-tap detection.
   DateTime? _lastAltPressTime;
@@ -266,6 +268,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     widget.inspectorService.addListener(_onServiceChanged);
     widget.annotationService.addListener(_onServiceChanged);
     widget.userMessageService.addListener(_onUserMessageServiceChanged);
+    _lastPendingCount = widget.userMessageService.pendingMessageCount;
+    _lastAgentConsumeGeneration =
+        widget.userMessageService.agentConsumeGeneration;
     HardwareKeyboard.instance.addHandler(_handleGlobalKey);
   }
 
@@ -294,6 +299,21 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   void _onUserMessageServiceChanged() {
     if (!mounted) return;
     final pendingMessages = widget.userMessageService.peekMessages();
+    final pendingCount = pendingMessages.length;
+    final currentConsumeGeneration =
+        widget.userMessageService.agentConsumeGeneration;
+    final consumedByAgent =
+        currentConsumeGeneration != _lastAgentConsumeGeneration;
+    _lastAgentConsumeGeneration = currentConsumeGeneration;
+    final shouldClearAnnotations =
+        consumedByAgent && _lastPendingCount > 0 && pendingCount == 0;
+    _lastPendingCount = pendingCount;
+
+    if (shouldClearAnnotations &&
+        widget.annotationService.annotations.isNotEmpty) {
+      widget.annotationService.clearAnnotations();
+    }
+
     setState(() {
       // Dismiss the overlay when the waiting state clears (e.g. after hot
       // reload).
@@ -302,20 +322,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         _showTextMessageOverlay = false;
       }
 
-      // Keep queue panel stable while still allowing newly queued messages
-      // to appear in the open panel/count.
-      if (_showQueuedMessagesPanel && pendingMessages.isNotEmpty) {
-        final existingIds =
-            _queuedMessagesSnapshot.map(_messageIdentity).toSet();
-        for (final message in pendingMessages) {
-          final id = _messageIdentity(message);
-          if (!existingIds.contains(id)) {
-            _queuedMessagesSnapshot = [
-              ..._queuedMessagesSnapshot,
-              Map<String, dynamic>.from(message),
-            ];
-            existingIds.add(id);
-          }
+      // Keep the open queue panel synchronized with the service queue.
+      if (_showQueuedMessagesPanel) {
+        _queuedMessagesSnapshot = pendingMessages
+            .map((message) => Map<String, dynamic>.from(message))
+            .toList();
+        if (_queuedMessagesSnapshot.isEmpty) {
+          _showQueuedMessagesPanel = false;
         }
       }
     });
@@ -561,14 +574,153 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     });
   }
 
+  Future<void> _editQueuedAnnotation(
+    int queueId,
+    String annotationId,
+    String currentText,
+  ) async {
+    if (!mounted) return;
+    final controller = TextEditingController(text: currentText);
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Edit annotation'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            minLines: 1,
+            maxLines: 4,
+            decoration: const InputDecoration(
+              labelText: 'Annotation text',
+              border: OutlineInputBorder(),
+            ),
+            onSubmitted: (_) {
+              _applyQueuedAnnotationEdit(
+                queueId,
+                annotationId,
+                controller.text,
+              );
+              Navigator.of(dialogContext).pop();
+            },
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                _removeQueuedAnnotation(queueId, annotationId);
+                Navigator.of(dialogContext).pop();
+              },
+              child: const Text('Delete'),
+            ),
+            FilledButton(
+              onPressed: () {
+                _applyQueuedAnnotationEdit(
+                  queueId,
+                  annotationId,
+                  controller.text,
+                );
+                Navigator.of(dialogContext).pop();
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+  }
+
+  void _applyQueuedAnnotationEdit(
+    int queueId,
+    String annotationId,
+    String newText,
+  ) {
+    final trimmed = newText.trim();
+    if (trimmed.isEmpty) {
+      _removeQueuedAnnotation(queueId, annotationId);
+      return;
+    }
+    widget.annotationService.updateAnnotationTextById(annotationId, trimmed);
+    _updateQueuedAnnotationInMessage(
+      queueId: queueId,
+      annotationId: annotationId,
+      updatedText: trimmed,
+      remove: false,
+    );
+  }
+
+  void _removeQueuedAnnotation(int queueId, String annotationId) {
+    widget.annotationService.removeAnnotationById(annotationId);
+    _updateQueuedAnnotationInMessage(
+      queueId: queueId,
+      annotationId: annotationId,
+      remove: true,
+    );
+  }
+
+  void _updateQueuedAnnotationInMessage({
+    required int queueId,
+    required String annotationId,
+    String? updatedText,
+    required bool remove,
+  }) {
+    final pendingMessages = widget.userMessageService.peekMessages();
+    final index = pendingMessages.indexWhere((m) => _queueIdOf(m) == queueId);
+    if (index == -1) return;
+
+    final originalMessage = pendingMessages[index];
+    final data = _normalizedDataMap(originalMessage['data']);
+    final annotations = _normalizedAnnotationMaps(data['annotations']);
+    if (annotations.isEmpty) return;
+
+    var changed = false;
+    final updatedAnnotations = <Map<String, dynamic>>[];
+    for (final annotation in annotations) {
+      final id = annotation['id']?.toString();
+      if (id == annotationId) {
+        changed = true;
+        if (remove) {
+          continue;
+        }
+        updatedAnnotations.add({
+          ...annotation,
+          'text': updatedText ?? annotation['text'],
+        });
+        continue;
+      }
+      updatedAnnotations.add(annotation);
+    }
+    if (!changed) return;
+
+    data['annotations'] = updatedAnnotations;
+    final updatedMessage = Map<String, dynamic>.from(originalMessage);
+    updatedMessage['data'] = data;
+    updatedMessage['text'] = _rebuildQueuedMessageText(
+      fallback: originalMessage['text']?.toString() ?? 'Queued message',
+      data: data,
+    );
+
+    widget.userMessageService.updateMessageByQueueId(queueId, updatedMessage);
+
+    if (!mounted) return;
+    setState(() {
+      _queuedMessagesSnapshot = _queuedMessagesSnapshot
+          .map((message) => _queueIdOf(message) == queueId
+              ? Map<String, dynamic>.from(updatedMessage)
+              : message)
+          .toList();
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final pendingMessages = widget.userMessageService.peekMessages();
     final pendingCount = pendingMessages.length;
-    final displayCount =
-        _showQueuedMessagesPanel && _queuedMessagesSnapshot.isNotEmpty
-            ? _queuedMessagesSnapshot.length
-            : pendingCount;
+    final displayCount = pendingCount;
     final viewPadding = MediaQuery.paddingOf(context);
     final badgeTop = viewPadding.top + 16;
     final badgeRight = viewPadding.right + 16;
@@ -601,28 +753,30 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               onSubmitted: _onTextMessageSubmitted,
               userMessageService: widget.userMessageService,
             ),
-          if (displayCount > 0)
-            Positioned(
-              top: badgeTop,
-              right: badgeRight,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () {
-                  setState(() {
-                    if (_showQueuedMessagesPanel) {
-                      _showQueuedMessagesPanel = false;
-                      _queuedMessagesSnapshot = const [];
-                      return;
-                    }
-                    _queuedMessagesSnapshot =
-                        List<Map<String, dynamic>>.from(pendingMessages);
-                    _showQueuedMessagesPanel =
-                        _queuedMessagesSnapshot.isNotEmpty;
-                  });
-                },
-                child: _QueuedMessagesBadge(count: displayCount),
+          Positioned(
+            top: badgeTop,
+            right: badgeRight,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () {
+                setState(() {
+                  if (_showQueuedMessagesPanel) {
+                    _showQueuedMessagesPanel = false;
+                    _queuedMessagesSnapshot = const [];
+                    return;
+                  }
+                  _queuedMessagesSnapshot =
+                      List<Map<String, dynamic>>.from(pendingMessages);
+                  _showQueuedMessagesPanel = _queuedMessagesSnapshot.isNotEmpty;
+                });
+              },
+              child: _QueuedMessagesBadge(
+                count: displayCount,
+                pushConnected:
+                    widget.userMessageService.isPushCapableHostConnected,
               ),
             ),
+          ),
           if (_showQueuedMessagesPanel && _queuedMessagesSnapshot.isNotEmpty)
             Positioned(
               top: badgeTop + 40,
@@ -631,6 +785,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 messages: _queuedMessagesSnapshot,
                 onDeleteMessage: _removeQueuedMessage,
                 onClearAll: _clearQueuedMessages,
+                onEditAnnotation: _editQueuedAnnotation,
+                onDeleteAnnotation: _removeQueuedAnnotation,
               ),
             ),
         ],
@@ -643,17 +799,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     if (raw is int) return raw;
     if (raw is String) return int.tryParse(raw);
     return null;
-  }
-
-  static String _messageIdentity(Map<String, dynamic> message) {
-    final queueId = message['queueId']?.toString();
-    if (queueId != null && queueId.isNotEmpty) {
-      return 'id:$queueId';
-    }
-    final timestamp = message['timestamp']?.toString() ?? '';
-    final type = message['type']?.toString() ?? '';
-    final text = message['text']?.toString() ?? '';
-    return '$timestamp|$type|$text';
   }
 
   Rect? _resolveQueuePreviewBounds({
@@ -682,6 +827,100 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     }
 
     return combinedBounds;
+  }
+
+  static Map<String, dynamic> _normalizedDataMap(Object? rawData) {
+    if (rawData is Map<String, dynamic>) {
+      return Map<String, dynamic>.from(rawData);
+    }
+    if (rawData is Map) {
+      return rawData.map(
+        (key, value) => MapEntry(key.toString(), value),
+      );
+    }
+    return <String, dynamic>{};
+  }
+
+  static List<Map<String, dynamic>> _normalizedAnnotationMaps(
+    Object? rawAnnotations,
+  ) {
+    if (rawAnnotations is! List) return const [];
+    final out = <Map<String, dynamic>>[];
+    for (final item in rawAnnotations) {
+      if (item is Map<String, dynamic>) {
+        out.add(Map<String, dynamic>.from(item));
+      } else if (item is Map) {
+        out.add(item.map((key, value) => MapEntry(key.toString(), value)));
+      }
+    }
+    return out;
+  }
+
+  static String _rebuildQueuedMessageText({
+    required String fallback,
+    required Map<String, dynamic> data,
+  }) {
+    final parts = <String>[];
+
+    final selection = data['inspectorSelection'];
+    if (selection is Map) {
+      final widgetType = selection['widgetType']?.toString();
+      final widgetPath = selection['widgetPath']?.toString();
+      if (widgetType != null && widgetPath != null) {
+        parts.add('Selected widget: $widgetType at $widgetPath');
+      }
+      final source = selection['sourceLocation']?.toString();
+      if (source != null && source.isNotEmpty) {
+        parts.add('Source: $source');
+      }
+    }
+
+    final annotations = _normalizedAnnotationMaps(data['annotations']);
+    if (annotations.isNotEmpty) {
+      parts.add('${annotations.length} annotation(s):');
+      for (final annotation in annotations) {
+        parts.add(_formatAnnotationLine(annotation));
+      }
+    }
+
+    final userMessage = data['userMessage']?.toString().trim();
+    if (userMessage != null && userMessage.isNotEmpty) {
+      parts.add('User message: $userMessage');
+    }
+
+    if (parts.isEmpty) return fallback;
+    return parts.join('\n');
+  }
+
+  static String _formatAnnotationLine(Map<String, dynamic> annotation) {
+    final bounds = _rectFromBoundsValue(annotation['bounds']);
+    final text = annotation['text']?.toString() ?? '(no label)';
+    final buffer = StringBuffer('  - "$text"');
+    if (bounds != null) {
+      buffer.write(
+        ' at (${bounds.left.round()}, ${bounds.top.round()}) '
+        '${bounds.width.round()}x${bounds.height.round()}',
+      );
+    }
+
+    final widget = annotation['widget'];
+    if (widget is Map) {
+      final widgetType = widget['widgetType']?.toString();
+      final widgetPath = widget['widgetPath']?.toString();
+      if (widgetType != null && widgetPath != null) {
+        buffer.write('\n    Widget: $widgetType at $widgetPath');
+      }
+      final source = widget['sourceLocation']?.toString();
+      if (source != null && source.isNotEmpty) {
+        buffer.write('\n    Source: $source');
+      }
+      final widgetText = widget['text']?.toString();
+      if (widgetText != null && widgetText.isNotEmpty) {
+        buffer.write('\n    Text: "$widgetText"');
+      }
+    }
+
+    return buffer.toString();
   }
 }
 
@@ -1822,38 +2061,77 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
 }
 
 class _QueuedMessagesBadge extends StatelessWidget {
-  const _QueuedMessagesBadge({required this.count});
+  const _QueuedMessagesBadge({
+    required this.count,
+    required this.pushConnected,
+  });
 
   final int count;
+  final bool? pushConnected;
 
   @override
   Widget build(BuildContext context) {
     final text = count > 99 ? '99+' : '$count';
-    return Container(
-      constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-      decoration: BoxDecoration(
-        color: const Color(0xFFE53935),
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: const Color(0xFFFFFFFF), width: 2),
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x99000000),
-            blurRadius: 10,
-            offset: Offset(0, 4),
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Container(
+          width: 28,
+          height: 28,
+          decoration: BoxDecoration(
+            color: const Color(0xFF005FCC),
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(
+              color: (pushConnected ?? false)
+                  ? const Color(0xFF38D76A)
+                  : const Color(0xFFFFFFFF),
+              width: 2,
+            ),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0xAA000000),
+                blurRadius: 12,
+                offset: Offset(0, 4),
+              ),
+            ],
           ),
-        ],
-      ),
-      child: Text(
-        text,
-        textAlign: TextAlign.center,
-        style: const TextStyle(
-          color: Color(0xFFFFFFFF),
-          fontSize: 10,
-          fontWeight: FontWeight.w700,
-          decoration: TextDecoration.none,
+          child: const Center(
+            child: Text(
+              'Q',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Color(0xFFFFFFFF),
+                fontSize: 12,
+                fontWeight: FontWeight.w800,
+                decoration: TextDecoration.none,
+              ),
+            ),
+          ),
         ),
-      ),
+        Positioned(
+          right: -8,
+          top: -8,
+          child: Container(
+            constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+            decoration: BoxDecoration(
+              color: const Color(0xFFE53935),
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: const Color(0xFFFFFFFF), width: 1.5),
+            ),
+            child: Text(
+              text,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Color(0xFFFFFFFF),
+                fontSize: 9,
+                fontWeight: FontWeight.w700,
+                decoration: TextDecoration.none,
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -1863,11 +2141,19 @@ class _QueuedMessagesPanel extends StatelessWidget {
     required this.messages,
     required this.onDeleteMessage,
     required this.onClearAll,
+    required this.onEditAnnotation,
+    required this.onDeleteAnnotation,
   });
 
   final List<Map<String, dynamic>> messages;
   final void Function(int queueId) onDeleteMessage;
   final VoidCallback onClearAll;
+  final Future<void> Function(
+    int queueId,
+    String annotationId,
+    String currentText,
+  ) onEditAnnotation;
+  final void Function(int queueId, String annotationId) onDeleteAnnotation;
 
   @override
   Widget build(BuildContext context) {
@@ -1904,7 +2190,7 @@ class _QueuedMessagesPanel extends StatelessWidget {
                     ),
                   ),
                 ),
-                if (messages.isNotEmpty)
+                if (messages.isNotEmpty) ...[
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
                     onTap: onClearAll,
@@ -1917,6 +2203,29 @@ class _QueuedMessagesPanel extends StatelessWidget {
                       ),
                     ),
                   ),
+                  const SizedBox(width: 4),
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: onClearAll,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF00AAFF).withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Text(
+                        'Flush',
+                        style: TextStyle(
+                          color: Color(0xFF00AAFF),
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -1933,6 +2242,7 @@ class _QueuedMessagesPanel extends StatelessWidget {
                   message['timestamp'] as String?,
                 );
                 final queueId = _queueIdOf(message);
+                final annotations = _annotationsFromMessage(message);
 
                 return Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -2001,6 +2311,83 @@ class _QueuedMessagesPanel extends StatelessWidget {
                           ),
                         ),
                       ],
+                      if (queueId != null && annotations.isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 4,
+                          children: annotations.map((annotation) {
+                            final annotationId =
+                                annotation['id']?.toString() ?? '';
+                            final annotationText =
+                                annotation['text']?.toString() ?? '(no label)';
+                            return Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0x33226688),
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: const Color(0x664488CC),
+                                  width: 1,
+                                ),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  ConstrainedBox(
+                                    constraints: const BoxConstraints(
+                                      maxWidth: 150,
+                                    ),
+                                    child: Text(
+                                      annotationText,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Color(0xFFB9D9FF),
+                                        fontSize: 10,
+                                        decoration: TextDecoration.none,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  GestureDetector(
+                                    behavior: HitTestBehavior.opaque,
+                                    onTap: () async {
+                                      if (annotationId.isEmpty) return;
+                                      await onEditAnnotation(
+                                        queueId,
+                                        annotationId,
+                                        annotationText,
+                                      );
+                                    },
+                                    child: const Icon(
+                                      Icons.edit_outlined,
+                                      size: 12,
+                                      color: Color(0xFFB9D9FF),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  GestureDetector(
+                                    behavior: HitTestBehavior.opaque,
+                                    onTap: () {
+                                      if (annotationId.isEmpty) return;
+                                      onDeleteAnnotation(queueId, annotationId);
+                                    },
+                                    child: const Icon(
+                                      Icons.close,
+                                      size: 12,
+                                      color: Color(0xFFFF9999),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      ],
                     ],
                   ),
                 );
@@ -2043,6 +2430,25 @@ class _QueuedMessagesPanel extends StatelessWidget {
     }
 
     return null;
+  }
+
+  static List<Map<String, dynamic>> _annotationsFromMessage(
+    Map<String, dynamic> message,
+  ) {
+    final data = message['data'];
+    if (data is! Map) return const [];
+    final annotations = data['annotations'];
+    if (annotations is! List) return const [];
+
+    final out = <Map<String, dynamic>>[];
+    for (final annotation in annotations) {
+      if (annotation is Map<String, dynamic>) {
+        out.add(annotation);
+      } else if (annotation is Map) {
+        out.add(annotation.map((k, v) => MapEntry(k.toString(), v)));
+      }
+    }
+    return out;
   }
 
   static int? _queueIdOf(Map<String, dynamic> message) {
@@ -2341,11 +2747,10 @@ class _AgentStatusIndicatorState extends State<_AgentStatusIndicator> {
           Padding(
             padding: const EdgeInsets.only(top: 4),
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
               decoration: BoxDecoration(
-                color: const Color(0xFF2A2A3E),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFF444466)),
+                color: const Color(0xFF00AAFF).withValues(alpha: 0.2),
+                borderRadius: BorderRadius.circular(4),
               ),
               child: const Text(
                 'Ask the agent to call\nprocess_queue',
