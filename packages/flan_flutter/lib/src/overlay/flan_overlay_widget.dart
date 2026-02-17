@@ -1,17 +1,235 @@
-import 'package:flutter/gestures.dart';
+import 'dart:convert';
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart' hide InspectorSelection;
 import 'package:flutter/services.dart';
 import 'package:flan_flutter/src/overlay/annotation_painter.dart';
 import 'package:flan_flutter/src/overlay/drawing_painter.dart';
-import 'package:flan_flutter/src/overlay/inspector_painter.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
 import 'package:flan_flutter/src/services/drawing_service.dart';
 import 'package:flan_flutter/src/services/inspector_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
 
+Uint8List? _decodeBase64Image(String? rawImage) {
+  if (rawImage == null || rawImage.trim().isEmpty) {
+    return null;
+  }
+  var normalized = rawImage.trim();
+  final commaIndex = normalized.indexOf(',');
+  if (normalized.startsWith('data:') && commaIndex != -1) {
+    normalized = normalized.substring(commaIndex + 1);
+  }
+  try {
+    return base64Decode(normalized);
+  } catch (_) {
+    return null;
+  }
+}
+
+Rect? _rectFromBoundsValue(Object? value) {
+  if (value is! Map) return null;
+  final x = value['x'];
+  final y = value['y'];
+  final width = value['width'];
+  final height = value['height'];
+  if (x is! num || y is! num || width is! num || height is! num) {
+    return null;
+  }
+  if (width <= 0 || height <= 0) return null;
+  return Rect.fromLTWH(
+    x.toDouble(),
+    y.toDouble(),
+    width.toDouble(),
+    height.toDouble(),
+  );
+}
+
+Rect _fitRectToAspect(Rect rect, double targetAspect, Size imageSize) {
+  final currentAspect = rect.width / rect.height;
+  var adjusted = rect;
+
+  if (currentAspect > targetAspect) {
+    final targetHeight = rect.width / targetAspect;
+    adjusted = Rect.fromLTWH(
+      rect.left,
+      rect.center.dy - targetHeight / 2,
+      rect.width,
+      targetHeight,
+    );
+  } else {
+    final targetWidth = rect.height * targetAspect;
+    adjusted = Rect.fromLTWH(
+      rect.center.dx - targetWidth / 2,
+      rect.top,
+      targetWidth,
+      rect.height,
+    );
+  }
+
+  if (adjusted.left < 0) {
+    adjusted = adjusted.shift(Offset(-adjusted.left, 0));
+  }
+  if (adjusted.top < 0) {
+    adjusted = adjusted.shift(Offset(0, -adjusted.top));
+  }
+  if (adjusted.right > imageSize.width) {
+    adjusted = adjusted.shift(Offset(imageSize.width - adjusted.right, 0));
+  }
+  if (adjusted.bottom > imageSize.height) {
+    adjusted = adjusted.shift(Offset(0, imageSize.height - adjusted.bottom));
+  }
+
+  final clampedWidth = adjusted.width.clamp(1.0, imageSize.width);
+  final clampedHeight = adjusted.height.clamp(1.0, imageSize.height);
+  return Rect.fromLTWH(
+    adjusted.left.clamp(0.0, imageSize.width - clampedWidth).toDouble(),
+    adjusted.top.clamp(0.0, imageSize.height - clampedHeight).toDouble(),
+    clampedWidth.toDouble(),
+    clampedHeight.toDouble(),
+  );
+}
+
+Future<String?> _buildQueueThumbnailFromScreenshot({
+  required String screenshotBase64,
+  required Rect targetBounds,
+  required Size viewportSize,
+  int thumbnailWidth = 120,
+  int thumbnailHeight = 72,
+}) async {
+  if (viewportSize.width <= 0 || viewportSize.height <= 0) {
+    return null;
+  }
+  final screenshotBytes = _decodeBase64Image(screenshotBase64);
+  if (screenshotBytes == null || screenshotBytes.isEmpty) {
+    return null;
+  }
+
+  ui.Codec? codec;
+  ui.Image? sourceImage;
+  ui.Image? thumbnailImage;
+
+  try {
+    codec = await ui.instantiateImageCodec(screenshotBytes);
+    final frame = await codec.getNextFrame();
+    sourceImage = frame.image;
+
+    final imageSize = Size(
+      sourceImage.width.toDouble(),
+      sourceImage.height.toDouble(),
+    );
+    final scaleX = imageSize.width / viewportSize.width;
+    final scaleY = imageSize.height / viewportSize.height;
+
+    final paddedBounds = targetBounds.inflate(20);
+    final clampedBounds = Rect.fromLTRB(
+      paddedBounds.left.clamp(0.0, viewportSize.width).toDouble(),
+      paddedBounds.top.clamp(0.0, viewportSize.height).toDouble(),
+      paddedBounds.right.clamp(0.0, viewportSize.width).toDouble(),
+      paddedBounds.bottom.clamp(0.0, viewportSize.height).toDouble(),
+    );
+    if (clampedBounds.width <= 0 || clampedBounds.height <= 0) {
+      return null;
+    }
+
+    final sourceRect = Rect.fromLTWH(
+      clampedBounds.left * scaleX,
+      clampedBounds.top * scaleY,
+      clampedBounds.width * scaleX,
+      clampedBounds.height * scaleY,
+    );
+    final fittedSourceRect = _fitRectToAspect(
+      sourceRect,
+      thumbnailWidth / thumbnailHeight,
+      imageSize,
+    );
+
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    final paint = Paint()..filterQuality = FilterQuality.low;
+    canvas.drawImageRect(
+      sourceImage,
+      fittedSourceRect,
+      Rect.fromLTWH(
+        0,
+        0,
+        thumbnailWidth.toDouble(),
+        thumbnailHeight.toDouble(),
+      ),
+      paint,
+    );
+    final picture = recorder.endRecording();
+    thumbnailImage = await picture.toImage(thumbnailWidth, thumbnailHeight);
+    picture.dispose();
+
+    final byteData = await thumbnailImage.toByteData(
+      format: ui.ImageByteFormat.png,
+    );
+    if (byteData == null) return null;
+    return base64Encode(byteData.buffer.asUint8List());
+  } catch (_) {
+    return null;
+  } finally {
+    thumbnailImage?.dispose();
+    sourceImage?.dispose();
+    codec?.dispose();
+  }
+}
+
+Size _resolveViewportSize(BuildContext context) {
+  final mediaSize = MediaQuery.maybeSizeOf(context);
+  if (mediaSize != null && mediaSize.width > 0 && mediaSize.height > 0) {
+    return mediaSize;
+  }
+
+  final view = View.maybeOf(context);
+  if (view != null && view.devicePixelRatio > 0) {
+    return Size(
+      view.physicalSize.width / view.devicePixelRatio,
+      view.physicalSize.height / view.devicePixelRatio,
+    );
+  }
+
+  return Size.zero;
+}
+
+Future<void> _attachScreenshotAndQueueThumbnail({
+  required BuildContext context,
+  required ScreenshotService screenshotService,
+  required Map<String, dynamic> data,
+  Rect? previewBounds,
+}) async {
+  final screenshots = await screenshotService.takeScreenshots();
+  if (screenshots.isEmpty) {
+    return;
+  }
+
+  data['screenshot'] = screenshots.first;
+  if (previewBounds == null) {
+    return;
+  }
+
+  final viewportSize = _resolveViewportSize(context);
+  if (viewportSize.width <= 0 || viewportSize.height <= 0) {
+    return;
+  }
+
+  for (final screenshot in screenshots) {
+    final queueThumbnail = await _buildQueueThumbnailFromScreenshot(
+      screenshotBase64: screenshot,
+      targetBounds: previewBounds,
+      viewportSize: viewportSize,
+    );
+    if (queueThumbnail != null) {
+      data['queueThumbnail'] = queueThumbnail;
+      data['screenshot'] = screenshot;
+      return;
+    }
+  }
+}
+
 /// Overlay widget injected at the root of the app via
-/// [FlanBinding.wrapWithDefaultView]. Renders inspector highlights
+/// [FlanBinding.wrapWithDefaultView]. Renders inspector interaction
 /// and annotation drawing UI on top of the app content.
 class FlanOverlayWidget extends StatefulWidget {
   const FlanOverlayWidget({
@@ -104,7 +322,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   }
 
   /// Global keyboard shortcut handler.
-  /// Ctrl+Shift+H toggles inspector/highlight mode.
+  /// Ctrl+Shift+H toggles inspector mode.
   /// Ctrl+Shift+A toggles annotation mode.
   /// Ctrl+Shift+Enter sends current data to the LLM agent.
   /// Escape exits the active mode.
@@ -202,9 +420,15 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       return;
     }
     final displayText = text.trim().isEmpty ? '(drawing attached)' : text;
-    // Mark waiting BEFORE sending so the listener doesn't dismiss
-    // when sendMessage triggers notifyListeners.
-    widget.userMessageService.markWaiting(displayText);
+    final shouldShowWaiting = widget.userMessageService.isAgentListening;
+    if (shouldShowWaiting) {
+      // Mark waiting BEFORE sending so the listener doesn't dismiss
+      // when sendMessage triggers notifyListeners.
+      widget.userMessageService.markWaiting(displayText);
+    } else {
+      // If no active listener is present, queue immediately in offline mode.
+      widget.userMessageService.clearWaiting();
+    }
     final data = <String, dynamic>{'userMessage': text};
     if (drawingBase64 != null) {
       data['drawingImage'] = drawingBase64;
@@ -243,9 +467,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         final bounds = a['bounds'] as Map<String, dynamic>;
         final centerX = (bounds['x'] as num) + (bounds['width'] as num) / 2;
         final centerY = (bounds['y'] as num) + (bounds['height'] as num) / 2;
-        final widgetSelection = widget.inspectorService.inspectAt(
+        final widgetSelection = widget.inspectorService.inspectAtForAgent(
           centerX.toDouble(),
           centerY.toDouble(),
+          includeProperties: false,
         );
         if (widgetSelection != null) {
           a['widget'] = widgetSelection.toJson();
@@ -289,12 +514,19 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       );
     }
 
-    // Capture a screenshot to include with the message
+    final previewBounds = _resolveQueuePreviewBounds(
+      selection: selection,
+      annotations: annotations,
+    );
+
+    // Capture a screenshot to include with the message.
     try {
-      final screenshots = await widget.screenshotService.takeScreenshots();
-      if (screenshots.isNotEmpty) {
-        data['screenshot'] = screenshots.first;
-      }
+      await _attachScreenshotAndQueueThumbnail(
+        context: context,
+        screenshotService: widget.screenshotService,
+        data: data,
+        previewBounds: previewBounds,
+      );
     } catch (_) {
       // Screenshot capture is best-effort; don't block sending the message.
     }
@@ -304,15 +536,29 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       'text': parts.join('\n'),
       'data': data,
     });
+  }
 
-    // Clear annotations and disable active modes after sending
-    widget.annotationService.clearAnnotations();
-    if (widget.inspectorService.enabled) {
-      widget.inspectorService.disable();
-    }
-    if (widget.annotationService.enabled) {
-      widget.annotationService.disable();
-    }
+  void _removeQueuedMessage(int queueId) {
+    final removed = widget.userMessageService.removeMessageByQueueId(queueId);
+    if (!removed || !mounted) return;
+
+    setState(() {
+      _queuedMessagesSnapshot = _queuedMessagesSnapshot
+          .where((message) => _queueIdOf(message) != queueId)
+          .toList();
+      if (_queuedMessagesSnapshot.isEmpty) {
+        _showQueuedMessagesPanel = false;
+      }
+    });
+  }
+
+  void _clearQueuedMessages() {
+    widget.userMessageService.clearMessages();
+    if (!mounted) return;
+    setState(() {
+      _queuedMessagesSnapshot = const [];
+      _showQueuedMessagesPanel = false;
+    });
   }
 
   @override
@@ -323,6 +569,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         _showQueuedMessagesPanel && _queuedMessagesSnapshot.isNotEmpty
             ? _queuedMessagesSnapshot.length
             : pendingCount;
+    final viewPadding = MediaQuery.paddingOf(context);
+    final badgeTop = viewPadding.top + 16;
+    final badgeRight = viewPadding.right + 16;
 
     return Directionality(
       textDirection: TextDirection.ltr,
@@ -335,6 +584,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
             _InspectorOverlay(
               service: widget.inspectorService,
               userMessageService: widget.userMessageService,
+              screenshotService: widget.screenshotService,
             ),
           // Annotation overlay (when active)
           if (widget.annotationService.enabled)
@@ -353,8 +603,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
             ),
           if (displayCount > 0)
             Positioned(
-              top: 16,
-              right: 16,
+              top: badgeTop,
+              right: badgeRight,
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: () {
@@ -375,34 +625,79 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
             ),
           if (_showQueuedMessagesPanel && _queuedMessagesSnapshot.isNotEmpty)
             Positioned(
-              top: 56,
-              right: 16,
-              child: _QueuedMessagesPanel(messages: _queuedMessagesSnapshot),
+              top: badgeTop + 40,
+              right: badgeRight,
+              child: _QueuedMessagesPanel(
+                messages: _queuedMessagesSnapshot,
+                onDeleteMessage: _removeQueuedMessage,
+                onClearAll: _clearQueuedMessages,
+              ),
             ),
         ],
       ),
     );
   }
 
+  static int? _queueIdOf(Map<String, dynamic> message) {
+    final raw = message['queueId'];
+    if (raw is int) return raw;
+    if (raw is String) return int.tryParse(raw);
+    return null;
+  }
+
   static String _messageIdentity(Map<String, dynamic> message) {
+    final queueId = message['queueId']?.toString();
+    if (queueId != null && queueId.isNotEmpty) {
+      return 'id:$queueId';
+    }
     final timestamp = message['timestamp']?.toString() ?? '';
     final type = message['type']?.toString() ?? '';
     final text = message['text']?.toString() ?? '';
     return '$timestamp|$type|$text';
   }
+
+  Rect? _resolveQueuePreviewBounds({
+    required InspectorSelection? selection,
+    required List<Map<String, dynamic>> annotations,
+  }) {
+    Rect? combinedBounds;
+
+    void includeRect(Rect? rect) {
+      if (rect == null) return;
+      if (combinedBounds == null) {
+        combinedBounds = rect;
+      } else {
+        combinedBounds = combinedBounds!.expandToInclude(rect);
+      }
+    }
+
+    includeRect(selection?.bounds);
+
+    for (final annotation in annotations) {
+      includeRect(_rectFromBoundsValue(annotation['bounds']));
+      final widgetInfo = annotation['widget'];
+      if (widgetInfo is Map) {
+        includeRect(_rectFromBoundsValue(widgetInfo['bounds']));
+      }
+    }
+
+    return combinedBounds;
+  }
 }
 
-/// Inspector overlay: intercepts all pointer events to highlight
-/// widgets and allow selection. When a widget is tapped, shows a text
-/// input for the user to type a message about the selected widget.
+/// Inspector overlay: intercepts pointer events to select widgets.
+/// When a widget is tapped, shows a text input for the user to type
+/// a message about the selected widget.
 class _InspectorOverlay extends StatefulWidget {
   const _InspectorOverlay({
     required this.service,
     required this.userMessageService,
+    required this.screenshotService,
   });
 
   final InspectorService service;
   final UserMessageService userMessageService;
+  final ScreenshotService screenshotService;
 
   @override
   State<_InspectorOverlay> createState() => _InspectorOverlayState();
@@ -432,7 +727,7 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
     if (mounted) setState(() {});
   }
 
-  void _submitMessage(String text) {
+  void _submitMessage(String text) async {
     final selection = widget.service.lastSelection;
     if (selection == null) return;
 
@@ -452,6 +747,17 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
       data['userMessage'] = text;
     }
 
+    try {
+      await _attachScreenshotAndQueueThumbnail(
+        context: context,
+        screenshotService: widget.screenshotService,
+        data: data,
+        previewBounds: selection.bounds,
+      );
+    } catch (_) {
+      // Screenshot capture is best-effort; don't block sending the message.
+    }
+
     widget.userMessageService.sendMessage({
       'type': 'user_feedback',
       'text': parts.join('\n'),
@@ -467,7 +773,7 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
     return Positioned.fill(
       child: Stack(
         children: [
-          // Gesture + paint layer
+          // Gesture layer
           Positioned.fill(
             child: KeyboardListener(
               focusNode: _focusNode,
@@ -475,14 +781,8 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
               onKeyEvent: _handleKeyEvent,
               child: Listener(
                 behavior: HitTestBehavior.opaque,
-                onPointerHover: (event) {
-                  widget.service.handlePointerHover(event.position);
-                },
-                onPointerMove: (event) {
-                  widget.service.handlePointerHover(event.position);
-                },
                 onPointerDown: (event) {
-                  // If locked, unlock first so hover can update
+                  // If locked, unlock previous selection first.
                   if (widget.service.locked) {
                     widget.service.selectCurrentElement(); // toggles unlock
                   }
@@ -497,24 +797,7 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
                     });
                   }
                 },
-                onPointerSignal: (event) {
-                  if (event is PointerScrollEvent) {
-                    // Scroll wheel cycles through elements
-                    if (event.scrollDelta.dy > 0) {
-                      widget.service.cycleNextElement();
-                    } else if (event.scrollDelta.dy < 0) {
-                      widget.service.cyclePreviousElement();
-                    }
-                  }
-                },
-                child: CustomPaint(
-                  painter: InspectorPainter(
-                    highlights: widget.service.elementsAtPoint,
-                    currentIndex: widget.service.currentElementIndex,
-                    selection: widget.service.lastSelection,
-                  ),
-                  size: Size.infinite,
-                ),
+                child: const SizedBox.expand(),
               ),
             ),
           ),
@@ -727,6 +1010,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
                 return _buildEditTextField(
                   annotation.bounds,
                   screenSize,
+                  annotation.id,
                 );
               },
             ),
@@ -811,7 +1095,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
     );
   }
 
-  Widget _buildEditTextField(Rect rect, Size screenSize) {
+  Widget _buildEditTextField(Rect rect, Size screenSize, String annotationId) {
     const maxFieldHeight = 68.0; // ~3 lines of text
     const gap = 4.0;
     final fieldWidth = rect.width.clamp(120.0, 400.0);
@@ -853,23 +1137,42 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
             ),
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              child: EditableText(
-                controller: _textController,
-                focusNode: _textFocusNode,
-                maxLines: null,
-                style: const TextStyle(
-                  color: Color(0xFFE0E0E0),
-                  fontSize: 13,
-                ),
-                cursorColor: const Color(0xFFFF6600),
-                backgroundCursorColor: const Color(0xFF333333),
-                inputFormatters: [
-                  _SubmitOnEnterFormatter(
-                    onSubmit: () =>
-                        _handleEditAnnotationSubmit(_textController.text),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: EditableText(
+                      controller: _textController,
+                      focusNode: _textFocusNode,
+                      maxLines: null,
+                      style: const TextStyle(
+                        color: Color(0xFFE0E0E0),
+                        fontSize: 13,
+                      ),
+                      cursorColor: const Color(0xFFFF6600),
+                      backgroundCursorColor: const Color(0xFF333333),
+                      inputFormatters: [
+                        _SubmitOnEnterFormatter(
+                          onSubmit: () =>
+                              _handleEditAnnotationSubmit(_textController.text),
+                        ),
+                      ],
+                      onSubmitted: _handleEditAnnotationSubmit,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () {
+                      widget.service.removeAnnotationById(annotationId);
+                      _textController.clear();
+                    },
+                    child: const Icon(
+                      Icons.delete_outline,
+                      size: 16,
+                      color: Color(0xFFFF6666),
+                    ),
                   ),
                 ],
-                onSubmitted: _handleEditAnnotationSubmit,
               ),
             ),
           ),
@@ -1525,24 +1828,28 @@ class _QueuedMessagesBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final text = count > 99 ? '99+' : '$count';
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
       decoration: BoxDecoration(
-        color: const Color(0xFF00AAFF),
+        color: const Color(0xFFE53935),
         borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: const Color(0xFFFFFFFF), width: 2),
         boxShadow: const [
           BoxShadow(
-            color: Color(0x66000000),
-            blurRadius: 8,
-            offset: Offset(0, 3),
+            color: Color(0x99000000),
+            blurRadius: 10,
+            offset: Offset(0, 4),
           ),
         ],
       ),
       child: Text(
-        '$count',
+        text,
+        textAlign: TextAlign.center,
         style: const TextStyle(
-          color: Color(0xFF001622),
-          fontSize: 11,
+          color: Color(0xFFFFFFFF),
+          fontSize: 10,
           fontWeight: FontWeight.w700,
           decoration: TextDecoration.none,
         ),
@@ -1552,9 +1859,15 @@ class _QueuedMessagesBadge extends StatelessWidget {
 }
 
 class _QueuedMessagesPanel extends StatelessWidget {
-  const _QueuedMessagesPanel({required this.messages});
+  const _QueuedMessagesPanel({
+    required this.messages,
+    required this.onDeleteMessage,
+    required this.onClearAll,
+  });
 
   final List<Map<String, dynamic>> messages;
+  final void Function(int queueId) onDeleteMessage;
+  final VoidCallback onClearAll;
 
   @override
   Widget build(BuildContext context) {
@@ -1578,14 +1891,33 @@ class _QueuedMessagesPanel extends StatelessWidget {
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-            child: Text(
-              'Queued messages (${messages.length})',
-              style: const TextStyle(
-                color: Color(0xFF00AAFF),
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                decoration: TextDecoration.none,
-              ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Queued messages (${messages.length})',
+                    style: const TextStyle(
+                      color: Color(0xFF00AAFF),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      decoration: TextDecoration.none,
+                    ),
+                  ),
+                ),
+                if (messages.isNotEmpty)
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: onClearAll,
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                      child: Icon(
+                        Icons.delete_sweep_outlined,
+                        size: 15,
+                        color: Color(0xFFFF7777),
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
           const Divider(height: 1, color: Color(0xFF333344)),
@@ -1596,26 +1928,68 @@ class _QueuedMessagesPanel extends StatelessWidget {
               itemBuilder: (context, index) {
                 final message = messages[index];
                 final summary = _summarizeMessage(message);
+                final previewBytes = _previewBytesForMessage(message);
                 final timestamp = _formatTimestamp(
                   message['timestamp'] as String?,
                 );
+                final queueId = _queueIdOf(message);
 
                 return Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        summary,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Color(0xFFE0E0E0),
-                          fontSize: 12,
-                          height: 1.4,
-                          decoration: TextDecoration.none,
-                        ),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (previewBytes != null) ...[
+                            _QueueMessageThumbnail(bytes: previewBytes),
+                            const SizedBox(width: 8),
+                          ],
+                          Expanded(
+                            child: Text(
+                              summary,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Color(0xFFE0E0E0),
+                                fontSize: 12,
+                                height: 1.4,
+                                decoration: TextDecoration.none,
+                              ),
+                            ),
+                          ),
+                          if (queueId != null) ...[
+                            const SizedBox(width: 6),
+                            GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onTap: () => onDeleteMessage(queueId),
+                              child: const Padding(
+                                padding: EdgeInsets.symmetric(
+                                  horizontal: 2,
+                                  vertical: 2,
+                                ),
+                                child: Icon(
+                                  Icons.delete_outline,
+                                  size: 14,
+                                  color: Color(0xFFFF7777),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
+                      if (queueId != null) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          'id: $queueId',
+                          style: const TextStyle(
+                            color: Color(0xFF8E8EA0),
+                            fontSize: 10,
+                            decoration: TextDecoration.none,
+                          ),
+                        ),
+                      ],
                       if (timestamp != null) ...[
                         const SizedBox(height: 3),
                         Text(
@@ -1653,6 +2027,31 @@ class _QueuedMessagesPanel extends StatelessWidget {
     return 'Queued message';
   }
 
+  static Uint8List? _previewBytesForMessage(Map<String, dynamic> message) {
+    final data = message['data'];
+    if (data is! Map) return null;
+
+    final queueThumbnail = data['queueThumbnail'];
+    if (queueThumbnail is String) {
+      final bytes = _decodeBase64Image(queueThumbnail);
+      if (bytes != null) return bytes;
+    }
+
+    final drawingImage = data['drawingImage'];
+    if (drawingImage is String) {
+      return _decodeBase64Image(drawingImage);
+    }
+
+    return null;
+  }
+
+  static int? _queueIdOf(Map<String, dynamic> message) {
+    final raw = message['queueId'];
+    if (raw is int) return raw;
+    if (raw is String) return int.tryParse(raw);
+    return null;
+  }
+
   static String? _formatTimestamp(String? timestamp) {
     if (timestamp == null || timestamp.isEmpty) {
       return null;
@@ -1669,6 +2068,31 @@ class _QueuedMessagesPanel extends StatelessWidget {
     final minute = local.minute.toString().padLeft(2, '0');
     final second = local.second.toString().padLeft(2, '0');
     return '$year-$month-$day $hour:$minute:$second';
+  }
+}
+
+class _QueueMessageThumbnail extends StatelessWidget {
+  const _QueueMessageThumbnail({required this.bytes});
+
+  final Uint8List bytes;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 72,
+      height: 44,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xFF2F3A57), width: 1),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Image.memory(
+        bytes,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+        filterQuality: FilterQuality.low,
+      ),
+    );
   }
 }
 
@@ -1924,7 +2348,7 @@ class _AgentStatusIndicatorState extends State<_AgentStatusIndicator> {
                 border: Border.all(color: const Color(0xFF444466)),
               ),
               child: const Text(
-                'Ask the agent to call\nwatch_flan',
+                'Ask the agent to call\nprocess_queue',
                 style: TextStyle(
                   color: Color(0xFFCCCCCC),
                   fontSize: 10,

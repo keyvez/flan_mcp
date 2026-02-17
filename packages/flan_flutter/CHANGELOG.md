@@ -1,3 +1,12 @@
+# Unreleased
+
+- Emit VM extension event `flan.userMessageQueued` whenever a user message is queued for the agent
+- Persist unprocessed user-message queue to survive hot reload, hot restart, and full app restarts
+- Make programmatic inspect side-effect-free (no inspector/annotation UI toggling) and faster for large apps
+- Add micro-profiler logs for programmatic inspect calls (`inspectAtForAgent`)
+- Keep annotations visible after queueing and allow deleting queued messages from the in-app queue panel
+- Show compact queue thumbnails for selected/inspected widgets (with screenshot fallback) in the queued messages panel
+
 # 0.4.0
 
 - Add in-app command center with widget inspector, annotations, and message overlay
