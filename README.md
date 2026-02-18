@@ -55,6 +55,8 @@ The AI agent can programmatically interact with your running app:
 | `get_user_message` | Retrieve queued messages from the app user |
 | `process_queue` | Drain queued user messages in one run, then stop when idle |
 
+> **Note:** `process_queue` is not triggered automatically — the agent must call it explicitly to consume pending messages. When the user sends messages from the in-app command center, Flan emits a notification and (optionally) a `sampling/createMessage` push, but the agent still needs to invoke `process_queue` (or `get_user_message`) to actually retrieve and act on them.
+
 ### In-App Command Center
 
 The real power of Flan is what happens inside the running app. With `flan_flutter` initialized, you get a full overlay system controlled by keyboard shortcuts:

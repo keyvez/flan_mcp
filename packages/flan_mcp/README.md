@@ -111,6 +111,8 @@ claude mcp add --transport stdio flan -- flan_mcp
 | `get_user_message` | Retrieve queued messages from the app user |
 | `process_queue` | Drain queued user messages in one run, then stop when idle |
 
+> **Note:** `process_queue` is not triggered automatically — the agent must call it explicitly to consume pending messages. Flan emits notifications when new messages arrive, but the agent still needs to invoke `process_queue` (or `get_user_message`) to retrieve them.
+
 `connect` also accepts an optional `sampling_push` boolean to enable server-initiated `sampling/createMessage` nudges when user messages arrive (capability-gated by client support).
 
 ### Development
