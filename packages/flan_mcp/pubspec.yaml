@@ -1,6 +1,6 @@
 name: flan_mcp
 description: MCP server for Flutter app interaction - enables AI agents to inspect and interact with running Flutter apps via VM service.
-version: 0.4.0
+version: 0.5.0
 resolution: workspace
 homepage: https://github.com/keyvez/flan-mcp
 repository: https://github.com/keyvez/flan-mcp

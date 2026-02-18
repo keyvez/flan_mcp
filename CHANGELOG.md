@@ -1,3 +1,13 @@
+# 0.5.0
+
+- Replace periodic message polling with VM extension event-driven delivery for user messages
+- Emit `flan.userMessageQueued` events from `flan_flutter` when app users send messages
+- Listen on VM `Extension` stream in `flan_mcp` and drain queued messages on demand
+- Replace `watch_flan` with `process_queue` for explicit batch queue processing
+- Add MCP resources capability and `flan://messages/pending` snapshot resource
+- Send `notifications/resources/updated` when pending-message state changes
+- Add optional `connect.sampling_push` to trigger capability-gated `sampling/createMessage` push nudges
+
 # 0.4.0
 
 - Add in-app command center with widget inspector, annotations, and message overlay

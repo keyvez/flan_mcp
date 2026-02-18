@@ -71,6 +71,10 @@ Future<int> main(List<String> arguments) async {
       options: McpServerOptions(
         capabilities: ServerCapabilities(
           tools: const ServerCapabilitiesTools(),
+          resources: const ServerCapabilitiesResources(
+            subscribe: true,
+            listChanged: true,
+          ),
           logging: const <String, dynamic>{},
         ),
         instructions: '''

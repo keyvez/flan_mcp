@@ -1,4 +1,4 @@
-# Unreleased
+# 0.5.0
 
 - Emit VM extension event `flan.userMessageQueued` whenever a user message is queued for the agent
 - Persist unprocessed user-message queue to survive hot reload, hot restart, and full app restarts
@@ -6,6 +6,9 @@
 - Add micro-profiler logs for programmatic inspect calls (`inspectAtForAgent`)
 - Keep annotations visible after queueing and allow deleting queued messages from the in-app queue panel
 - Show compact queue thumbnails for selected/inspected widgets (with screenshot fallback) in the queued messages panel
+- Add editable queued annotation chips in queue panel and clear on-screen annotations after queue is fully processed
+- Improve queue badge visibility with explicit `Q` marker and counter bubble
+- Show green queue badge border when a push-capable MCP host is connected
 
 # 0.4.0
 

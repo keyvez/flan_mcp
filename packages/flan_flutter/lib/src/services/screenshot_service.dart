@@ -78,9 +78,9 @@ class ScreenshotService {
     required RenderView view,
   }) async {
     // ignore: invalid_use_of_protected_member
-    if (view.debugNeedsPaint || view.layer == null) {
+    if (view.layer == null) {
       debugPrint(
-        'ScreenshotService: View needs paint or layer is null. Scheduling frame.',
+        'ScreenshotService: Layer is null. Scheduling frame.',
       );
       // Schedule a frame to ensure the layer tree is built and painted.
       WidgetsBinding.instance.scheduleFrame();

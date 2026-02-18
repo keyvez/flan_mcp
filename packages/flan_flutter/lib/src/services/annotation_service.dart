@@ -88,6 +88,7 @@ class AnnotationService extends ChangeNotifier {
     _dragStart = null;
     _dragCurrent = null;
     _pendingRect = null;
+    _editingIndex = null;
     notifyListeners();
   }
 
@@ -97,6 +98,7 @@ class AnnotationService extends ChangeNotifier {
     _dragStart = null;
     _dragCurrent = null;
     _pendingRect = null;
+    _editingIndex = null;
     notifyListeners();
   }
 
@@ -177,6 +179,12 @@ class AnnotationService extends ChangeNotifier {
         _editingIndex == null) {
       return;
     }
+    if (_editingIndex! < 0 || _editingIndex! >= _annotations.length) {
+      _editingIndex = null;
+      _drawState = AnnotationDrawState.normal;
+      notifyListeners();
+      return;
+    }
     if (text.isEmpty) {
       // Empty text deletes the annotation
       _annotations.removeAt(_editingIndex!);
@@ -201,6 +209,14 @@ class AnnotationService extends ChangeNotifier {
     final index = _annotations.indexWhere((a) => a.id == id);
     if (index == -1) return false;
     _annotations.removeAt(index);
+    if (_editingIndex != null) {
+      if (_editingIndex == index) {
+        _editingIndex = null;
+        _drawState = AnnotationDrawState.normal;
+      } else if (_editingIndex! > index) {
+        _editingIndex = _editingIndex! - 1;
+      }
+    }
     _postAnnotationChangedEvent();
     notifyListeners();
     return true;
@@ -215,6 +231,14 @@ class AnnotationService extends ChangeNotifier {
     final trimmed = text.trim();
     if (trimmed.isEmpty) {
       _annotations.removeAt(index);
+      if (_editingIndex != null) {
+        if (_editingIndex == index) {
+          _editingIndex = null;
+          _drawState = AnnotationDrawState.normal;
+        } else if (_editingIndex! > index) {
+          _editingIndex = _editingIndex! - 1;
+        }
+      }
     } else {
       _annotations[index] = _annotations[index].copyWith(text: trimmed);
     }
@@ -226,6 +250,11 @@ class AnnotationService extends ChangeNotifier {
   /// Clears all annotations.
   void clearAnnotations() {
     _annotations.clear();
+    _drawState = AnnotationDrawState.normal;
+    _dragStart = null;
+    _dragCurrent = null;
+    _pendingRect = null;
+    _editingIndex = null;
     _postAnnotationChangedEvent();
     notifyListeners();
   }

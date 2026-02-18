@@ -6,6 +6,8 @@ import 'package:flan_flutter/src/services/annotation_service.dart';
 import 'package:flan_flutter/src/services/element_tree_finder.dart';
 import 'package:flan_flutter/src/services/gesture_dispatcher.dart';
 import 'package:flan_flutter/src/services/inspector_service.dart';
+import 'package:flan_flutter/src/services/error_interceptor.dart';
+import 'package:flan_flutter/src/services/github_issue_service.dart';
 import 'package:flan_flutter/src/services/log_collector.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
@@ -34,6 +36,20 @@ class FlanBinding extends WidgetsFlutterBinding {
   static FlanBinding get instance => BindingBase.checkInstance(_instance);
   static FlanBinding? _instance;
 
+  /// Configures the backend endpoint for GitHub issue creation.
+  ///
+  /// [url] is the full URL (e.g. `https://dev-api.fasmac.workers.dev/api/github/issues`).
+  /// [headersBuilder] returns auth headers for each request.
+  static void configureIssueEndpoint({
+    required String url,
+    required Map<String, String> Function() headersBuilder,
+  }) {
+    GitHubIssueService.configure(url: url, headersBuilder: headersBuilder);
+  }
+
+  /// Whether the issue endpoint has been configured.
+  static bool get issueEndpointConfigured => GitHubIssueService.isConfigured;
+
   /// Attempts to enqueue a message for the connected agent.
   ///
   /// Returns `true` if Flan is initialized and the message was queued.
@@ -51,6 +67,7 @@ class FlanBinding extends WidgetsFlutterBinding {
       'type': type,
       if (data != null) 'data': data,
     };
+    binding._userMessageService.warmUp();
     binding._userMessageService.sendMessage(payload);
     return true;
   }
@@ -71,6 +88,7 @@ class FlanBinding extends WidgetsFlutterBinding {
   late final InspectorService _inspectorService;
   late final AnnotationService _annotationService;
   late final UserMessageService _userMessageService;
+  late final ErrorInterceptor _errorInterceptor;
 
   @override
   void initInstances() {
@@ -90,6 +108,9 @@ class FlanBinding extends WidgetsFlutterBinding {
     _inspectorService = InspectorService();
     _annotationService = AnnotationService();
     _userMessageService = UserMessageService();
+    _userMessageService.warmUp();
+    _errorInterceptor = ErrorInterceptor();
+    _errorInterceptor.install();
 
     // Initialize log collection
     _logCollector.initialize();
@@ -103,6 +124,7 @@ class FlanBinding extends WidgetsFlutterBinding {
         annotationService: _annotationService,
         userMessageService: _userMessageService,
         screenshotService: _screenshotService,
+        errorInterceptor: _errorInterceptor,
         child: rootWidget,
       ),
     );
@@ -340,7 +362,11 @@ class FlanBinding extends WidgetsFlutterBinding {
         try {
           final x = parseRequiredDoubleParam(params['x'], 'x');
           final y = parseRequiredDoubleParam(params['y'], 'y');
-          final selection = _inspectorService.inspectAt(x, y);
+          final selection = _inspectorService.inspectAtForAgent(
+            x,
+            y,
+            includeProperties: false,
+          );
           return <String, dynamic>{
             'status': 'Success',
             'selection': selection?.toJson(),
@@ -470,6 +496,7 @@ class FlanBinding extends WidgetsFlutterBinding {
       name: 'flan.sendToAgent',
       callback: (params) async {
         try {
+          await _userMessageService.ensureHydrated();
           final message = <String, dynamic>{};
           if (params.containsKey('text')) {
             message['text'] = params['text'];
@@ -499,6 +526,7 @@ class FlanBinding extends WidgetsFlutterBinding {
       name: 'flan.consumeUserMessages',
       callback: (params) async {
         try {
+          await _userMessageService.ensureHydrated();
           final messages = _userMessageService.consumeMessages();
           return <String, dynamic>{
             'status': 'Success',
@@ -519,6 +547,7 @@ class FlanBinding extends WidgetsFlutterBinding {
       name: 'flan.peekUserMessages',
       callback: (params) async {
         try {
+          await _userMessageService.ensureHydrated();
           final messages = _userMessageService.peekMessages();
           return <String, dynamic>{
             'status': 'Success',
@@ -544,6 +573,33 @@ class FlanBinding extends WidgetsFlutterBinding {
           return <String, dynamic>{
             'status': 'Success',
             'listening': listening,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.setHostConnectionState',
+      callback: (params) async {
+        try {
+          final connected =
+              params['connected'] == 'true' || params['connected'] == true;
+          final pushCapable =
+              params['pushCapable'] == 'true' || params['pushCapable'] == true;
+          _userMessageService.setHostConnectionState(
+            connected: connected,
+            pushCapable: pushCapable,
+          );
+          return <String, dynamic>{
+            'status': 'Success',
+            'connected': connected,
+            'pushCapable': pushCapable,
           };
         } catch (err, st) {
           return <String, dynamic>{

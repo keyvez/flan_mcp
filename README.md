@@ -53,7 +53,7 @@ The AI agent can programmatically interact with your running app:
 | `add_annotation` | Create an annotation programmatically |
 | `clear_annotations` | Remove all annotations |
 | `get_user_message` | Retrieve queued messages from the app user |
-| `watch_flan` | Block and wait for the next user message (long-polling) |
+| `process_queue` | Drain queued user messages in one run, then stop when idle |
 
 ### In-App Command Center
 
@@ -113,14 +113,16 @@ Press **Enter** to send. If you've drawn anything, the sketch is captured as an 
 Here's what a typical workflow looks like:
 
 1. **You** run the Flutter app and ask the agent to `connect`
-2. **Agent** calls `watch_flan` and waits for your input
-3. **You** press `Ctrl+Shift+H`, hover over a misaligned card, click it, and type: "this card should have 16px padding on all sides"
-4. **Agent** receives the message with the exact widget, its source file and line number, and your instruction
-5. **Agent** edits the code, calls `hot_reload`, verifies the change with `inspect_widget_at`
-6. **Agent** calls `watch_flan` again, listening for your next instruction
-7. **You** check the result and either approve or point at the next thing to fix
+2. **You** send one or more instructions from the app overlay/inspector
+3. **Agent** calls `process_queue` to consume and process the queued batch
+4. **Agent** receives messages with exact widgets, source file/line, and your instructions
+5. **Agent** edits code, calls `hot_reload`, and verifies with `inspect_widget_at`
+6. **You** check the result and send the next batch when needed
+7. **Agent** runs `process_queue` again
 
 The agent doesn't need to take expensive screenshots or traverse the full widget tree to understand what you want. You've already pointed at it.
+
+Optional push trigger: call `connect` with `sampling_push: true` to enable server-initiated `sampling/createMessage` nudges on new user messages (only when the MCP client supports sampling).
 
 ## Quick Start
 
@@ -338,7 +340,7 @@ The agent receives both annotations with the widgets underneath and can address 
 1. **Initialization**: `FlanBinding` registers VM service extensions (`ext.flutter.flan.*`) and installs the command center overlay
 2. **Connection**: The MCP server connects to your app's VM Service URL via WebSocket
 3. **Agent actions**: When the agent calls a tool (like `tap`), the MCP server translates it into a VM service extension call
-4. **User actions**: When you select a widget or send a message, it's queued for the agent to retrieve via `watch_flan`
+4. **User actions**: When you select a widget or send a message, Flan emits a VM extension event and the MCP server drains queued messages immediately
 5. **Hot reload**: The agent can apply code changes and verify them without restarting the app
 
 ## Assumptions & Limitations
@@ -390,7 +392,7 @@ pkill -f flan_relay
 - **"Not connected to any app"**: The agent must call `connect` with the VM Service URI first.
 - **Finding the URI**: Run `flutter run` in debug mode and copy the WebSocket URL from the line `This app is linked to the debug service: ...` (for example, `ws://127.0.0.1:52794/N2Tizytts-E=/ws`).
 - **Elements not found**: Ensure widgets are visible and custom widgets are configured in `FlanConfiguration`.
-- **Agent not receiving messages**: Make sure the agent has called `watch_flan`. The green dot in the message overlay confirms the agent is listening.
+- **Agent not receiving messages**: Make sure the agent has called `process_queue` (or manually checks `get_user_message` / `flan://messages/pending`). The green dot in the message overlay confirms the agent is listening.
 
 ## License
 

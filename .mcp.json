@@ -2,8 +2,13 @@
   "mcpServers": {
     "flan": {
       "command": "dart",
-      "args": ["run", "packages/flan_mcp/bin/flan_mcp.dart", "-l", "FINEST"],
-      "cwd": "/Users/gaurav/Documents/Code/flutter/flutter_app_mcp"
+      "args": [
+        "run",
+        "/Users/gaurav/Documents/Code/flutter/flan_mcp/packages/flan_mcp/bin/flan_mcp.dart",
+        "-l",
+        "FINEST"
+      ],
+      "cwd": "/Users/gaurav/Documents/Code/flutter/flan_mcp"
     }
   }
 }

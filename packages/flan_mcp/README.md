@@ -109,7 +109,9 @@ claude mcp add --transport stdio flan -- flan_mcp
 | Tool | Description |
 |------|-------------|
 | `get_user_message` | Retrieve queued messages from the app user |
-| `watch_flan` | Block and wait for the next user message |
+| `process_queue` | Drain queued user messages in one run, then stop when idle |
+
+`connect` also accepts an optional `sampling_push` boolean to enable server-initiated `sampling/createMessage` nudges when user messages arrive (capability-gated by client support).
 
 ### Development
 | Tool | Description |

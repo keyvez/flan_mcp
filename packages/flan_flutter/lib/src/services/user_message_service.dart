@@ -20,6 +20,9 @@ class UserMessageService extends ChangeNotifier {
   bool _persistRequested = false;
 
   bool _isAgentListening = false;
+  bool? _isHostConnected = false;
+  bool? _isPushCapableHostConnected = false;
+  int _agentConsumeGeneration = 0;
   bool _waitingForActivity = false;
   String? _sentMessageText;
   Timer? _heartbeatTimer;
@@ -38,6 +41,18 @@ class UserMessageService extends ChangeNotifier {
   /// Automatically expires if no heartbeat is received within
   /// [_heartbeatTimeout].
   bool get isAgentListening => _isAgentListening;
+
+  /// Whether an MCP host is currently connected to Flan.
+  bool get isHostConnected => (_isHostConnected ?? false) == true;
+
+  /// Whether the connected host supports Flan push nudges
+  /// (notifications and/or sampling).
+  bool get isPushCapableHostConnected =>
+      (_isPushCapableHostConnected ?? false) == true;
+
+  /// Monotonic counter incremented whenever queued messages are consumed
+  /// through the MCP consume path.
+  int get agentConsumeGeneration => _agentConsumeGeneration;
 
   set isAgentListening(bool value) {
     _heartbeatTimer?.cancel();
@@ -61,6 +76,21 @@ class UserMessageService extends ChangeNotifier {
       _isAgentListening = value;
       notifyListeners();
     }
+  }
+
+  /// Updates connected host state for UI signaling.
+  void setHostConnectionState({
+    required bool connected,
+    required bool pushCapable,
+  }) {
+    final normalizedPush = connected && pushCapable;
+    if (_isHostConnected == connected &&
+        _isPushCapableHostConnected == normalizedPush) {
+      return;
+    }
+    _isHostConnected = connected;
+    _isPushCapableHostConnected = normalizedPush;
+    notifyListeners();
   }
 
   /// Whether the overlay should show a "waiting for agent" state
@@ -123,6 +153,7 @@ class UserMessageService extends ChangeNotifier {
     if (_pendingMessages.isEmpty) return [];
     final messages = List<Map<String, dynamic>>.from(_pendingMessages);
     _pendingMessages.clear();
+    _agentConsumeGeneration++;
     unawaited(_persistQueueState());
     notifyListeners();
     return messages;
@@ -143,6 +174,26 @@ class UserMessageService extends ChangeNotifier {
     final index = _pendingMessages.indexWhere((m) => m['queueId'] == queueId);
     if (index == -1) return false;
     _pendingMessages.removeAt(index);
+    unawaited(_persistQueueState());
+    notifyListeners();
+    return true;
+  }
+
+  /// Replaces a queued message by queue id.
+  /// Returns true if a message was found and updated.
+  bool updateMessageByQueueId(
+      int queueId, Map<String, dynamic> updatedMessage) {
+    warmUp();
+    final index = _pendingMessages.indexWhere((m) => m['queueId'] == queueId);
+    if (index == -1) return false;
+
+    final existing = _pendingMessages[index];
+    final merged = <String, dynamic>{
+      ...existing,
+      ...updatedMessage,
+      'queueId': queueId,
+    };
+    _pendingMessages[index] = merged;
     unawaited(_persistQueueState());
     notifyListeners();
     return true;

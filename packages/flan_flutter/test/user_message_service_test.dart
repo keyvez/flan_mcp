@@ -79,4 +79,70 @@ void main() {
     service.clearMessages();
     expect(service.peekMessages(), isEmpty);
   });
+
+  test('can update queued message by queue id', () async {
+    final service = UserMessageService();
+    await service.ensureHydrated();
+
+    service.sendMessage({
+      'type': 'user_feedback',
+      'text': 'original',
+      'data': {
+        'annotations': [
+          {'id': '1', 'text': 'old'},
+        ],
+      },
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+
+    final messages = service.peekMessages();
+    final queueId = messages.first['queueId'] as int;
+    final updated = Map<String, dynamic>.from(messages.first)
+      ..['text'] = 'updated'
+      ..['data'] = {
+        'annotations': [
+          {'id': '1', 'text': 'new'},
+        ],
+      };
+
+    expect(service.updateMessageByQueueId(queueId, updated), isTrue);
+    final after = service.peekMessages().first;
+    expect(after['text'], 'updated');
+    final data = after['data'] as Map<String, dynamic>;
+    final annotations = data['annotations'] as List<dynamic>;
+    expect((annotations.first as Map<String, dynamic>)['text'], 'new');
+  });
+
+  test('consumeMessages bumps agent consume generation', () async {
+    final service = UserMessageService();
+    await service.ensureHydrated();
+
+    expect(service.agentConsumeGeneration, 0);
+    service.sendMessage({'type': 'user_feedback', 'text': 'one'});
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+
+    final consumed = service.consumeMessages();
+    expect(consumed, hasLength(1));
+    expect(service.agentConsumeGeneration, 1);
+  });
+
+  test('host connection state tracks push-capable host', () async {
+    final service = UserMessageService();
+    await service.ensureHydrated();
+
+    expect(service.isHostConnected, isFalse);
+    expect(service.isPushCapableHostConnected, isFalse);
+
+    service.setHostConnectionState(connected: true, pushCapable: true);
+    expect(service.isHostConnected, isTrue);
+    expect(service.isPushCapableHostConnected, isTrue);
+
+    service.setHostConnectionState(connected: true, pushCapable: false);
+    expect(service.isHostConnected, isTrue);
+    expect(service.isPushCapableHostConnected, isFalse);
+
+    service.setHostConnectionState(connected: false, pushCapable: true);
+    expect(service.isHostConnected, isFalse);
+    expect(service.isPushCapableHostConnected, isFalse);
+  });
 }

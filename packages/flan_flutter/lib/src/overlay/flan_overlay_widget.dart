@@ -8,8 +8,12 @@ import 'package:flan_flutter/src/overlay/drawing_painter.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
 import 'package:flan_flutter/src/services/drawing_service.dart';
 import 'package:flan_flutter/src/services/inspector_service.dart';
+import 'package:flan_flutter/src/services/error_interceptor.dart';
+import 'package:flan_flutter/src/services/github_issue_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
+
+void _noopAnnotationSubmittedCallback() {}
 
 Uint8List? _decodeBase64Image(String? rawImage) {
   if (rawImage == null || rawImage.trim().isEmpty) {
@@ -238,6 +242,7 @@ class FlanOverlayWidget extends StatefulWidget {
     required this.annotationService,
     required this.userMessageService,
     required this.screenshotService,
+    required this.errorInterceptor,
     required this.child,
   });
 
@@ -245,6 +250,7 @@ class FlanOverlayWidget extends StatefulWidget {
   final AnnotationService annotationService;
   final UserMessageService userMessageService;
   final ScreenshotService screenshotService;
+  final ErrorInterceptor errorInterceptor;
   final Widget child;
 
   @override
@@ -256,8 +262,12 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   bool _textOverlayEverShown = false;
   bool _showQueuedMessagesPanel = false;
   List<Map<String, dynamic>> _queuedMessagesSnapshot = const [];
-  int _lastPendingCount = 0;
-  int _lastAgentConsumeGeneration = 0;
+  int? _annotationDraftQueueId;
+  String _lastQueuedAnnotationsSignature = '';
+
+  /// Guard flag to prevent the user-message listener from recreating
+  /// an annotation draft while [_sendToAgent] is in progress.
+  bool _isSendingToAgent = false;
 
   /// Tracks the last time an Alt/Option key was pressed for double-tap detection.
   DateTime? _lastAltPressTime;
@@ -266,20 +276,20 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   void initState() {
     super.initState();
     widget.inspectorService.addListener(_onServiceChanged);
-    widget.annotationService.addListener(_onServiceChanged);
+    widget.annotationService.addListener(_onAnnotationServiceChanged);
     widget.userMessageService.addListener(_onUserMessageServiceChanged);
-    _lastPendingCount = widget.userMessageService.pendingMessageCount;
-    _lastAgentConsumeGeneration =
-        widget.userMessageService.agentConsumeGeneration;
+    widget.errorInterceptor.addListener(_onServiceChanged);
     HardwareKeyboard.instance.addHandler(_handleGlobalKey);
+    _onAnnotationServiceChanged();
   }
 
   @override
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_handleGlobalKey);
     widget.inspectorService.removeListener(_onServiceChanged);
-    widget.annotationService.removeListener(_onServiceChanged);
+    widget.annotationService.removeListener(_onAnnotationServiceChanged);
     widget.userMessageService.removeListener(_onUserMessageServiceChanged);
+    widget.errorInterceptor.removeListener(_onServiceChanged);
     super.dispose();
   }
 
@@ -296,22 +306,113 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     if (mounted) setState(() {});
   }
 
+  void _onAnnotationServiceChanged() {
+    final annotations = widget.annotationService.getAnnotationsData();
+    final signature = jsonEncode(annotations);
+    if (signature != _lastQueuedAnnotationsSignature) {
+      _lastQueuedAnnotationsSignature = signature;
+      _upsertQueuedAnnotationDraft(annotations);
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _upsertQueuedAnnotationDraft(List<Map<String, dynamic>> annotations) {
+    if (annotations.isEmpty) {
+      final queueId = _annotationDraftQueueId;
+      if (queueId != null) {
+        widget.userMessageService.removeMessageByQueueId(queueId);
+      }
+      _annotationDraftQueueId = null;
+      return;
+    }
+
+    final enrichedAnnotations = annotations
+        .map((annotation) => Map<String, dynamic>.from(annotation))
+        .toList(growable: false);
+    for (final annotation in enrichedAnnotations) {
+      final bounds = annotation['bounds'] as Map<String, dynamic>?;
+      if (bounds == null) continue;
+      final x = bounds['x'];
+      final y = bounds['y'];
+      final width = bounds['width'];
+      final height = bounds['height'];
+      if (x is! num || y is! num || width is! num || height is! num) {
+        continue;
+      }
+      final centerX = x + width / 2;
+      final centerY = y + height / 2;
+      final widgetSelection = widget.inspectorService.inspectAtForAgent(
+        centerX.toDouble(),
+        centerY.toDouble(),
+        includeProperties: false,
+      );
+      if (widgetSelection != null) {
+        annotation['widget'] = widgetSelection.toJson();
+      }
+    }
+
+    final data = <String, dynamic>{
+      'annotations': enrichedAnnotations,
+      'annotationDraft': true,
+    };
+    final text = _rebuildQueuedMessageText(
+      fallback: 'Annotation draft',
+      data: data,
+    );
+
+    final queueId = _annotationDraftQueueId;
+    if (queueId != null) {
+      final updated =
+          widget.userMessageService.updateMessageByQueueId(queueId, {
+        'type': 'user_feedback',
+        'text': text,
+        'data': data,
+      });
+      if (updated) {
+        return;
+      }
+      _annotationDraftQueueId = null;
+    }
+
+    widget.userMessageService.sendMessage({
+      'type': 'user_feedback',
+      'text': text,
+      'data': data,
+    });
+    final pendingMessages = widget.userMessageService.peekMessages();
+    for (final message in pendingMessages.reversed) {
+      final messageData = _normalizedDataMap(message['data']);
+      if (messageData['annotationDraft'] == true) {
+        _annotationDraftQueueId = _queueIdOf(message);
+        if (_annotationDraftQueueId != null) {
+          break;
+        }
+      }
+    }
+  }
+
   void _onUserMessageServiceChanged() {
     if (!mounted) return;
     final pendingMessages = widget.userMessageService.peekMessages();
-    final pendingCount = pendingMessages.length;
-    final currentConsumeGeneration =
-        widget.userMessageService.agentConsumeGeneration;
-    final consumedByAgent =
-        currentConsumeGeneration != _lastAgentConsumeGeneration;
-    _lastAgentConsumeGeneration = currentConsumeGeneration;
-    final shouldClearAnnotations =
-        consumedByAgent && _lastPendingCount > 0 && pendingCount == 0;
-    _lastPendingCount = pendingCount;
-
-    if (shouldClearAnnotations &&
-        widget.annotationService.annotations.isNotEmpty) {
-      widget.annotationService.clearAnnotations();
+    if (_annotationDraftQueueId != null &&
+        !pendingMessages.any((m) => _queueIdOf(m) == _annotationDraftQueueId)) {
+      _annotationDraftQueueId = null;
+    }
+    if (_annotationDraftQueueId == null) {
+      for (final message in pendingMessages.reversed) {
+        final data = _normalizedDataMap(message['data']);
+        if (data['annotationDraft'] == true) {
+          _annotationDraftQueueId = _queueIdOf(message);
+          if (_annotationDraftQueueId != null) break;
+        }
+      }
+      if (_annotationDraftQueueId == null &&
+          !_isSendingToAgent &&
+          !widget.userMessageService.isAgentListening &&
+          widget.annotationService.annotations.isNotEmpty) {
+        _upsertQueuedAnnotationDraft(
+            widget.annotationService.getAnnotationsData());
+      }
     }
 
     setState(() {
@@ -456,6 +557,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// Packages up the current inspector selection and/or annotations
   /// into a message and sends it to the LLM agent.
   Future<void> _sendToAgent() async {
+    _isSendingToAgent = true;
+    final annotationDraftQueueId = _annotationDraftQueueId;
+    if (annotationDraftQueueId != null) {
+      widget.userMessageService.removeMessageByQueueId(annotationDraftQueueId);
+      _annotationDraftQueueId = null;
+    }
+
     final parts = <String>[];
     final data = <String, dynamic>{};
 
@@ -544,16 +652,113 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       // Screenshot capture is best-effort; don't block sending the message.
     }
 
+    // Reset the annotation signature so the listener doesn't
+    // immediately recreate a draft from the same annotations.
+    _lastQueuedAnnotationsSignature = '';
+
     widget.userMessageService.sendMessage({
       'type': 'user_feedback',
       'text': parts.join('\n'),
       'data': data,
     });
+    _isSendingToAgent = false;
+  }
+
+  void _sendErrorToAgent(InterceptedError error) {
+    widget.userMessageService.sendMessage({
+      'type': 'app_error',
+      'text':
+          'App error intercepted — please investigate:\n${error.details}',
+      'data': <String, dynamic>{
+        'kind': 'app_error',
+        'summary': error.summary,
+        'details': error.details,
+        'timestamp': error.timestamp.toIso8601String(),
+      },
+    });
+    widget.errorInterceptor.dismiss(error.id);
+  }
+
+  Future<void> _createIssueFromQueue() async {
+    if (!GitHubIssueService.isConfigured) return;
+    final messages = _queuedMessagesSnapshot
+        .map((m) => Map<String, dynamic>.from(m))
+        .toList();
+    if (messages.isEmpty) return;
+
+    // Hide the flan overlay so the screenshot shows the app cleanly.
+    setState(() => _showQueuedMessagesPanel = false);
+    // Wait for the frame to paint without the overlay.
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+
+    // Capture a fresh screenshot of the clean app.
+    try {
+      final screenshots =
+          await widget.screenshotService.takeScreenshots();
+      debugPrint(
+        '[Flan] Screenshot capture: ${screenshots.length} image(s), '
+        'first ${screenshots.firstOrNull?.length ?? 0} bytes',
+      );
+      if (screenshots.isNotEmpty) {
+        for (final msg in messages) {
+          final msgData = msg['data'];
+          if (msgData is Map<String, dynamic>) {
+            final copy = Map<String, dynamic>.from(msgData);
+            copy['screenshot'] = screenshots.first;
+            msg['data'] = copy;
+          } else {
+            msg['data'] = <String, dynamic>{
+              'screenshot': screenshots.first,
+            };
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('[Flan] Screenshot capture failed: $e');
+    }
+
+    try {
+      await GitHubIssueService.createIssueFromMessages(messages);
+      // Clear annotations so the listener doesn't recreate a draft
+      // after we clear the queue.
+      widget.annotationService.clearAnnotations();
+      _annotationDraftQueueId = null;
+      _lastQueuedAnnotationsSignature = '';
+      _isSendingToAgent = true;
+      widget.userMessageService.clearMessages();
+      _isSendingToAgent = false;
+      if (mounted) {
+        setState(() {
+          _showQueuedMessagesPanel = false;
+          _queuedMessagesSnapshot = const [];
+        });
+      }
+    } catch (e) {
+      _isSendingToAgent = false;
+      debugPrint('[Flan] Failed to create issue: $e');
+    }
+  }
+
+  Future<void> _createIssueFromError(InterceptedError error) async {
+    if (!GitHubIssueService.isConfigured) return;
+
+    try {
+      await GitHubIssueService.createIssueFromError(
+        summary: error.summary,
+        details: error.details,
+      );
+      widget.errorInterceptor.dismiss(error.id);
+    } catch (e) {
+      debugPrint('[Flan] Failed to create issue from error: $e');
+    }
   }
 
   void _removeQueuedMessage(int queueId) {
     final removed = widget.userMessageService.removeMessageByQueueId(queueId);
     if (!removed || !mounted) return;
+    if (_annotationDraftQueueId == queueId) {
+      _annotationDraftQueueId = null;
+    }
 
     setState(() {
       _queuedMessagesSnapshot = _queuedMessagesSnapshot
@@ -566,7 +771,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   }
 
   void _clearQueuedMessages() {
+    _annotationDraftQueueId = null;
+    _lastQueuedAnnotationsSignature = '';
+    _isSendingToAgent = true;
     widget.userMessageService.clearMessages();
+    _isSendingToAgent = false;
     if (!mounted) return;
     setState(() {
       _queuedMessagesSnapshot = const [];
@@ -731,6 +940,24 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         children: [
           // The actual app content
           widget.child,
+          // Render existing annotations even when annotation mode is off.
+          if (!widget.annotationService.enabled &&
+              widget.annotationService.annotations.isNotEmpty)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: CustomPaint(
+                  painter: AnnotationPainter(
+                    annotations: widget.annotationService.annotations,
+                    dragStart: null,
+                    dragCurrent: null,
+                    pendingRect: null,
+                    drawState: AnnotationDrawState.normal,
+                    editingIndex: null,
+                  ),
+                  size: Size.infinite,
+                ),
+              ),
+            ),
           // Inspector overlay (when active)
           if (widget.inspectorService.enabled)
             _InspectorOverlay(
@@ -743,7 +970,52 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
             _AnnotationOverlay(
               service: widget.annotationService,
               userMessageService: widget.userMessageService,
-              onAnnotationSubmitted: _sendToAgent,
+              onAnnotationSubmitted: () {
+                _sendToAgent();
+              },
+            ),
+          if (widget.annotationService.enabled)
+            Positioned(
+              top: badgeTop,
+              left: 0,
+              right: 0,
+              child: IgnorePointer(
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: const Color(0xE6201410),
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(
+                        color: const Color(0xFFFF6600),
+                        width: 1,
+                      ),
+                    ),
+                    child: const Padding(
+                      padding:
+                          EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      child: Text(
+                        'Annotation mode ON  •  Drag to draw, Enter to save',
+                        style: TextStyle(
+                          color: Color(0xFFFFC8A0),
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          // Error toast overlay
+          if (widget.errorInterceptor.errors.isNotEmpty)
+            _ErrorToastOverlay(
+              errors: widget.errorInterceptor.errors,
+              onDismiss: (id) => widget.errorInterceptor.dismiss(id),
+              onSendToAgent: _sendErrorToAgent,
+              onCreateIssue: GitHubIssueService.isConfigured
+                  ? _createIssueFromError
+                  : null,
             ),
           // Text message overlay — kept in tree to preserve state across dismiss
           if (_textOverlayEverShown)
@@ -763,6 +1035,16 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   if (_showQueuedMessagesPanel) {
                     _showQueuedMessagesPanel = false;
                     _queuedMessagesSnapshot = const [];
+                    return;
+                  }
+                  if (pendingMessages.isEmpty) {
+                    // Nothing queued — enter annotation mode.
+                    if (!widget.annotationService.enabled) {
+                      if (widget.inspectorService.enabled) {
+                        widget.inspectorService.disable();
+                      }
+                      widget.annotationService.enable();
+                    }
                     return;
                   }
                   _queuedMessagesSnapshot =
@@ -787,6 +1069,14 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 onClearAll: _clearQueuedMessages,
                 onEditAnnotation: _editQueuedAnnotation,
                 onDeleteAnnotation: _removeQueuedAnnotation,
+                onCreateIssue: GitHubIssueService.isConfigured
+                    ? _createIssueFromQueue
+                    : null,
+                isAnnotationModeActive:
+                    widget.annotationService.enabled,
+                onExitAnnotationMode: () {
+                  widget.annotationService.disable();
+                },
               ),
             ),
         ],
@@ -1137,11 +1427,12 @@ class _AnnotationOverlay extends StatefulWidget {
   const _AnnotationOverlay({
     required this.service,
     required this.userMessageService,
-    required this.onAnnotationSubmitted,
+    this.onAnnotationSubmitted = _noopAnnotationSubmittedCallback,
   });
 
   final AnnotationService service;
   final UserMessageService userMessageService;
+  // Compatibility field kept to avoid hot-reload class shape breakage.
   final VoidCallback onAnnotationSubmitted;
 
   @override
@@ -1189,7 +1480,9 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
                     widget.service.startDrawing(event.position);
                 if (tappedExisting) {
                   final idx = widget.service.editingIndex;
-                  if (idx != null) {
+                  if (idx != null &&
+                      idx >= 0 &&
+                      idx < widget.service.annotations.length) {
                     _textController.text = widget.service.annotations[idx].text;
                     _textController.selection = TextSelection(
                       baseOffset: 0,
@@ -1240,7 +1533,9 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
             ),
           // Text input field when editing an existing annotation
           if (widget.service.drawState == AnnotationDrawState.editingExisting &&
-              widget.service.editingIndex != null)
+              widget.service.editingIndex != null &&
+              widget.service.editingIndex! >= 0 &&
+              widget.service.editingIndex! < widget.service.annotations.length)
             Builder(
               builder: (context) {
                 final screenSize = MediaQuery.of(context).size;
@@ -1260,12 +1555,16 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
 
   void _handleNewAnnotationSubmit(String text) {
     widget.service.submitAnnotationText(text);
-    widget.onAnnotationSubmitted();
+    if (widget.service.annotations.isNotEmpty) {
+      widget.onAnnotationSubmitted();
+    }
   }
 
   void _handleEditAnnotationSubmit(String text) {
     widget.service.submitEditedAnnotationText(text);
-    widget.onAnnotationSubmitted();
+    if (widget.service.annotations.isNotEmpty) {
+      widget.onAnnotationSubmitted();
+    }
   }
 
   Widget _buildTextField(Rect rect, Size screenSize) {
@@ -2143,6 +2442,9 @@ class _QueuedMessagesPanel extends StatelessWidget {
     required this.onClearAll,
     required this.onEditAnnotation,
     required this.onDeleteAnnotation,
+    this.onCreateIssue,
+    this.onExitAnnotationMode,
+    this.isAnnotationModeActive = false,
   });
 
   final List<Map<String, dynamic>> messages;
@@ -2154,6 +2456,9 @@ class _QueuedMessagesPanel extends StatelessWidget {
     String currentText,
   ) onEditAnnotation;
   final void Function(int queueId, String annotationId) onDeleteAnnotation;
+  final VoidCallback? onCreateIssue;
+  final VoidCallback? onExitAnnotationMode;
+  final bool isAnnotationModeActive;
 
   @override
   Widget build(BuildContext context) {
@@ -2190,7 +2495,78 @@ class _QueuedMessagesPanel extends StatelessWidget {
                     ),
                   ),
                 ),
+                if (isAnnotationModeActive &&
+                    onExitAnnotationMode != null) ...[
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: onExitAnnotationMode,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFFAA00).withValues(alpha: 0.3),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.check_circle_outline,
+                            size: 12,
+                            color: Color(0xFFFFCC44),
+                          ),
+                          SizedBox(width: 3),
+                          Text(
+                            'Done',
+                            style: TextStyle(
+                              color: Color(0xFFFFCC44),
+                              fontSize: 10,
+                              fontWeight: FontWeight.w600,
+                              decoration: TextDecoration.none,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                ],
                 if (messages.isNotEmpty) ...[
+                  if (onCreateIssue != null) ...[
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: onCreateIssue,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF2EA043).withValues(alpha: 0.3),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.bug_report_outlined,
+                              size: 12,
+                              color: Color(0xFF7EE787),
+                            ),
+                            SizedBox(width: 3),
+                            Text(
+                              'Create Issue',
+                              style: TextStyle(
+                                color: Color(0xFF7EE787),
+                                fontSize: 10,
+                                fontWeight: FontWeight.w600,
+                                decoration: TextDecoration.none,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                  ],
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
                     onTap: onClearAll,
@@ -2211,7 +2587,7 @@ class _QueuedMessagesPanel extends StatelessWidget {
                       padding: const EdgeInsets.symmetric(
                           horizontal: 6, vertical: 2),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF00AAFF).withOpacity(0.2),
+                        color: const Color(0xFF00AAFF).withValues(alpha: 0.2),
                         borderRadius: BorderRadius.circular(4),
                       ),
                       child: const Text(
@@ -2764,6 +3140,164 @@ class _AgentStatusIndicatorState extends State<_AgentStatusIndicator> {
             ),
           ),
       ],
+    );
+  }
+}
+
+/// Shows intercepted errors as dismissible toasts at the bottom of the screen.
+/// Each toast has a "Send to Agent" button.
+class _ErrorToastOverlay extends StatelessWidget {
+  const _ErrorToastOverlay({
+    required this.errors,
+    required this.onDismiss,
+    required this.onSendToAgent,
+    this.onCreateIssue,
+  });
+
+  final List<InterceptedError> errors;
+  final ValueChanged<int> onDismiss;
+  final ValueChanged<InterceptedError> onSendToAgent;
+  final ValueChanged<InterceptedError>? onCreateIssue;
+
+  @override
+  Widget build(BuildContext context) {
+    // Show only the 3 most recent errors to avoid flooding.
+    final visible = errors.length > 3
+        ? errors.sublist(errors.length - 3)
+        : errors;
+
+    return Positioned(
+      left: 16,
+      right: 16,
+      bottom: 16,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final error in visible)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: _ErrorToast(
+                error: error,
+                onDismiss: () => onDismiss(error.id),
+                onSendToAgent: () => onSendToAgent(error),
+                onCreateIssue: onCreateIssue != null
+                    ? () => onCreateIssue!(error)
+                    : null,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ErrorToast extends StatelessWidget {
+  const _ErrorToast({
+    required this.error,
+    required this.onDismiss,
+    required this.onSendToAgent,
+    this.onCreateIssue,
+  });
+
+  final InterceptedError error;
+  final VoidCallback onDismiss;
+  final VoidCallback onSendToAgent;
+  final VoidCallback? onCreateIssue;
+
+  @override
+  Widget build(BuildContext context) {
+    // Truncate the summary for display.
+    final display = error.summary.length > 120
+        ? '${error.summary.substring(0, 120)}...'
+        : error.summary;
+
+    return Material(
+      type: MaterialType.transparency,
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 480),
+        decoration: BoxDecoration(
+          color: const Color(0xF0B71C1C),
+          borderRadius: BorderRadius.circular(8),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x40000000),
+              blurRadius: 8,
+              offset: Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 4, 10),
+          child: Row(
+            children: [
+              const Icon(
+                Icons.error_outline,
+                color: Color(0xFFFFCDD2),
+                size: 18,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  display,
+                  style: const TextStyle(
+                    color: Color(0xFFFFEBEE),
+                    fontSize: 12,
+                    height: 1.3,
+                    decoration: TextDecoration.none,
+                  ),
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 4),
+              if (onCreateIssue != null)
+                _ToastButton(
+                  icon: Icons.bug_report_outlined,
+                  tooltip: 'Create Issue',
+                  onTap: onCreateIssue!,
+                )
+              else
+                _ToastButton(
+                  icon: Icons.send,
+                  tooltip: 'Send to agent',
+                  onTap: onSendToAgent,
+                ),
+              _ToastButton(
+                icon: Icons.close,
+                tooltip: 'Dismiss',
+                onTap: onDismiss,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ToastButton extends StatelessWidget {
+  const _ToastButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(16),
+        child: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Icon(icon, color: const Color(0xCCFFFFFF), size: 16),
+        ),
+      ),
     );
   }
 }

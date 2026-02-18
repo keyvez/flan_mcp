@@ -120,7 +120,7 @@ Flan collects logs via Dart's [`logging`](https://pub.dev/packages/logging) pack
 1. Registers VM service extensions (`ext.flutter.flan.*`) for each tool
 2. Installs a global overlay with the inspector, annotation, and message UI
 3. Listens for keyboard shortcuts to activate each mode
-4. Queues user messages for the MCP server to retrieve via `watch_flan`
+4. Queues user messages and emits VM extension events so the MCP server can drain them immediately
 
 The command center overlay is entirely self-contained — it doesn't interfere with your app's widget tree or state management.
 
