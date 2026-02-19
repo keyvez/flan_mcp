@@ -643,6 +643,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         setState(() => _showErrorPanel = false);
         return true;
       }
+      if (_showQueuedMessagesPanel) {
+        setState(() {
+          _showQueuedMessagesPanel = false;
+          _queuedMessagesSnapshot = const [];
+        });
+        return true;
+      }
       if (_showTextMessageOverlay) {
         widget.userMessageService.clearWaiting();
         setState(() => _showTextMessageOverlay = false);
@@ -1161,24 +1168,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           // The actual app content, wrapped in a RepaintBoundary so we can
           // capture it without annotation/overlay layers.
           RepaintBoundary(key: _appContentKey, child: widget.child),
-          // Render existing annotations even when annotation mode is off.
-          if (!widget.annotationService.enabled &&
-              widget.annotationService.annotations.isNotEmpty)
-            Positioned.fill(
-              child: IgnorePointer(
-                child: CustomPaint(
-                  painter: AnnotationPainter(
-                    annotations: widget.annotationService.annotations,
-                    dragStart: null,
-                    dragCurrent: null,
-                    pendingRect: null,
-                    drawState: AnnotationDrawState.normal,
-                    editingIndex: null,
-                  ),
-                  size: Size.infinite,
-                ),
-              ),
-            ),
+          // Annotations are only rendered while annotation mode is active.
+          // When the user exits annotation mode, annotations disappear from
+          // the screen but remain preserved in the queue as a draft message
+          // with a cropped thumbnail.
           // Inspector overlay (when active)
           if (widget.inspectorService.enabled)
             _InspectorOverlay(
