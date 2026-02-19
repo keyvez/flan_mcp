@@ -906,6 +906,29 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     });
   }
 
+  void _saveQueuedMessageText(int queueId, String newText) {
+    final pendingMessages = widget.userMessageService.peekMessages();
+    final index = pendingMessages.indexWhere((m) => _queueIdOf(m) == queueId);
+    if (index == -1) return;
+
+    final original = pendingMessages[index];
+    final data = _normalizedDataMap(original['data']);
+    data['userMessage'] = newText;
+
+    widget.userMessageService.updateMessageByQueueId(queueId, {
+      'text': _rebuildQueuedMessageText(
+        fallback: original['text']?.toString() ?? 'Queued message',
+        data: data,
+      ),
+      'data': data,
+    });
+
+    if (!mounted) return;
+    setState(() {
+      _queuedMessagesSnapshot = widget.userMessageService.peekMessages();
+    });
+  }
+
   Future<void> _editQueuedAnnotation(
     int queueId,
     String annotationId,
@@ -1232,6 +1255,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 onClearAll: _clearQueuedMessages,
                 onSaveAnnotation: _applyQueuedAnnotationEdit,
                 onDeleteAnnotation: _removeQueuedAnnotation,
+                onSaveMessageText: _saveQueuedMessageText,
                 onCreateIssue: GitHubIssueService.isConfigured
                     ? _createIssueFromQueue
                     : null,
@@ -2613,6 +2637,7 @@ class _QueuedMessagesPanel extends StatefulWidget {
     required this.onClearAll,
     required this.onSaveAnnotation,
     required this.onDeleteAnnotation,
+    required this.onSaveMessageText,
     this.onCreateIssue,
     this.onExitAnnotationMode,
     this.isAnnotationModeActive = false,
@@ -2627,6 +2652,7 @@ class _QueuedMessagesPanel extends StatefulWidget {
     String newText,
   ) onSaveAnnotation;
   final void Function(int queueId, String annotationId) onDeleteAnnotation;
+  final void Function(int queueId, String newText) onSaveMessageText;
   final VoidCallback? onCreateIssue;
   final VoidCallback? onExitAnnotationMode;
   final bool isAnnotationModeActive;
@@ -2636,7 +2662,9 @@ class _QueuedMessagesPanel extends StatefulWidget {
 }
 
 class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
-  /// Key: "queueId:annotationId" for the annotation currently being edited.
+  /// Key for the item currently being edited inline.
+  /// Annotation edits: "ann:queueId:annotationId"
+  /// Message text edits: "msg:queueId"
   String? _editingKey;
   final _editController = TextEditingController();
   final _editFocusNode = FocusNode();
@@ -2661,29 +2689,86 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     }
   }
 
-  void _startEditing(int queueId, String annotationId, String currentText) {
+  void _startEditingMessage(
+    int queueId,
+    String currentText, {
+    int? cursorOffset,
+  }) {
+    _startEditingWithKey('msg:$queueId', currentText,
+        cursorOffset: cursorOffset);
+  }
+
+  void _startEditingWithKey(
+    String key,
+    String currentText, {
+    int? cursorOffset,
+  }) {
+    final offset =
+        (cursorOffset ?? currentText.length).clamp(0, currentText.length);
     setState(() {
-      _editingKey = '$queueId:$annotationId';
+      _editingKey = key;
       _editController.text = currentText;
+      _editController.selection = TextSelection.collapsed(offset: offset);
     });
+    // Set selection again after the TextField has built and received focus,
+    // since focus acquisition can reset the selection.
+    void setSelectionOnFocus() {
+      if (_editFocusNode.hasFocus) {
+        _editFocusNode.removeListener(setSelectionOnFocus);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_editController.text.isNotEmpty) {
+            _editController.selection =
+                TextSelection.collapsed(offset: offset);
+          }
+        });
+      }
+    }
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      _editFocusNode.addListener(setSelectionOnFocus);
       _editFocusNode.requestFocus();
-      _editController.selection = TextSelection(
-        baseOffset: 0,
-        extentOffset: _editController.text.length,
-      );
     });
+  }
+
+  /// Estimates the character offset in [text] closest to [localX] using the
+  /// same text style as the displayed label.
+  int _estimateCursorOffset(String text, double localX) {
+    const style = TextStyle(
+      color: Color(0xFFE0E0E0),
+      fontSize: 12,
+      height: 1.4,
+    );
+    final painter = TextPainter(
+      text: TextSpan(text: text, style: style),
+      textDirection: TextDirection.ltr,
+      maxLines: 2,
+    )..layout();
+    final position = painter.getPositionForOffset(Offset(localX, 0));
+    painter.dispose();
+    return position.offset;
   }
 
   void _commitEdit() {
     if (_editingKey == null) return;
-    final parts = _editingKey!.split(':');
-    final queueId = int.tryParse(parts[0]);
-    final annotationId = parts.length > 1 ? parts.sublist(1).join(':') : '';
+    final key = _editingKey!;
     final newText = _editController.text.trim();
     setState(() => _editingKey = null);
-    if (queueId != null && annotationId.isNotEmpty && newText.isNotEmpty) {
-      widget.onSaveAnnotation(queueId, annotationId, newText);
+    if (newText.isEmpty) return;
+
+    if (key.startsWith('ann:')) {
+      final rest = key.substring(4);
+      final colonIdx = rest.indexOf(':');
+      if (colonIdx == -1) return;
+      final queueId = int.tryParse(rest.substring(0, colonIdx));
+      final annotationId = rest.substring(colonIdx + 1);
+      if (queueId != null && annotationId.isNotEmpty) {
+        widget.onSaveAnnotation(queueId, annotationId, newText);
+      }
+    } else if (key.startsWith('msg:')) {
+      final queueId = int.tryParse(key.substring(4));
+      if (queueId != null) {
+        widget.onSaveMessageText(queueId, newText);
+      }
     }
   }
 
@@ -2869,6 +2954,51 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     );
   }
 
+  Widget _buildInlineTextField() {
+    return Localizations(
+      locale: const Locale('en'),
+      delegates: const [
+        DefaultMaterialLocalizations.delegate,
+        DefaultWidgetsLocalizations.delegate,
+      ],
+      child: Material(
+        color: Colors.transparent,
+        child: SizedBox(
+          height: 24,
+          child: TextField(
+            controller: _editController,
+            focusNode: _editFocusNode,
+            style: const TextStyle(
+              color: Color(0xFFE0E0E0),
+              fontSize: 12,
+              height: 1.4,
+            ),
+            decoration: const InputDecoration(
+              isDense: true,
+              contentPadding: EdgeInsets.symmetric(
+                horizontal: 4,
+                vertical: 4,
+              ),
+              border: OutlineInputBorder(
+                borderSide: BorderSide(color: Color(0xFF00AAFF)),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderSide: BorderSide(color: Color(0xFF00AAFF)),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderSide: BorderSide(
+                  color: Color(0xFF00AAFF),
+                  width: 1.5,
+                ),
+              ),
+            ),
+            onSubmitted: (_) => _commitEdit(),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildAnnotationItem({
     required int queueId,
     required Uint8List? previewBytes,
@@ -2888,7 +3018,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
               final annotationId = annotation['id']?.toString() ?? '';
               final annotationText =
                   annotation['text']?.toString() ?? '(no label)';
-              final editKey = '$queueId:$annotationId';
+              final editKey = 'ann:$queueId:$annotationId';
               final isEditing = _editingKey == editKey;
               return Padding(
                 padding: EdgeInsets.only(
@@ -2898,53 +3028,18 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                   children: [
                     Expanded(
                       child: isEditing
-                          ? Material(
-                              color: Colors.transparent,
-                              child: SizedBox(
-                              height: 24,
-                              child: TextField(
-                                controller: _editController,
-                                focusNode: _editFocusNode,
-                                style: const TextStyle(
-                                  color: Color(0xFFE0E0E0),
-                                  fontSize: 12,
-                                  height: 1.4,
-                                ),
-                                decoration: const InputDecoration(
-                                  isDense: true,
-                                  contentPadding: EdgeInsets.symmetric(
-                                    horizontal: 4,
-                                    vertical: 4,
-                                  ),
-                                  border: OutlineInputBorder(
-                                    borderSide: BorderSide(
-                                      color: Color(0xFF00AAFF),
-                                    ),
-                                  ),
-                                  enabledBorder: OutlineInputBorder(
-                                    borderSide: BorderSide(
-                                      color: Color(0xFF00AAFF),
-                                    ),
-                                  ),
-                                  focusedBorder: OutlineInputBorder(
-                                    borderSide: BorderSide(
-                                      color: Color(0xFF00AAFF),
-                                      width: 1.5,
-                                    ),
-                                  ),
-                                ),
-                                onSubmitted: (_) => _commitEdit(),
-                              ),
-                            ),
-                            )
+                          ? _buildInlineTextField()
                           : GestureDetector(
                               behavior: HitTestBehavior.opaque,
-                              onTap: () {
+                              onTapUp: (details) {
                                 if (annotationId.isEmpty) return;
-                                _startEditing(
-                                  queueId,
-                                  annotationId,
+                                _startEditingWithKey(
+                                  'ann:$queueId:$annotationId',
                                   annotationText,
+                                  cursorOffset: _estimateCursorOffset(
+                                    annotationText,
+                                    details.localPosition.dx,
+                                  ),
                                 );
                               },
                               child: Text(
@@ -2991,25 +3086,42 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     required Uint8List? previewBytes,
     required String summary,
   }) {
+    final isEditing =
+        queueId != null && _editingKey == 'msg:$queueId';
     return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
         if (previewBytes != null) ...[
           _QueueMessageThumbnail(bytes: previewBytes),
           const SizedBox(width: 8),
         ],
         Expanded(
-          child: Text(
-            summary,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: Color(0xFFE0E0E0),
-              fontSize: 12,
-              height: 1.4,
-              decoration: TextDecoration.none,
-            ),
-          ),
+          child: isEditing
+              ? _buildInlineTextField()
+              : GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapUp: queueId != null
+                      ? (details) => _startEditingMessage(
+                            queueId,
+                            summary,
+                            cursorOffset: _estimateCursorOffset(
+                              summary,
+                              details.localPosition.dx,
+                            ),
+                          )
+                      : null,
+                  child: Text(
+                    summary,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Color(0xFFE0E0E0),
+                      fontSize: 12,
+                      height: 1.4,
+                      decoration: TextDecoration.none,
+                    ),
+                  ),
+                ),
         ),
         if (queueId != null) ...[
           const SizedBox(width: 6),
