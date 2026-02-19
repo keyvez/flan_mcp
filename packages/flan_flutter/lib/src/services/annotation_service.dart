@@ -136,8 +136,9 @@ class AnnotationService extends ChangeNotifier {
   /// Called when the user finishes dragging. If the rectangle is large
   /// enough, transitions to the editing state for text input.
   void finishDrawing() {
-    // Don't interfere with editing an existing annotation
-    if (_drawState == AnnotationDrawState.editingExisting) return;
+    // Don't interfere with text editing (new or existing annotation).
+    if (_drawState == AnnotationDrawState.editing ||
+        _drawState == AnnotationDrawState.editingExisting) return;
 
     if (_drawState != AnnotationDrawState.drawing ||
         _dragStart == null ||

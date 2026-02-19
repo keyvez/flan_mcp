@@ -474,8 +474,10 @@ class VmServiceConnector {
           isolateId: _isolateId!,
         );
         _logger.fine('Hot restart completed: result=${result.json}');
-        // After restart, we need to re-find the isolate since it changes
-        _isolateId = await _findIsolateWithFlanExtensions();
+        // After restart, the old isolate is destroyed and a new one is
+        // created. The new isolate needs time to register its extensions
+        // before we can find it.
+        _isolateId = await _findIsolateWithFlanExtensionsWithRetry();
         return result.json?['type'] == 'Success';
       } else {
         // Fallback: call reloadSources with force compile
@@ -487,12 +489,34 @@ class VmServiceConnector {
       _logger.severe('Hot restart failed', err);
       // After restart, isolate ID may have changed, try to re-find
       try {
-        _isolateId = await _findIsolateWithFlanExtensions();
+        _isolateId = await _findIsolateWithFlanExtensionsWithRetry();
       } catch (_) {
         // Ignore if re-find fails
       }
       rethrow;
     }
+  }
+
+  /// Finds the first isolate with flan extensions, retrying with a delay
+  /// to allow a newly restarted isolate time to register its extensions.
+  Future<String> _findIsolateWithFlanExtensionsWithRetry({
+    int maxAttempts = 10,
+    Duration delay = const Duration(milliseconds: 500),
+  }) async {
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await _findIsolateWithFlanExtensions();
+      } catch (err) {
+        if (attempt == maxAttempts) rethrow;
+        _logger.fine(
+          'Isolate not ready yet (attempt $attempt/$maxAttempts), '
+          'retrying in ${delay.inMilliseconds}ms',
+        );
+        await Future<void>.delayed(delay);
+      }
+    }
+    // Unreachable, but satisfies the type system.
+    throw StateError('Retry loop exited unexpectedly');
   }
 
   /// Finds the first isolate that has the flan extensions.

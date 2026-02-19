@@ -36,6 +36,7 @@ final class VmServiceContext {
   bool _drainRequested = false;
   DateTime? _lastMessageReceivedAt;
   int _lastKnownAppPendingCount = 0;
+  int _drainGeneration = 0;
   bool _enableSamplingPush = false;
   DateTime? _lastSamplingPushAt;
 
@@ -64,9 +65,16 @@ final class VmServiceContext {
     if (!connector.isConnected || _server == null) return;
 
     try {
+      final generationBefore = _drainGeneration;
       final response = await connector.peekUserMessages();
       final pendingCount = (response['count'] as num?)?.toInt() ?? 0;
-      _lastKnownAppPendingCount = pendingCount;
+      // Only update the cached count when no drain happened while the peek
+      // was in flight.  A concurrent drain already set the authoritative
+      // count to 0, and overwriting it with a stale peek value would make
+      // the resource report phantom pending messages.
+      if (_drainGeneration == generationBefore) {
+        _lastKnownAppPendingCount = pendingCount;
+      }
       if (pendingCount > 0) {
         _lastMessageReceivedAt = DateTime.now().toUtc();
       }
@@ -75,22 +83,25 @@ final class VmServiceContext {
         _messageArrived!.complete();
       }
 
-      // Only send logging notification when process_queue is NOT active,
-      // since process_queue will return the messages directly.
-      if (!_isProcessingQueue && pendingCount > 0) {
-        await _server!.sendLoggingMessage(
-          LoggingMessageNotification(
-            level: LoggingLevel.info,
-            logger: 'flan-user',
-            data:
-                '$pendingCount pending message(s) from the Flutter app user. '
-                'Call process_queue, get_user_message, or read flan://messages/pending.',
-          ),
-        );
-      }
+      // Only send logging/resource notifications when the peek is still
+      // fresh (no drain consumed the messages while the peek was in flight)
+      // and process_queue is NOT active.
+      if (_drainGeneration == generationBefore) {
+        if (!_isProcessingQueue && pendingCount > 0) {
+          await _server!.sendLoggingMessage(
+            LoggingMessageNotification(
+              level: LoggingLevel.info,
+              logger: 'flan-user',
+              data:
+                  '$pendingCount pending message(s) from the Flutter app user. '
+                  'Call process_queue, get_user_message, or read flan://messages/pending.',
+            ),
+          );
+        }
 
-      await _notifyPendingMessagesResourceUpdated();
-      _maybeTriggerSamplingPushForPendingCount(pendingCount);
+        await _notifyPendingMessagesResourceUpdated();
+        _maybeTriggerSamplingPushForPendingCount(pendingCount);
+      }
     } catch (err, st) {
       _logger.warning('Failed to refresh pending queue ($origin)', err, st);
     }
@@ -122,6 +133,7 @@ final class VmServiceContext {
           allAddedMessages.addAll(messages);
           _lastMessageReceivedAt = DateTime.now().toUtc();
           _lastKnownAppPendingCount = 0;
+          _drainGeneration++;
           totalAdded += messages.length;
         }
 

@@ -261,6 +261,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   bool _showTextMessageOverlay = false;
   bool _textOverlayEverShown = false;
   bool _showQueuedMessagesPanel = false;
+  bool _showErrorPanel = false;
   List<Map<String, dynamic>> _queuedMessagesSnapshot = const [];
   int? _annotationDraftQueueId;
   String _lastQueuedAnnotationsSignature = '';
@@ -269,12 +270,27 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// an annotation draft while [_sendToAgent] is in progress.
   bool _isSendingToAgent = false;
 
+  /// Guard flag to prevent [_onAnnotationServiceChanged] from upserting
+  /// a new annotation draft while [_applyQueuedAnnotationEdit] is updating
+  /// the annotation text (which triggers notifyListeners).
+  bool _suppressAnnotationDraftUpsert = false;
+
+  /// Tracks [UserMessageService.agentConsumeGeneration] so we can detect
+  /// when the agent has consumed queued messages and clear annotations
+  /// instead of re-creating a draft.
+  int _lastSeenConsumeGeneration = 0;
+
   /// Tracks the last time an Alt/Option key was pressed for double-tap detection.
   DateTime? _lastAltPressTime;
+
+  /// Tracks the last time a Ctrl key was pressed for double-tap detection.
+  DateTime? _lastCtrlPressTime;
 
   @override
   void initState() {
     super.initState();
+    _lastSeenConsumeGeneration =
+        widget.userMessageService.agentConsumeGeneration;
     widget.inspectorService.addListener(_onServiceChanged);
     widget.annotationService.addListener(_onAnnotationServiceChanged);
     widget.userMessageService.addListener(_onUserMessageServiceChanged);
@@ -302,11 +318,25 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     }
   }
 
+  bool _serviceChangePending = false;
+
   void _onServiceChanged() {
-    if (mounted) setState(() {});
+    if (_showErrorPanel && widget.errorInterceptor.errors.isEmpty) {
+      _showErrorPanel = false;
+    }
+    if (!mounted || _serviceChangePending) return;
+    _serviceChangePending = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _serviceChangePending = false;
+      if (mounted) setState(() {});
+    });
   }
 
   void _onAnnotationServiceChanged() {
+    if (_suppressAnnotationDraftUpsert) {
+      if (mounted) setState(() {});
+      return;
+    }
     final annotations = widget.annotationService.getAnnotationsData();
     final signature = jsonEncode(annotations);
     if (signature != _lastQueuedAnnotationsSignature) {
@@ -362,16 +392,14 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
     final queueId = _annotationDraftQueueId;
     if (queueId != null) {
-      final updated =
-          widget.userMessageService.updateMessageByQueueId(queueId, {
+      widget.userMessageService.updateMessageByQueueId(queueId, {
         'type': 'user_feedback',
         'text': text,
         'data': data,
       });
-      if (updated) {
-        return;
-      }
-      _annotationDraftQueueId = null;
+      // Attach a cropped thumbnail asynchronously.
+      _attachDraftThumbnail(queueId, enrichedAnnotations, data);
+      return;
     }
 
     widget.userMessageService.sendMessage({
@@ -389,10 +417,64 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         }
       }
     }
+    // Attach a cropped thumbnail asynchronously.
+    if (_annotationDraftQueueId != null) {
+      _attachDraftThumbnail(
+          _annotationDraftQueueId!, enrichedAnnotations, data);
+    }
+  }
+
+  /// Asynchronously captures a screenshot and attaches a cropped thumbnail
+  /// to the draft message identified by [queueId].
+  Future<void> _attachDraftThumbnail(
+    int queueId,
+    List<Map<String, dynamic>> annotations,
+    Map<String, dynamic> data,
+  ) async {
+    final previewBounds = _resolveQueuePreviewBounds(
+      selection: null,
+      annotations: annotations,
+    );
+    try {
+      await _attachScreenshotAndQueueThumbnail(
+        context: context,
+        screenshotService: widget.screenshotService,
+        data: data,
+        previewBounds: previewBounds,
+      );
+    } catch (_) {
+      return;
+    }
+    // Update the message with the thumbnail if it still exists.
+    if (_annotationDraftQueueId == queueId) {
+      widget.userMessageService.updateMessageByQueueId(queueId, {
+        'type': 'user_feedback',
+        'text': _rebuildQueuedMessageText(
+          fallback: 'Annotation draft',
+          data: data,
+        ),
+        'data': data,
+      });
+    }
   }
 
   void _onUserMessageServiceChanged() {
     if (!mounted) return;
+
+    // Detect whether the agent just consumed messages. If so, clear
+    // annotations so the draft isn't immediately re-created.
+    final currentGeneration =
+        widget.userMessageService.agentConsumeGeneration;
+    if (currentGeneration != _lastSeenConsumeGeneration) {
+      _lastSeenConsumeGeneration = currentGeneration;
+      _annotationDraftQueueId = null;
+      _suppressAnnotationDraftUpsert = true;
+      widget.annotationService.clearAnnotations();
+      _lastQueuedAnnotationsSignature =
+          jsonEncode(widget.annotationService.getAnnotationsData());
+      _suppressAnnotationDraftUpsert = false;
+    }
+
     final pendingMessages = widget.userMessageService.peekMessages();
     if (_annotationDraftQueueId != null &&
         !pendingMessages.any((m) => _queueIdOf(m) == _annotationDraftQueueId)) {
@@ -407,11 +489,19 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         }
       }
       if (_annotationDraftQueueId == null &&
+          !_suppressAnnotationDraftUpsert &&
           !_isSendingToAgent &&
           !widget.userMessageService.isAgentListening &&
           widget.annotationService.annotations.isNotEmpty) {
-        _upsertQueuedAnnotationDraft(
-            widget.annotationService.getAnnotationsData());
+        // Only create a new draft if the annotations have changed since
+        // the last send/queue. This prevents re-creating a draft after
+        // _sendToAgent when the same annotations are still on screen.
+        final currentSignature =
+            jsonEncode(widget.annotationService.getAnnotationsData());
+        if (currentSignature != _lastQueuedAnnotationsSignature) {
+          _upsertQueuedAnnotationDraft(
+              widget.annotationService.getAnnotationsData());
+        }
       }
     }
 
@@ -437,7 +527,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
   /// Global keyboard shortcut handler.
   /// Ctrl+Shift+H toggles inspector mode.
-  /// Ctrl+Shift+A toggles annotation mode.
+  /// Double-tap Ctrl toggles annotation mode.
   /// Ctrl+Shift+Enter sends current data to the LLM agent.
   /// Escape exits the active mode.
   bool _handleGlobalKey(KeyEvent event) {
@@ -457,8 +547,33 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       return false;
     }
 
+    // Double-tap Ctrl to toggle annotation mode.
+    if (event.logicalKey == LogicalKeyboardKey.controlLeft ||
+        event.logicalKey == LogicalKeyboardKey.controlRight) {
+      final now = DateTime.now();
+      if (_lastCtrlPressTime != null &&
+          now.difference(_lastCtrlPressTime!).inMilliseconds < 500) {
+        _lastCtrlPressTime = null;
+        if (widget.annotationService.enabled) {
+          widget.annotationService.disable();
+        } else {
+          if (widget.inspectorService.enabled) {
+            widget.inspectorService.disable();
+          }
+          widget.annotationService.enable();
+        }
+        return true;
+      }
+      _lastCtrlPressTime = now;
+      return false;
+    }
+
     // Escape exits whichever mode is active (no modifiers needed).
     if (event.logicalKey == LogicalKeyboardKey.escape) {
+      if (_showErrorPanel) {
+        setState(() => _showErrorPanel = false);
+        return true;
+      }
       if (_showTextMessageOverlay) {
         widget.userMessageService.clearWaiting();
         setState(() => _showTextMessageOverlay = false);
@@ -489,18 +604,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           widget.annotationService.disable();
         }
         widget.inspectorService.enable();
-      }
-      return true;
-    }
-
-    if (event.logicalKey == LogicalKeyboardKey.keyA) {
-      if (widget.annotationService.enabled) {
-        widget.annotationService.disable();
-      } else {
-        if (widget.inspectorService.enabled) {
-          widget.inspectorService.disable();
-        }
-        widget.annotationService.enable();
       }
       return true;
     }
@@ -652,9 +755,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       // Screenshot capture is best-effort; don't block sending the message.
     }
 
-    // Reset the annotation signature so the listener doesn't
-    // immediately recreate a draft from the same annotations.
-    _lastQueuedAnnotationsSignature = '';
+    // Sync the signature to the current annotations so the listener
+    // doesn't recreate a draft from the same data on the next change.
+    _lastQueuedAnnotationsSignature =
+        jsonEncode(widget.annotationService.getAnnotationsData());
 
     widget.userMessageService.sendMessage({
       'type': 'user_feedback',
@@ -754,11 +858,20 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   }
 
   void _removeQueuedMessage(int queueId) {
+    // If the message being removed is an annotation draft, clear the
+    // underlying annotations so the boxes disappear from the screen.
+    final isAnnotationDraft = _annotationDraftQueueId == queueId;
+    if (isAnnotationDraft) {
+      _annotationDraftQueueId = null;
+      _suppressAnnotationDraftUpsert = true;
+      widget.annotationService.clearAnnotations();
+      _lastQueuedAnnotationsSignature =
+          jsonEncode(widget.annotationService.getAnnotationsData());
+      _suppressAnnotationDraftUpsert = false;
+    }
+
     final removed = widget.userMessageService.removeMessageByQueueId(queueId);
     if (!removed || !mounted) return;
-    if (_annotationDraftQueueId == queueId) {
-      _annotationDraftQueueId = null;
-    }
 
     setState(() {
       _queuedMessagesSnapshot = _queuedMessagesSnapshot
@@ -773,6 +886,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   void _clearQueuedMessages() {
     _annotationDraftQueueId = null;
     _lastQueuedAnnotationsSignature = '';
+    _suppressAnnotationDraftUpsert = true;
+    widget.annotationService.clearAnnotations();
+    _lastQueuedAnnotationsSignature =
+        jsonEncode(widget.annotationService.getAnnotationsData());
+    _suppressAnnotationDraftUpsert = false;
     _isSendingToAgent = true;
     widget.userMessageService.clearMessages();
     _isSendingToAgent = false;
@@ -853,13 +971,17 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       _removeQueuedAnnotation(queueId, annotationId);
       return;
     }
+    _suppressAnnotationDraftUpsert = true;
     widget.annotationService.updateAnnotationTextById(annotationId, trimmed);
+    _lastQueuedAnnotationsSignature =
+        jsonEncode(widget.annotationService.getAnnotationsData());
     _updateQueuedAnnotationInMessage(
       queueId: queueId,
       annotationId: annotationId,
       updatedText: trimmed,
       remove: false,
     );
+    _suppressAnnotationDraftUpsert = false;
   }
 
   void _removeQueuedAnnotation(int queueId, String annotationId) {
@@ -1007,15 +1129,50 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 ),
               ),
             ),
-          // Error toast overlay
+          // Error indicator dot (positioned to the left of the queue badge)
           if (widget.errorInterceptor.errors.isNotEmpty)
-            _ErrorToastOverlay(
-              errors: widget.errorInterceptor.errors,
-              onDismiss: (id) => widget.errorInterceptor.dismiss(id),
-              onSendToAgent: _sendErrorToAgent,
-              onCreateIssue: GitHubIssueService.isConfigured
-                  ? _createIssueFromError
-                  : null,
+            Positioned(
+              top: badgeTop,
+              right: badgeRight + 40,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () {
+                  setState(() {
+                    _showErrorPanel = !_showErrorPanel;
+                    if (_showErrorPanel) {
+                      _showQueuedMessagesPanel = false;
+                    }
+                  });
+                },
+                child: _ErrorDot(
+                  count: widget.errorInterceptor.errors.length,
+                ),
+              ),
+            ),
+          // Error panel (expands below the error dot)
+          if (_showErrorPanel && widget.errorInterceptor.errors.isNotEmpty)
+            Positioned(
+              top: badgeTop + 40,
+              right: badgeRight + 40,
+              child: _ErrorPanel(
+                errors: widget.errorInterceptor.errors,
+                onDismiss: (id) {
+                  widget.errorInterceptor.dismiss(id);
+                  if (widget.errorInterceptor.errors.isEmpty) {
+                    setState(() => _showErrorPanel = false);
+                  }
+                },
+                onAddToQueue: (error) {
+                  _sendErrorToAgent(error);
+                  if (widget.errorInterceptor.errors.isEmpty) {
+                    setState(() => _showErrorPanel = false);
+                  }
+                },
+                onClearAll: () {
+                  widget.errorInterceptor.clear();
+                  setState(() => _showErrorPanel = false);
+                },
+              ),
             ),
           // Text message overlay — kept in tree to preserve state across dismiss
           if (_textOverlayEverShown)
@@ -1032,6 +1189,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               behavior: HitTestBehavior.opaque,
               onTap: () {
                 setState(() {
+                  _showErrorPanel = false;
                   if (_showQueuedMessagesPanel) {
                     _showQueuedMessagesPanel = false;
                     _queuedMessagesSnapshot = const [];
@@ -1476,6 +1634,16 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
             child: Listener(
               behavior: HitTestBehavior.opaque,
               onPointerDown: (event) {
+                // If currently editing, re-focus the text field instead of
+                // starting a new drawing.
+                if (widget.service.drawState == AnnotationDrawState.editing ||
+                    widget.service.drawState ==
+                        AnnotationDrawState.editingExisting) {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    _textFocusNode.requestFocus();
+                  });
+                  return;
+                }
                 final tappedExisting =
                     widget.service.startDrawing(event.position);
                 if (tappedExisting) {
@@ -2249,7 +2417,7 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
                       label: 'Inspector')),
               Expanded(
                   child: _ShortcutRow(
-                      keyCaps: [ctrlKey, shiftKey, const _KeyCapText('A')],
+                      keyCaps: [ctrlKey, ctrlKey],
                       label: 'Annotate')),
             ],
           ),
@@ -3144,128 +3312,206 @@ class _AgentStatusIndicatorState extends State<_AgentStatusIndicator> {
   }
 }
 
-/// Shows intercepted errors as dismissible toasts at the bottom of the screen.
-/// Each toast has a "Send to Agent" button.
-class _ErrorToastOverlay extends StatelessWidget {
-  const _ErrorToastOverlay({
-    required this.errors,
-    required this.onDismiss,
-    required this.onSendToAgent,
-    this.onCreateIssue,
-  });
+/// A small red dot that indicates intercepted errors.
+/// Shows error count as a badge.
+class _ErrorDot extends StatelessWidget {
+  const _ErrorDot({required this.count});
 
-  final List<InterceptedError> errors;
-  final ValueChanged<int> onDismiss;
-  final ValueChanged<InterceptedError> onSendToAgent;
-  final ValueChanged<InterceptedError>? onCreateIssue;
+  final int count;
 
   @override
   Widget build(BuildContext context) {
-    // Show only the 3 most recent errors to avoid flooding.
-    final visible = errors.length > 3
-        ? errors.sublist(errors.length - 3)
-        : errors;
-
-    return Positioned(
-      left: 16,
-      right: 16,
-      bottom: 16,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          for (final error in visible)
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: _ErrorToast(
-                error: error,
-                onDismiss: () => onDismiss(error.id),
-                onSendToAgent: () => onSendToAgent(error),
-                onCreateIssue: onCreateIssue != null
-                    ? () => onCreateIssue!(error)
-                    : null,
-              ),
-            ),
+    final text = count > 99 ? '99+' : '$count';
+    return Container(
+      width: 28,
+      height: 28,
+      decoration: BoxDecoration(
+        color: const Color(0xFFD32F2F),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: const Color(0xFFFFFFFF),
+          width: 2,
+        ),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0xAA000000),
+            blurRadius: 12,
+            offset: Offset(0, 4),
+          ),
         ],
+      ),
+      child: Center(
+        child: Text(
+          text,
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+            color: Color(0xFFFFFFFF),
+            fontSize: 10,
+            fontWeight: FontWeight.w800,
+            decoration: TextDecoration.none,
+          ),
+        ),
       ),
     );
   }
 }
 
-class _ErrorToast extends StatelessWidget {
-  const _ErrorToast({
-    required this.error,
+/// Panel that expands below the error dot showing error details with
+/// "Add to Queue" and dismiss buttons for each error.
+class _ErrorPanel extends StatelessWidget {
+  const _ErrorPanel({
+    required this.errors,
     required this.onDismiss,
-    required this.onSendToAgent,
-    this.onCreateIssue,
+    required this.onAddToQueue,
+    required this.onClearAll,
   });
 
-  final InterceptedError error;
-  final VoidCallback onDismiss;
-  final VoidCallback onSendToAgent;
-  final VoidCallback? onCreateIssue;
+  final List<InterceptedError> errors;
+  final ValueChanged<int> onDismiss;
+  final ValueChanged<InterceptedError> onAddToQueue;
+  final VoidCallback onClearAll;
 
   @override
   Widget build(BuildContext context) {
-    // Truncate the summary for display.
-    final display = error.summary.length > 120
-        ? '${error.summary.substring(0, 120)}...'
-        : error.summary;
+    // Show up to 5 most recent errors.
+    final visible =
+        errors.length > 5 ? errors.sublist(errors.length - 5) : errors;
 
     return Material(
       type: MaterialType.transparency,
       child: Container(
-        constraints: const BoxConstraints(maxWidth: 480),
+        width: 340,
+        constraints: const BoxConstraints(maxHeight: 400),
         decoration: BoxDecoration(
-          color: const Color(0xF0B71C1C),
-          borderRadius: BorderRadius.circular(8),
+          color: const Color(0xF02A1010),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: const Color(0xFFD32F2F),
+            width: 1,
+          ),
           boxShadow: const [
             BoxShadow(
-              color: Color(0x40000000),
-              blurRadius: 8,
-              offset: Offset(0, 2),
+              color: Color(0x60000000),
+              blurRadius: 16,
+              offset: Offset(0, 4),
             ),
           ],
         ),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 10, 4, 10),
-          child: Row(
-            children: [
-              const Icon(
-                Icons.error_outline,
-                color: Color(0xFFFFCDD2),
-                size: 18,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Header
+            Container(
+              padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+              decoration: const BoxDecoration(
+                border: Border(
+                  bottom: BorderSide(color: Color(0x33FF5252)),
+                ),
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  display,
-                  style: const TextStyle(
-                    color: Color(0xFFFFEBEE),
-                    fontSize: 12,
-                    height: 1.3,
-                    decoration: TextDecoration.none,
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.error_outline,
+                    color: Color(0xFFFF5252),
+                    size: 16,
                   ),
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
+                  const SizedBox(width: 6),
+                  Text(
+                    '${errors.length} error${errors.length == 1 ? '' : 's'}',
+                    style: const TextStyle(
+                      color: Color(0xFFFF8A80),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      decoration: TextDecoration.none,
+                    ),
+                  ),
+                  const Spacer(),
+                  if (errors.length > 1)
+                    _ErrorPanelButton(
+                      label: 'Clear all',
+                      onTap: onClearAll,
+                    ),
+                ],
+              ),
+            ),
+            // Error list
+            Flexible(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final error in visible)
+                      _ErrorPanelItem(
+                        error: error,
+                        onDismiss: () => onDismiss(error.id),
+                        onAddToQueue: () => onAddToQueue(error),
+                      ),
+                  ],
                 ),
               ),
-              const SizedBox(width: 4),
-              if (onCreateIssue != null)
-                _ToastButton(
-                  icon: Icons.bug_report_outlined,
-                  tooltip: 'Create Issue',
-                  onTap: onCreateIssue!,
-                )
-              else
-                _ToastButton(
-                  icon: Icons.send,
-                  tooltip: 'Send to agent',
-                  onTap: onSendToAgent,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ErrorPanelItem extends StatelessWidget {
+  const _ErrorPanelItem({
+    required this.error,
+    required this.onDismiss,
+    required this.onAddToQueue,
+  });
+
+  final InterceptedError error;
+  final VoidCallback onDismiss;
+  final VoidCallback onAddToQueue;
+
+  @override
+  Widget build(BuildContext context) {
+    final display = error.summary.length > 200
+        ? '${error.summary.substring(0, 200)}...'
+        : error.summary;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      child: Container(
+        decoration: BoxDecoration(
+          color: const Color(0x20FF5252),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                display,
+                style: const TextStyle(
+                  color: Color(0xFFFFCDD2),
+                  fontSize: 11,
+                  height: 1.4,
+                  decoration: TextDecoration.none,
                 ),
-              _ToastButton(
-                icon: Icons.close,
-                tooltip: 'Dismiss',
-                onTap: onDismiss,
+                maxLines: 4,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 6),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  _ErrorPanelButton(
+                    label: 'Add to queue',
+                    onTap: onAddToQueue,
+                  ),
+                  const SizedBox(width: 4),
+                  _ErrorPanelButton(
+                    label: 'Dismiss',
+                    onTap: onDismiss,
+                  ),
+                ],
               ),
             ],
           ),
@@ -3275,27 +3521,33 @@ class _ErrorToast extends StatelessWidget {
   }
 }
 
-class _ToastButton extends StatelessWidget {
-  const _ToastButton({
-    required this.icon,
-    required this.tooltip,
+class _ErrorPanelButton extends StatelessWidget {
+  const _ErrorPanelButton({
+    required this.label,
     required this.onTap,
   });
 
-  final IconData icon;
-  final String tooltip;
+  final String label;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Tooltip(
-      message: tooltip,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(16),
-        child: Padding(
-          padding: const EdgeInsets.all(8),
-          child: Icon(icon, color: const Color(0xCCFFFFFF), size: 16),
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0x33FF5252),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Text(
+          label,
+          style: const TextStyle(
+            color: Color(0xFFFF8A80),
+            fontSize: 10,
+            fontWeight: FontWeight.w600,
+            decoration: TextDecoration.none,
+          ),
         ),
       ),
     );
