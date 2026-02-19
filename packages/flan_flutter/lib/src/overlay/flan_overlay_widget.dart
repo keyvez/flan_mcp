@@ -235,6 +235,7 @@ Future<void> _attachScreenshotAndQueueThumbnail({
 /// Overlay widget injected at the root of the app via
 /// [FlanBinding.wrapWithDefaultView]. Renders inspector interaction
 /// and annotation drawing UI on top of the app content.
+
 class FlanOverlayWidget extends StatefulWidget {
   const FlanOverlayWidget({
     super.key,
@@ -265,6 +266,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   List<Map<String, dynamic>> _queuedMessagesSnapshot = const [];
   int? _annotationDraftQueueId;
   String _lastQueuedAnnotationsSignature = '';
+
+  /// Monotonically increasing counter to detect stale async thumbnail
+  /// completions. Incremented every time a new draft thumbnail is started.
+  int _draftThumbnailGeneration = 0;
 
   /// Guard flag to prevent the user-message listener from recreating
   /// an annotation draft while [_sendToAgent] is in progress.
@@ -392,13 +397,28 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
     final queueId = _annotationDraftQueueId;
     if (queueId != null) {
+      // Preserve any existing thumbnail/screenshot from the current message
+      // so they remain visible while the new async thumbnail is being captured.
+      final pendingMessages = widget.userMessageService.peekMessages();
+      final existingIdx =
+          pendingMessages.indexWhere((m) => _queueIdOf(m) == queueId);
+      if (existingIdx != -1) {
+        final existingData =
+            _normalizedDataMap(pendingMessages[existingIdx]['data']);
+        if (existingData['queueThumbnail'] != null) {
+          data['queueThumbnail'] = existingData['queueThumbnail'];
+        }
+        if (existingData['screenshot'] != null) {
+          data['screenshot'] = existingData['screenshot'];
+        }
+      }
       widget.userMessageService.updateMessageByQueueId(queueId, {
         'type': 'user_feedback',
         'text': text,
         'data': data,
       });
       // Attach a cropped thumbnail asynchronously.
-      _attachDraftThumbnail(queueId, enrichedAnnotations, data);
+      _attachDraftThumbnail(queueId, enrichedAnnotations);
       return;
     }
 
@@ -420,7 +440,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     // Attach a cropped thumbnail asynchronously.
     if (_annotationDraftQueueId != null) {
       _attachDraftThumbnail(
-          _annotationDraftQueueId!, enrichedAnnotations, data);
+          _annotationDraftQueueId!, enrichedAnnotations);
     }
   }
 
@@ -429,33 +449,50 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   Future<void> _attachDraftThumbnail(
     int queueId,
     List<Map<String, dynamic>> annotations,
-    Map<String, dynamic> data,
   ) async {
+    final generation = ++_draftThumbnailGeneration;
     final previewBounds = _resolveQueuePreviewBounds(
       selection: null,
       annotations: annotations,
     );
+    // Use a temporary data map just for the screenshot/thumbnail capture.
+    final captureData = <String, dynamic>{};
     try {
       await _attachScreenshotAndQueueThumbnail(
         context: context,
         screenshotService: widget.screenshotService,
-        data: data,
+        data: captureData,
         previewBounds: previewBounds,
       );
     } catch (_) {
       return;
     }
-    // Update the message with the thumbnail if it still exists.
-    if (_annotationDraftQueueId == queueId) {
-      widget.userMessageService.updateMessageByQueueId(queueId, {
-        'type': 'user_feedback',
-        'text': _rebuildQueuedMessageText(
-          fallback: 'Annotation draft',
-          data: data,
-        ),
-        'data': data,
-      });
+    // Only update if this is still the latest thumbnail generation and the
+    // draft message still exists — otherwise a newer call has superseded us.
+    if (_draftThumbnailGeneration != generation ||
+        _annotationDraftQueueId != queueId) {
+      return;
     }
+    // Merge the thumbnail into the current message data instead of
+    // overwriting with a stale copy.
+    final pendingMessages = widget.userMessageService.peekMessages();
+    final index = pendingMessages.indexWhere((m) => _queueIdOf(m) == queueId);
+    if (index == -1) return;
+    final currentData = _normalizedDataMap(pendingMessages[index]['data']);
+    if (captureData['queueThumbnail'] != null) {
+      currentData['queueThumbnail'] = captureData['queueThumbnail'];
+    }
+    if (captureData['screenshot'] != null) {
+      currentData['screenshot'] = captureData['screenshot'];
+    }
+    widget.userMessageService.updateMessageByQueueId(queueId, {
+      'type': 'user_feedback',
+      'text': _rebuildQueuedMessageText(
+        fallback: 'Annotation draft',
+        data: currentData,
+      ),
+      'data': currentData,
+    });
   }
 
   void _onUserMessageServiceChanged() {
@@ -1297,10 +1334,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
     for (final annotation in annotations) {
       includeRect(_rectFromBoundsValue(annotation['bounds']));
-      final widgetInfo = annotation['widget'];
-      if (widgetInfo is Map) {
-        includeRect(_rectFromBoundsValue(widgetInfo['bounds']));
-      }
     }
 
     return combinedBounds;
@@ -3158,9 +3191,17 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     final data = message['data'];
     if (data is! Map) return null;
 
+    // Prefer the cropped thumbnail — it focuses on the relevant area.
     final queueThumbnail = data['queueThumbnail'];
     if (queueThumbnail is String) {
       final bytes = _decodeBase64Image(queueThumbnail);
+      if (bytes != null) return bytes;
+    }
+
+    // Fall back to the full screenshot.
+    final screenshot = data['screenshot'];
+    if (screenshot is String) {
+      final bytes = _decodeBase64Image(screenshot);
       if (bytes != null) return bytes;
     }
 
@@ -3208,11 +3249,11 @@ class _QueueMessageThumbnail extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 72,
-      height: 44,
+      width: 96,
+      height: 58,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: const Color(0xFF2F3A57), width: 1),
+        border: Border.all(color: const Color(0xFF5A6A8A), width: 1),
       ),
       clipBehavior: Clip.antiAlias,
       child: Image.memory(

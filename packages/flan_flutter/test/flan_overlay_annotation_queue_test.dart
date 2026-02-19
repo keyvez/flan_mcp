@@ -220,4 +220,170 @@ void main() {
     expect(userMessageService.pendingMessageCount, 0);
     expect(annotationService.annotations, isEmpty);
   });
+
+  testWidgets(
+      'adding second annotation preserves first after async thumbnail completes',
+      (tester) async {
+    final inspectorService = InspectorService();
+    final annotationService = AnnotationService();
+    final userMessageService = UserMessageService();
+    final screenshotService =
+        ScreenshotService(maxScreenshotSize: const Size(1024, 1024));
+    final errorInterceptor = ErrorInterceptor();
+
+    await tester.pumpWidget(_buildTestApp(
+      inspectorService: inspectorService,
+      annotationService: annotationService,
+      userMessageService: userMessageService,
+      screenshotService: screenshotService,
+      errorInterceptor: errorInterceptor,
+    ));
+    await tester.pumpAndSettle();
+
+    // Add first annotation and wait for async thumbnail to complete.
+    await _runAsyncAndSettle(tester, () async {
+      annotationService.addAnnotationProgrammatically(
+        x: 10,
+        y: 10,
+        width: 60,
+        height: 40,
+        text: 'first',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    });
+
+    expect(userMessageService.pendingMessageCount, 1);
+    var data = userMessageService.peekMessages().single['data']
+        as Map<String, dynamic>;
+    var annotations = data['annotations'] as List<dynamic>;
+    expect(annotations, hasLength(1));
+    expect((annotations[0] as Map)['text'], 'first');
+
+    // Add second annotation — the async thumbnail for the first may still be
+    // pending or complete. After this, both annotations must be present.
+    await _runAsyncAndSettle(tester, () async {
+      annotationService.addAnnotationProgrammatically(
+        x: 100,
+        y: 100,
+        width: 60,
+        height: 40,
+        text: 'second',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    });
+
+    expect(userMessageService.pendingMessageCount, 1);
+    data = userMessageService.peekMessages().single['data']
+        as Map<String, dynamic>;
+    annotations = data['annotations'] as List<dynamic>;
+    // Both annotations must be present — the stale async thumbnail must not
+    // have overwritten the data with only the first annotation.
+    expect(annotations, hasLength(2));
+    final texts = annotations
+        .map((a) => (a as Map)['text']?.toString() ?? '')
+        .toList();
+    expect(texts, containsAll(['first', 'second']));
+  });
+
+  testWidgets(
+      'rapidly adding three annotations preserves all in the draft',
+      (tester) async {
+    final inspectorService = InspectorService();
+    final annotationService = AnnotationService();
+    final userMessageService = UserMessageService();
+    final screenshotService =
+        ScreenshotService(maxScreenshotSize: const Size(1024, 1024));
+    final errorInterceptor = ErrorInterceptor();
+
+    await tester.pumpWidget(_buildTestApp(
+      inspectorService: inspectorService,
+      annotationService: annotationService,
+      userMessageService: userMessageService,
+      screenshotService: screenshotService,
+      errorInterceptor: errorInterceptor,
+    ));
+    await tester.pumpAndSettle();
+
+    // Add three annotations rapidly without waiting for async completion.
+    await _runAsyncAndSettle(tester, () async {
+      annotationService.addAnnotationProgrammatically(
+        x: 10, y: 10, width: 40, height: 30, text: 'A',
+      );
+      annotationService.addAnnotationProgrammatically(
+        x: 60, y: 10, width: 40, height: 30, text: 'B',
+      );
+      annotationService.addAnnotationProgrammatically(
+        x: 110, y: 10, width: 40, height: 30, text: 'C',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    });
+
+    expect(userMessageService.pendingMessageCount, 1);
+    final data = userMessageService.peekMessages().single['data']
+        as Map<String, dynamic>;
+    final annotations = data['annotations'] as List<dynamic>;
+    expect(annotations, hasLength(3));
+    final texts = annotations
+        .map((a) => (a as Map)['text']?.toString() ?? '')
+        .toList();
+    expect(texts, containsAll(['A', 'B', 'C']));
+  });
+
+  testWidgets(
+      'thumbnail is preserved when updating draft with a new annotation',
+      (tester) async {
+    final inspectorService = InspectorService();
+    final annotationService = AnnotationService();
+    final userMessageService = UserMessageService();
+    final screenshotService =
+        ScreenshotService(maxScreenshotSize: const Size(1024, 1024));
+    final errorInterceptor = ErrorInterceptor();
+
+    await tester.pumpWidget(_buildTestApp(
+      inspectorService: inspectorService,
+      annotationService: annotationService,
+      userMessageService: userMessageService,
+      screenshotService: screenshotService,
+      errorInterceptor: errorInterceptor,
+    ));
+    await tester.pumpAndSettle();
+
+    // Add first annotation and wait for the async thumbnail to attach.
+    await _runAsyncAndSettle(tester, () async {
+      annotationService.addAnnotationProgrammatically(
+        x: 10,
+        y: 10,
+        width: 60,
+        height: 40,
+        text: 'first',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    });
+
+    expect(userMessageService.pendingMessageCount, 1);
+    var data = userMessageService.peekMessages().single['data']
+        as Map<String, dynamic>;
+    // After the async thumbnail completes, queueThumbnail should be present.
+    expect(data['queueThumbnail'], isNotNull,
+        reason: 'thumbnail should be attached after first annotation');
+
+    // Add a second annotation — this triggers _upsertQueuedAnnotationDraft
+    // which updates the draft. The existing thumbnail must be preserved.
+    annotationService.addAnnotationProgrammatically(
+      x: 100,
+      y: 100,
+      width: 60,
+      height: 40,
+      text: 'second',
+    );
+    await tester.pumpAndSettle();
+
+    // Check immediately — the thumbnail should still be present even before
+    // the new async thumbnail capture completes.
+    data = userMessageService.peekMessages().single['data']
+        as Map<String, dynamic>;
+    expect(data['queueThumbnail'], isNotNull,
+        reason: 'thumbnail must not be lost when updating draft');
+    expect(data['annotations'], hasLength(2));
+  });
 }
