@@ -202,7 +202,34 @@ Future<void> _attachScreenshotAndQueueThumbnail({
   required ScreenshotService screenshotService,
   required Map<String, dynamic> data,
   Rect? previewBounds,
+  GlobalKey? boundaryKey,
 }) async {
+  // Try capturing from the RepaintBoundary first (excludes overlay layers).
+  String? cleanScreenshot;
+  if (boundaryKey != null) {
+    cleanScreenshot =
+        await screenshotService.takeScreenshotFromBoundary(boundaryKey);
+  }
+
+  if (cleanScreenshot != null) {
+    data['screenshot'] = cleanScreenshot;
+    if (previewBounds != null) {
+      final viewportSize = _resolveViewportSize(context);
+      if (viewportSize.width > 0 && viewportSize.height > 0) {
+        final queueThumbnail = await _buildQueueThumbnailFromScreenshot(
+          screenshotBase64: cleanScreenshot,
+          targetBounds: previewBounds,
+          viewportSize: viewportSize,
+        );
+        if (queueThumbnail != null) {
+          data['queueThumbnail'] = queueThumbnail;
+        }
+      }
+    }
+    return;
+  }
+
+  // Fall back to the full-view screenshot.
   final screenshots = await screenshotService.takeScreenshots();
   if (screenshots.isEmpty) {
     return;
@@ -266,6 +293,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   List<Map<String, dynamic>> _queuedMessagesSnapshot = const [];
   int? _annotationDraftQueueId;
   String _lastQueuedAnnotationsSignature = '';
+
+  /// Key for the RepaintBoundary wrapping the app content.
+  /// Used to capture only the app layer (without annotation overlays
+  /// or Flan UI) via [ScreenshotService.takeScreenshotFromBoundary].
+  final _appContentKey = GlobalKey();
 
   /// Monotonically increasing counter to detect stale async thumbnail
   /// completions. Incremented every time a new draft thumbnail is started.
@@ -455,7 +487,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       selection: null,
       annotations: annotations,
     );
-    // Use a temporary data map just for the screenshot/thumbnail capture.
     final captureData = <String, dynamic>{};
     try {
       await _attachScreenshotAndQueueThumbnail(
@@ -463,6 +494,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         screenshotService: widget.screenshotService,
         data: captureData,
         previewBounds: previewBounds,
+        boundaryKey: _appContentKey,
       );
     } catch (_) {
       return;
@@ -792,6 +824,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         screenshotService: widget.screenshotService,
         data: data,
         previewBounds: previewBounds,
+        boundaryKey: _appContentKey,
       );
     } catch (_) {
       // Screenshot capture is best-effort; don't block sending the message.
@@ -1125,8 +1158,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       textDirection: TextDirection.ltr,
       child: Stack(
         children: [
-          // The actual app content
-          widget.child,
+          // The actual app content, wrapped in a RepaintBoundary so we can
+          // capture it without annotation/overlay layers.
+          RepaintBoundary(key: _appContentKey, child: widget.child),
           // Render existing annotations even when annotation mode is off.
           if (!widget.annotationService.enabled &&
               widget.annotationService.annotations.isNotEmpty)
@@ -2768,13 +2802,13 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
   int _estimateCursorOffset(String text, double localX) {
     const style = TextStyle(
       color: Color(0xFFE0E0E0),
-      fontSize: 12,
+      fontSize: 14,
       height: 1.4,
     );
     final painter = TextPainter(
       text: TextSpan(text: text, style: style),
       textDirection: TextDirection.ltr,
-      maxLines: 2,
+      maxLines: 3,
     )..layout();
     final position = painter.getPositionForOffset(Offset(localX, 0));
     painter.dispose();
@@ -2808,8 +2842,8 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 340,
-      constraints: const BoxConstraints(maxHeight: 260),
+      width: 480,
+      constraints: const BoxConstraints(maxHeight: 400),
       decoration: BoxDecoration(
         color: const Color(0xFF1A1A2E),
         borderRadius: BorderRadius.circular(12),
@@ -2823,6 +2857,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
         ],
       ),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
@@ -2834,7 +2869,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                     'Queued messages (${widget.messages.length})',
                     style: const TextStyle(
                       color: Color(0xFF00AAFF),
-                      fontSize: 12,
+                      fontSize: 14,
                       fontWeight: FontWeight.w600,
                       decoration: TextDecoration.none,
                     ),
@@ -2967,7 +3002,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                   child: annotations.isNotEmpty && queueId != null
                       ? _buildAnnotationItem(
                           queueId: queueId,
-                          previewBytes: previewBytes,
+                          screenshotBytes: _screenshotBytesForMessage(message),
                           annotations: annotations,
                         )
                       : _buildGenericItem(
@@ -2997,13 +3032,13 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
       child: Material(
         color: Colors.transparent,
         child: SizedBox(
-          height: 24,
+          height: 28,
           child: TextField(
             controller: _editController,
             focusNode: _editFocusNode,
             style: const TextStyle(
               color: Color(0xFFE0E0E0),
-              fontSize: 12,
+              fontSize: 14,
               height: 1.4,
             ),
             decoration: const InputDecoration(
@@ -3034,80 +3069,92 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
 
   Widget _buildAnnotationItem({
     required int queueId,
-    required Uint8List? previewBytes,
+    required Uint8List? screenshotBytes,
     required List<Map<String, dynamic>> annotations,
   }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (int i = 0; i < annotations.length; i++) ...[
+          if (i > 0)
+            const Divider(height: 8, color: Color(0xFF2A2A3A)),
+          _buildSingleAnnotationRow(
+            queueId: queueId,
+            annotation: annotations[i],
+            screenshotBytes: screenshotBytes,
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildSingleAnnotationRow({
+    required int queueId,
+    required Map<String, dynamic> annotation,
+    required Uint8List? screenshotBytes,
+  }) {
+    final annotationId = annotation['id']?.toString() ?? '';
+    final annotationText = annotation['text']?.toString() ?? '(no label)';
+    final editKey = 'ann:$queueId:$annotationId';
+    final isEditing = _editingKey == editKey;
+    final bounds = _rectFromBoundsValue(annotation['bounds']);
+
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        if (previewBytes != null) ...[
-          _QueueMessageThumbnail(bytes: previewBytes),
+        if (screenshotBytes != null) ...[
+          if (bounds != null)
+            _CroppedAnnotationThumbnail(
+              screenshotBytes: screenshotBytes,
+              annotationBounds: bounds,
+            )
+          else
+            _QueueMessageThumbnail(bytes: screenshotBytes),
           const SizedBox(width: 8),
         ],
         Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: annotations.map((annotation) {
-              final annotationId = annotation['id']?.toString() ?? '';
-              final annotationText =
-                  annotation['text']?.toString() ?? '(no label)';
-              final editKey = 'ann:$queueId:$annotationId';
-              final isEditing = _editingKey == editKey;
-              return Padding(
-                padding: EdgeInsets.only(
-                  bottom: annotation == annotations.last ? 0 : 4,
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: isEditing
-                          ? _buildInlineTextField()
-                          : GestureDetector(
-                              behavior: HitTestBehavior.opaque,
-                              onTapUp: (details) {
-                                if (annotationId.isEmpty) return;
-                                _startEditingWithKey(
-                                  'ann:$queueId:$annotationId',
-                                  annotationText,
-                                  cursorOffset: _estimateCursorOffset(
-                                    annotationText,
-                                    details.localPosition.dx,
-                                  ),
-                                );
-                              },
-                              child: Text(
-                                annotationText,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: Color(0xFFE0E0E0),
-                                  fontSize: 12,
-                                  height: 1.4,
-                                  decoration: TextDecoration.none,
-                                ),
-                              ),
-                            ),
-                    ),
-                    const SizedBox(width: 4),
-                    GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () {
-                        if (annotationId.isEmpty) return;
-                        widget.onDeleteAnnotation(queueId, annotationId);
-                      },
-                      child: const Padding(
-                        padding: EdgeInsets.all(2),
-                        child: Icon(
-                          Icons.delete_outline,
-                          size: 14,
-                          color: Color(0xFFFF7777),
-                        ),
+          child: isEditing
+              ? _buildInlineTextField()
+              : GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapUp: (details) {
+                    if (annotationId.isEmpty) return;
+                    _startEditingWithKey(
+                      'ann:$queueId:$annotationId',
+                      annotationText,
+                      cursorOffset: _estimateCursorOffset(
+                        annotationText,
+                        details.localPosition.dx,
                       ),
+                    );
+                  },
+                  child: Text(
+                    annotationText,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Color(0xFFE0E0E0),
+                      fontSize: 14,
+                      height: 1.4,
+                      decoration: TextDecoration.none,
                     ),
-                  ],
+                  ),
                 ),
-              );
-            }).toList(),
+        ),
+        const SizedBox(width: 4),
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () {
+            if (annotationId.isEmpty) return;
+            widget.onDeleteAnnotation(queueId, annotationId);
+          },
+          child: const Padding(
+            padding: EdgeInsets.all(2),
+            child: Icon(
+              Icons.delete_outline,
+              size: 14,
+              color: Color(0xFFFF7777),
+            ),
           ),
         ),
       ],
@@ -3145,11 +3192,11 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                       : null,
                   child: Text(
                     summary,
-                    maxLines: 2,
+                    maxLines: 3,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                       color: Color(0xFFE0E0E0),
-                      fontSize: 12,
+                      fontSize: 14,
                       height: 1.4,
                       decoration: TextDecoration.none,
                     ),
@@ -3213,6 +3260,19 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     return null;
   }
 
+  /// Returns the raw full screenshot bytes for a message (used for
+  /// per-annotation cropping in the queue panel).
+  static Uint8List? _screenshotBytesForMessage(Map<String, dynamic> message) {
+    final data = message['data'];
+    if (data is! Map) return null;
+    final screenshot = data['screenshot'];
+    if (screenshot is String) {
+      return _decodeBase64Image(screenshot);
+    }
+    // Fall back to queueThumbnail or drawingImage.
+    return _previewBytesForMessage(message);
+  }
+
   static List<Map<String, dynamic>> _annotationsFromMessage(
     Map<String, dynamic> message,
   ) {
@@ -3249,8 +3309,8 @@ class _QueueMessageThumbnail extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 96,
-      height: 58,
+      width: 120,
+      height: 72,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(6),
         border: Border.all(color: const Color(0xFF5A6A8A), width: 1),
@@ -3264,6 +3324,146 @@ class _QueueMessageThumbnail extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Thumbnail that crops a full screenshot to show just the region around
+/// a single annotation's bounds.
+class _CroppedAnnotationThumbnail extends StatefulWidget {
+  const _CroppedAnnotationThumbnail({
+    required this.screenshotBytes,
+    required this.annotationBounds,
+  });
+
+  final Uint8List screenshotBytes;
+  final Rect annotationBounds;
+
+  @override
+  State<_CroppedAnnotationThumbnail> createState() =>
+      _CroppedAnnotationThumbnailState();
+}
+
+class _CroppedAnnotationThumbnailState
+    extends State<_CroppedAnnotationThumbnail> {
+  ui.Image? _image;
+  bool _disposed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _decodeImage();
+  }
+
+  @override
+  void didUpdateWidget(_CroppedAnnotationThumbnail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(widget.screenshotBytes, oldWidget.screenshotBytes)) {
+      _image?.dispose();
+      _image = null;
+      _decodeImage();
+    }
+  }
+
+  Future<void> _decodeImage() async {
+    try {
+      final codec = await ui.instantiateImageCodec(widget.screenshotBytes);
+      final frame = await codec.getNextFrame();
+      codec.dispose();
+      if (_disposed) {
+        frame.image.dispose();
+        return;
+      }
+      setState(() => _image = frame.image);
+    } catch (_) {
+      // Decoding failed — leave _image null, will show placeholder.
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _image?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final viewportSize = _resolveViewportSize(context);
+    return Container(
+      width: 120,
+      height: 72,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xFF5A6A8A), width: 1),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: _image != null && viewportSize.width > 0
+          ? CustomPaint(
+              size: const Size(120, 72),
+              painter: _CropPainter(
+                image: _image!,
+                annotationBounds: widget.annotationBounds,
+                viewportSize: viewportSize,
+              ),
+            )
+          : const SizedBox.shrink(),
+    );
+  }
+}
+
+class _CropPainter extends CustomPainter {
+  _CropPainter({
+    required this.image,
+    required this.annotationBounds,
+    required this.viewportSize,
+  });
+
+  final ui.Image image;
+  final Rect annotationBounds;
+  final Size viewportSize;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final imageW = image.width.toDouble();
+    final imageH = image.height.toDouble();
+    if (imageW <= 0 || imageH <= 0) return;
+
+    final scaleX = imageW / viewportSize.width;
+    final scaleY = imageH / viewportSize.height;
+
+    // Pad the annotation bounds by 20 logical pixels.
+    final padded = annotationBounds.inflate(20);
+    final clamped = Rect.fromLTRB(
+      padded.left.clamp(0.0, viewportSize.width),
+      padded.top.clamp(0.0, viewportSize.height),
+      padded.right.clamp(0.0, viewportSize.width),
+      padded.bottom.clamp(0.0, viewportSize.height),
+    );
+    if (clamped.width <= 0 || clamped.height <= 0) return;
+
+    // Convert to image pixel coordinates.
+    final srcRect = Rect.fromLTRB(
+      clamped.left * scaleX,
+      clamped.top * scaleY,
+      clamped.right * scaleX,
+      clamped.bottom * scaleY,
+    );
+
+    // Fit the source rect to the thumbnail aspect ratio so content
+    // isn't squished.
+    final imageSize = Size(imageW, imageH);
+    final targetAspect = size.width / size.height;
+    final fittedSrcRect = _fitRectToAspect(srcRect, targetAspect, imageSize);
+
+    final dstRect = Rect.fromLTWH(0, 0, size.width, size.height);
+    final paint = Paint()..filterQuality = FilterQuality.low;
+    canvas.drawImageRect(image, fittedSrcRect, dstRect, paint);
+  }
+
+  @override
+  bool shouldRepaint(_CropPainter oldDelegate) =>
+      !identical(image, oldDelegate.image) ||
+      annotationBounds != oldDelegate.annotationBounds ||
+      viewportSize != oldDelegate.viewportSize;
 }
 
 /// A [TextInputFormatter] that intercepts bare Enter (without Shift) to

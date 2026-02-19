@@ -205,6 +205,66 @@ class ScreenshotService {
     return resizedImage;
   }
 
+  /// Takes a screenshot from a specific [RenderRepaintBoundary]'s layer,
+  /// capturing only the subtree under that boundary (excluding overlay layers
+  /// like annotation painters that are siblings in the widget tree).
+  ///
+  /// Returns a base64-encoded PNG string, or null if capture fails.
+  Future<String?> takeScreenshotFromBoundary(GlobalKey boundaryKey) async {
+    final context = boundaryKey.currentContext;
+    if (context == null) return null;
+
+    final renderObject = context.findRenderObject();
+    if (renderObject is! RenderRepaintBoundary) return null;
+
+    ui.Image? image;
+    ui.Image? resizedImage;
+
+    try {
+      // Use the boundary's own toImage, which captures only its subtree.
+      final dpr = WidgetsBinding
+              .instance.renderViews.firstOrNull?.flutterView.devicePixelRatio ??
+          1.0;
+      image = await renderObject.toImage(pixelRatio: dpr);
+
+      final width = image.width;
+      final height = image.height;
+      if (width <= 0 || height <= 0) return null;
+
+      final targetSize = maxScreenshotSize == null
+          ? null
+          : calculateScaledSize(
+              Size(width.toDouble(), height.toDouble()),
+              maxScreenshotSize!,
+            );
+
+      if (targetSize != null) {
+        resizedImage = await _resizeImage(image, targetSize);
+      }
+
+      final imageToEncode = resizedImage ?? image;
+      final byteData = await imageToEncode.toByteData(
+        format: ui.ImageByteFormat.png,
+      );
+      if (byteData == null) return null;
+
+      final pngBytes = byteData.buffer.asUint8List();
+      debugPrint(
+        'ScreenshotService: Captured boundary screenshot '
+        '(${pngBytes.lengthInBytes} bytes).',
+      );
+      return base64Encode(pngBytes);
+    } catch (e) {
+      debugPrint('ScreenshotService: Boundary capture failed: $e');
+      return null;
+    } finally {
+      if (resizedImage != null && resizedImage != image) {
+        resizedImage.dispose();
+      }
+      image?.dispose();
+    }
+  }
+
   static bool _isValidSize(Size size) {
     return size.width > 0 && size.height > 0;
   }
