@@ -250,6 +250,34 @@ class FlanBinding extends WidgetsFlutterBinding {
       },
     );
 
+    // Extension: Get intercepted errors
+    registerServiceExtension(
+      name: 'flan.getErrors',
+      callback: (params) async {
+        try {
+          final errors = _errorInterceptor.errors
+              .map((e) => <String, dynamic>{
+                    'id': e.id,
+                    'summary': e.summary,
+                    'details': e.details,
+                    'timestamp': e.timestamp.toIso8601String(),
+                  })
+              .toList();
+          return <String, dynamic>{
+            'status': 'Success',
+            'errors': errors,
+            'count': errors.length,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
     // Extension: Take screenshots
     registerServiceExtension(
       name: 'flan.takeScreenshots',

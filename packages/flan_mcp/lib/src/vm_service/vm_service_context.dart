@@ -761,6 +761,60 @@ final class VmServiceContext {
           }
         },
       )
+      // Get errors
+      ..registerTool(
+        'get_errors',
+        description:
+            'Retrieves intercepted errors and exceptions from the Flutter app. Returns all errors captured since the app started or since the last clear, including Flutter framework errors and unhandled Dart exceptions. Each error includes a summary, full details with stack trace, and timestamp. Use this after making code changes and hot reloading to check if the app threw any errors. Requires an active connection established via connect.',
+        annotations: const ToolAnnotations(
+          title: 'Get Intercepted Errors',
+          readOnlyHint: true,
+        ),
+        inputSchema: const ToolInputSchema(properties: {}),
+        callback: (args, extra) async {
+          _logger.info('Getting intercepted errors');
+
+          try {
+            final response = await connector.getErrors();
+            final errors = response['errors'] as List;
+            final count = response['count'] as int;
+
+            if (count == 0) {
+              return CallToolResult(
+                content: [
+                  const TextContent(text: 'No errors intercepted'),
+                ],
+              );
+            }
+
+            final buffer = StringBuffer()
+              ..writeln(
+                '$count error${count == 1 ? '' : 's'} intercepted:\n',
+              );
+
+            for (final error in errors) {
+              final summary = error['summary'] ?? 'Unknown error';
+              final details = error['details'] ?? '';
+              final timestamp = error['timestamp'] ?? '';
+              buffer
+                ..writeln('--- [$timestamp] ---')
+                ..writeln(summary)
+                ..writeln(details)
+                ..writeln();
+            }
+
+            return CallToolResult(
+              content: [TextContent(text: buffer.toString())],
+            );
+          } catch (err) {
+            _logger.warning('Failed to get errors', err);
+            return CallToolResult(
+              isError: true,
+              content: [TextContent(text: err.toString())],
+            );
+          }
+        },
+      )
       // Take screenshots
       ..registerTool(
         'take_screenshots',

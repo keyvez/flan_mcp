@@ -304,6 +304,13 @@ class VmServiceConnector {
     return _callExtension('flan.getLogs', {});
   }
 
+  /// Gets intercepted errors and exceptions from the running app.
+  ///
+  /// Throws [NotConnectedException] if not connected.
+  Future<Map<String, dynamic>> getErrors() {
+    return _callExtension('flan.getErrors', {});
+  }
+
   /// Takes screenshots of all views in the app.
   ///
   /// Returns a list of base64-encoded PNG images.
