@@ -584,7 +584,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         return true;
       }
       if (widget.annotationService.enabled) {
-        widget.annotationService.disable();
+        if (widget.annotationService.drawState != AnnotationDrawState.normal) {
+          widget.annotationService.cancelEditing();
+        } else {
+          widget.annotationService.disable();
+        }
         return true;
       }
       return false;
@@ -660,6 +664,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// Packages up the current inspector selection and/or annotations
   /// into a message and sends it to the LLM agent.
   Future<void> _sendToAgent() async {
+    if (_isSendingToAgent) return;
     _isSendingToAgent = true;
     final annotationDraftQueueId = _annotationDraftQueueId;
     if (annotationDraftQueueId != null) {
@@ -1225,7 +1230,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 messages: _queuedMessagesSnapshot,
                 onDeleteMessage: _removeQueuedMessage,
                 onClearAll: _clearQueuedMessages,
-                onEditAnnotation: _editQueuedAnnotation,
+                onSaveAnnotation: _applyQueuedAnnotationEdit,
                 onDeleteAnnotation: _removeQueuedAnnotation,
                 onCreateIssue: GitHubIssueService.isConfigured
                     ? _createIssueFromQueue
@@ -1723,16 +1728,14 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
 
   void _handleNewAnnotationSubmit(String text) {
     widget.service.submitAnnotationText(text);
-    if (widget.service.annotations.isNotEmpty) {
-      widget.onAnnotationSubmitted();
-    }
+    // Don't auto-send — the annotation is queued as a draft and the user
+    // can edit it further before explicitly sending with Ctrl+Shift+Enter.
   }
 
   void _handleEditAnnotationSubmit(String text) {
     widget.service.submitEditedAnnotationText(text);
-    if (widget.service.annotations.isNotEmpty) {
-      widget.onAnnotationSubmitted();
-    }
+    // Don't call onAnnotationSubmitted here — editing an existing annotation
+    // should only update the draft in-place, not trigger a send to agent.
   }
 
   Widget _buildTextField(Rect rect, Size screenSize) {
@@ -2603,12 +2606,12 @@ class _QueuedMessagesBadge extends StatelessWidget {
   }
 }
 
-class _QueuedMessagesPanel extends StatelessWidget {
-  const _QueuedMessagesPanel({
+class _QueuedMessagesPanel extends StatefulWidget {
+  _QueuedMessagesPanel({
     required this.messages,
     required this.onDeleteMessage,
     required this.onClearAll,
-    required this.onEditAnnotation,
+    required this.onSaveAnnotation,
     required this.onDeleteAnnotation,
     this.onCreateIssue,
     this.onExitAnnotationMode,
@@ -2618,15 +2621,71 @@ class _QueuedMessagesPanel extends StatelessWidget {
   final List<Map<String, dynamic>> messages;
   final void Function(int queueId) onDeleteMessage;
   final VoidCallback onClearAll;
-  final Future<void> Function(
+  final void Function(
     int queueId,
     String annotationId,
-    String currentText,
-  ) onEditAnnotation;
+    String newText,
+  ) onSaveAnnotation;
   final void Function(int queueId, String annotationId) onDeleteAnnotation;
   final VoidCallback? onCreateIssue;
   final VoidCallback? onExitAnnotationMode;
   final bool isAnnotationModeActive;
+
+  @override
+  State<_QueuedMessagesPanel> createState() => _QueuedMessagesPanelState();
+}
+
+class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
+  /// Key: "queueId:annotationId" for the annotation currently being edited.
+  String? _editingKey;
+  final _editController = TextEditingController();
+  final _editFocusNode = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _editFocusNode.addListener(_onFocusLost);
+  }
+
+  @override
+  void dispose() {
+    _editFocusNode.removeListener(_onFocusLost);
+    _editFocusNode.dispose();
+    _editController.dispose();
+    super.dispose();
+  }
+
+  void _onFocusLost() {
+    if (!_editFocusNode.hasFocus && _editingKey != null) {
+      _commitEdit();
+    }
+  }
+
+  void _startEditing(int queueId, String annotationId, String currentText) {
+    setState(() {
+      _editingKey = '$queueId:$annotationId';
+      _editController.text = currentText;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _editFocusNode.requestFocus();
+      _editController.selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: _editController.text.length,
+      );
+    });
+  }
+
+  void _commitEdit() {
+    if (_editingKey == null) return;
+    final parts = _editingKey!.split(':');
+    final queueId = int.tryParse(parts[0]);
+    final annotationId = parts.length > 1 ? parts.sublist(1).join(':') : '';
+    final newText = _editController.text.trim();
+    setState(() => _editingKey = null);
+    if (queueId != null && annotationId.isNotEmpty && newText.isNotEmpty) {
+      widget.onSaveAnnotation(queueId, annotationId, newText);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2654,7 +2713,7 @@ class _QueuedMessagesPanel extends StatelessWidget {
               children: [
                 Expanded(
                   child: Text(
-                    'Queued messages (${messages.length})',
+                    'Queued messages (${widget.messages.length})',
                     style: const TextStyle(
                       color: Color(0xFF00AAFF),
                       fontSize: 12,
@@ -2663,11 +2722,11 @@ class _QueuedMessagesPanel extends StatelessWidget {
                     ),
                   ),
                 ),
-                if (isAnnotationModeActive &&
-                    onExitAnnotationMode != null) ...[
+                if (widget.isAnnotationModeActive &&
+                    widget.onExitAnnotationMode != null) ...[
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onTap: onExitAnnotationMode,
+                    onTap: widget.onExitAnnotationMode,
                     child: Container(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 6, vertical: 2),
@@ -2699,11 +2758,11 @@ class _QueuedMessagesPanel extends StatelessWidget {
                   ),
                   const SizedBox(width: 4),
                 ],
-                if (messages.isNotEmpty) ...[
-                  if (onCreateIssue != null) ...[
+                if (widget.messages.isNotEmpty) ...[
+                  if (widget.onCreateIssue != null) ...[
                     GestureDetector(
                       behavior: HitTestBehavior.opaque,
-                      onTap: onCreateIssue,
+                      onTap: widget.onCreateIssue,
                       child: Container(
                         padding: const EdgeInsets.symmetric(
                             horizontal: 6, vertical: 2),
@@ -2737,7 +2796,7 @@ class _QueuedMessagesPanel extends StatelessWidget {
                   ],
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onTap: onClearAll,
+                    onTap: widget.onClearAll,
                     child: const Padding(
                       padding: EdgeInsets.symmetric(horizontal: 2, vertical: 2),
                       child: Icon(
@@ -2750,7 +2809,7 @@ class _QueuedMessagesPanel extends StatelessWidget {
                   const SizedBox(width: 4),
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onTap: onClearAll,
+                    onTap: widget.onClearAll,
                     child: Container(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 6, vertical: 2),
@@ -2779,170 +2838,195 @@ class _QueuedMessagesPanel extends StatelessWidget {
               padding: const EdgeInsets.symmetric(vertical: 8),
               shrinkWrap: true,
               itemBuilder: (context, index) {
-                final message = messages[index];
+                final message = widget.messages[index];
                 final summary = _summarizeMessage(message);
                 final previewBytes = _previewBytesForMessage(message);
-                final timestamp = _formatTimestamp(
-                  message['timestamp'] as String?,
-                );
                 final queueId = _queueIdOf(message);
                 final annotations = _annotationsFromMessage(message);
 
                 return Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          if (previewBytes != null) ...[
-                            _QueueMessageThumbnail(bytes: previewBytes),
-                            const SizedBox(width: 8),
-                          ],
-                          Expanded(
-                            child: Text(
-                              summary,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Color(0xFFE0E0E0),
-                                fontSize: 12,
-                                height: 1.4,
-                                decoration: TextDecoration.none,
-                              ),
-                            ),
-                          ),
-                          if (queueId != null) ...[
-                            const SizedBox(width: 6),
-                            GestureDetector(
-                              behavior: HitTestBehavior.opaque,
-                              onTap: () => onDeleteMessage(queueId),
-                              child: const Padding(
-                                padding: EdgeInsets.symmetric(
-                                  horizontal: 2,
-                                  vertical: 2,
-                                ),
-                                child: Icon(
-                                  Icons.delete_outline,
-                                  size: 14,
-                                  color: Color(0xFFFF7777),
-                                ),
-                              ),
-                            ),
-                          ],
-                        ],
-                      ),
-                      if (queueId != null) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          'id: $queueId',
-                          style: const TextStyle(
-                            color: Color(0xFF8E8EA0),
-                            fontSize: 10,
-                            decoration: TextDecoration.none,
-                          ),
+                  child: annotations.isNotEmpty && queueId != null
+                      ? _buildAnnotationItem(
+                          queueId: queueId,
+                          previewBytes: previewBytes,
+                          annotations: annotations,
+                        )
+                      : _buildGenericItem(
+                          queueId: queueId,
+                          previewBytes: previewBytes,
+                          summary: summary,
                         ),
-                      ],
-                      if (timestamp != null) ...[
-                        const SizedBox(height: 3),
-                        Text(
-                          timestamp,
-                          style: const TextStyle(
-                            color: Color(0xFF8E8EA0),
-                            fontSize: 10,
-                            decoration: TextDecoration.none,
-                          ),
-                        ),
-                      ],
-                      if (queueId != null && annotations.isNotEmpty) ...[
-                        const SizedBox(height: 6),
-                        Wrap(
-                          spacing: 6,
-                          runSpacing: 4,
-                          children: annotations.map((annotation) {
-                            final annotationId =
-                                annotation['id']?.toString() ?? '';
-                            final annotationText =
-                                annotation['text']?.toString() ?? '(no label)';
-                            return Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 6,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: const Color(0x33226688),
-                                borderRadius: BorderRadius.circular(6),
-                                border: Border.all(
-                                  color: const Color(0x664488CC),
-                                  width: 1,
-                                ),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  ConstrainedBox(
-                                    constraints: const BoxConstraints(
-                                      maxWidth: 150,
-                                    ),
-                                    child: Text(
-                                      annotationText,
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        color: Color(0xFFB9D9FF),
-                                        fontSize: 10,
-                                        decoration: TextDecoration.none,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 4),
-                                  GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTap: () async {
-                                      if (annotationId.isEmpty) return;
-                                      await onEditAnnotation(
-                                        queueId,
-                                        annotationId,
-                                        annotationText,
-                                      );
-                                    },
-                                    child: const Icon(
-                                      Icons.edit_outlined,
-                                      size: 12,
-                                      color: Color(0xFFB9D9FF),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 4),
-                                  GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTap: () {
-                                      if (annotationId.isEmpty) return;
-                                      onDeleteAnnotation(queueId, annotationId);
-                                    },
-                                    child: const Icon(
-                                      Icons.close,
-                                      size: 12,
-                                      color: Color(0xFFFF9999),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            );
-                          }).toList(),
-                        ),
-                      ],
-                    ],
-                  ),
                 );
               },
               separatorBuilder: (_, __) =>
                   const Divider(height: 12, color: Color(0xFF2A2A3A)),
-              itemCount: messages.length,
+              itemCount: widget.messages.length,
             ),
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildAnnotationItem({
+    required int queueId,
+    required Uint8List? previewBytes,
+    required List<Map<String, dynamic>> annotations,
+  }) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        if (previewBytes != null) ...[
+          _QueueMessageThumbnail(bytes: previewBytes),
+          const SizedBox(width: 8),
+        ],
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: annotations.map((annotation) {
+              final annotationId = annotation['id']?.toString() ?? '';
+              final annotationText =
+                  annotation['text']?.toString() ?? '(no label)';
+              final editKey = '$queueId:$annotationId';
+              final isEditing = _editingKey == editKey;
+              return Padding(
+                padding: EdgeInsets.only(
+                  bottom: annotation == annotations.last ? 0 : 4,
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: isEditing
+                          ? Material(
+                              color: Colors.transparent,
+                              child: SizedBox(
+                              height: 24,
+                              child: TextField(
+                                controller: _editController,
+                                focusNode: _editFocusNode,
+                                style: const TextStyle(
+                                  color: Color(0xFFE0E0E0),
+                                  fontSize: 12,
+                                  height: 1.4,
+                                ),
+                                decoration: const InputDecoration(
+                                  isDense: true,
+                                  contentPadding: EdgeInsets.symmetric(
+                                    horizontal: 4,
+                                    vertical: 4,
+                                  ),
+                                  border: OutlineInputBorder(
+                                    borderSide: BorderSide(
+                                      color: Color(0xFF00AAFF),
+                                    ),
+                                  ),
+                                  enabledBorder: OutlineInputBorder(
+                                    borderSide: BorderSide(
+                                      color: Color(0xFF00AAFF),
+                                    ),
+                                  ),
+                                  focusedBorder: OutlineInputBorder(
+                                    borderSide: BorderSide(
+                                      color: Color(0xFF00AAFF),
+                                      width: 1.5,
+                                    ),
+                                  ),
+                                ),
+                                onSubmitted: (_) => _commitEdit(),
+                              ),
+                            ),
+                            )
+                          : GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onTap: () {
+                                if (annotationId.isEmpty) return;
+                                _startEditing(
+                                  queueId,
+                                  annotationId,
+                                  annotationText,
+                                );
+                              },
+                              child: Text(
+                                annotationText,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Color(0xFFE0E0E0),
+                                  fontSize: 12,
+                                  height: 1.4,
+                                  decoration: TextDecoration.none,
+                                ),
+                              ),
+                            ),
+                    ),
+                    const SizedBox(width: 4),
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () {
+                        if (annotationId.isEmpty) return;
+                        widget.onDeleteAnnotation(queueId, annotationId);
+                      },
+                      child: const Padding(
+                        padding: EdgeInsets.all(2),
+                        child: Icon(
+                          Icons.delete_outline,
+                          size: 14,
+                          color: Color(0xFFFF7777),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }).toList(),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildGenericItem({
+    required int? queueId,
+    required Uint8List? previewBytes,
+    required String summary,
+  }) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (previewBytes != null) ...[
+          _QueueMessageThumbnail(bytes: previewBytes),
+          const SizedBox(width: 8),
+        ],
+        Expanded(
+          child: Text(
+            summary,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Color(0xFFE0E0E0),
+              fontSize: 12,
+              height: 1.4,
+              decoration: TextDecoration.none,
+            ),
+          ),
+        ),
+        if (queueId != null) ...[
+          const SizedBox(width: 6),
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => widget.onDeleteMessage(queueId),
+            child: const Padding(
+              padding: EdgeInsets.all(2),
+              child: Icon(
+                Icons.delete_outline,
+                size: 14,
+                color: Color(0xFFFF7777),
+              ),
+            ),
+          ),
+        ],
+      ],
     );
   }
 
@@ -3002,23 +3086,6 @@ class _QueuedMessagesPanel extends StatelessWidget {
     return null;
   }
 
-  static String? _formatTimestamp(String? timestamp) {
-    if (timestamp == null || timestamp.isEmpty) {
-      return null;
-    }
-    final parsed = DateTime.tryParse(timestamp);
-    if (parsed == null) {
-      return timestamp;
-    }
-    final local = parsed.toLocal();
-    final year = local.year.toString().padLeft(4, '0');
-    final month = local.month.toString().padLeft(2, '0');
-    final day = local.day.toString().padLeft(2, '0');
-    final hour = local.hour.toString().padLeft(2, '0');
-    final minute = local.minute.toString().padLeft(2, '0');
-    final second = local.second.toString().padLeft(2, '0');
-    return '$year-$month-$day $hour:$minute:$second';
-  }
 }
 
 class _QueueMessageThumbnail extends StatelessWidget {

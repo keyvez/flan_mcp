@@ -57,6 +57,7 @@ class VmServiceConnector {
 
   final Map<String, String?> _registeredServices = {};
   final Map<String, List<Completer<String?>>> _pendingServiceRequests = {};
+  bool _hotRestarting = false;
 
   /// Called when the connection is lost unexpectedly (e.g. app crash,
   /// WebSocket close). Set by [VmServiceContext] to clean up state.
@@ -86,9 +87,11 @@ class VmServiceConnector {
       _service = await vmServiceConnectUri(uri);
 
       // Detect unexpected connection loss (app crash, WebSocket close).
+      // Skipped during hot restart since the connection loss is expected
+      // and the restart method handles reconnection itself.
       unawaited(
         _service!.onDone.then((_) {
-          if (_service != null) {
+          if (_service != null && !_hotRestarting) {
             _logger.warning('VM service connection lost unexpectedly');
             unawaited(_serviceEventSubscription?.cancel());
             unawaited(_extensionEventSubscription?.cancel());
@@ -462,6 +465,7 @@ class VmServiceConnector {
     _ensureConnected();
 
     _logger.info('Performing hot restart');
+    _hotRestarting = true;
 
     try {
       // Hot restart uses reloadSources with pause=false, but the actual
@@ -494,6 +498,8 @@ class VmServiceConnector {
         // Ignore if re-find fails
       }
       rethrow;
+    } finally {
+      _hotRestarting = false;
     }
   }
 
