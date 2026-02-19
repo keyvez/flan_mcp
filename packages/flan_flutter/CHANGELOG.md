@@ -1,3 +1,9 @@
+# 0.6.1
+
+- Add `flan.getErrors` VM service extension for runtime error inspection
+- Fix annotations persisting on screen after exiting annotation mode
+- Add Escape key handling to close the queue panel
+
 # 0.5.0
 
 - Emit VM extension event `flan.userMessageQueued` whenever a user message is queued for the agent

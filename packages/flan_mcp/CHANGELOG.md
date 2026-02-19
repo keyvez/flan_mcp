@@ -1,3 +1,9 @@
+# 0.6.1
+
+- Add `get_errors` tool for retrieving intercepted Flutter errors and unhandled exceptions
+- Fix annotations persisting on screen after exiting annotation mode
+- Add Escape key handling to close the queue panel
+
 # 0.5.0
 
 - Replace periodic polling with VM extension event-driven message delivery
