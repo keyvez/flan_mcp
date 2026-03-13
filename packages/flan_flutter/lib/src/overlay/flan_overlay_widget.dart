@@ -1552,12 +1552,27 @@ class _InspectorOverlay extends StatefulWidget {
 class _InspectorOverlayState extends State<_InspectorOverlay> {
   final FocusNode _focusNode = FocusNode();
   final TextEditingController _textController = TextEditingController();
-  final FocusNode _textFocusNode = FocusNode();
+  late final FocusNode _textFocusNode;
 
   @override
   void initState() {
     super.initState();
+    _textFocusNode = FocusNode(onKeyEvent: _handleTextFieldKey);
     widget.service.addListener(_onChanged);
+  }
+
+  /// Intercepts Cmd+Enter in the command text field so it behaves the
+  /// same as plain Enter (submit + send to agent).
+  KeyEventResult _handleTextFieldKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey != LogicalKeyboardKey.enter) {
+      return KeyEventResult.ignored;
+    }
+    if (!HardwareKeyboard.instance.isMetaPressed) {
+      return KeyEventResult.ignored;
+    }
+    _submitMessage(_textController.text);
+    return KeyEventResult.handled;
   }
 
   @override
