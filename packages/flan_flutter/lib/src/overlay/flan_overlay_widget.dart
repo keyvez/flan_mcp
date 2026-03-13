@@ -2975,8 +2975,36 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     }
   }
 
+  /// Estimates the number of tokens that will be sent to the agent.
+  ///
+  /// Uses ~4 characters per token for text. Screenshots add ~1600 tokens
+  /// each (typical 768×1024 PNG at medium detail).
+  static int _estimateTokens(List<Map<String, dynamic>> messages) {
+    var charCount = 0;
+    var imageCount = 0;
+
+    // Header: "N message(s) from user:\n\n"
+    charCount += '${messages.length} message(s) from user:\n\n'.length;
+
+    for (final m in messages) {
+      final text = m['text'] as String? ?? '';
+      charCount += text.length + 1; // +1 for newline
+
+      final data = m['data'];
+      if (data is Map<String, dynamic>) {
+        if (data.containsKey('screenshot')) imageCount++;
+        if (data.containsKey('drawingImage')) imageCount++;
+      }
+    }
+
+    // ~4 chars per token for text, ~1600 tokens per image
+    return (charCount / 4).ceil() + (imageCount * 1600);
+  }
+
   @override
   Widget build(BuildContext context) {
+    final estimatedTokens = _estimateTokens(widget.messages);
+
     return Container(
       width: 480,
       constraints: const BoxConstraints(maxHeight: 400),
@@ -3001,14 +3029,52 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
             child: Row(
               children: [
                 Expanded(
-                  child: Text(
-                    'Queued messages (${widget.messages.length})',
-                    style: const TextStyle(
-                      color: Color(0xFF00AAFF),
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                      decoration: TextDecoration.none,
-                    ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text.rich(
+                        TextSpan(
+                          children: [
+                            TextSpan(
+                              text:
+                                  'Queued (${widget.messages.length}) · ',
+                            ),
+                            TextSpan(
+                              text: estimatedTokens >= 1000
+                                  ? '~${(estimatedTokens / 1000).toStringAsFixed(1)}k tokens'
+                                  : '~$estimatedTokens tokens',
+                              style: TextStyle(
+                                color: estimatedTokens > 3000
+                                    ? const Color(0xFFFF9500)
+                                    : const Color(0xFF888899),
+                                fontWeight: estimatedTokens > 3000
+                                    ? FontWeight.w600
+                                    : FontWeight.w400,
+                              ),
+                            ),
+                          ],
+                        ),
+                        style: const TextStyle(
+                          color: Color(0xFF00AAFF),
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                      if (estimatedTokens > 3000)
+                        const Padding(
+                          padding: EdgeInsets.only(top: 2),
+                          child: Text(
+                            'Large payload — consider clearing context or compacting first',
+                            style: TextStyle(
+                              color: Color(0xFFFF9500),
+                              fontSize: 10,
+                              fontWeight: FontWeight.w400,
+                              decoration: TextDecoration.none,
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
                 ),
                 if (widget.isAnnotationModeActive &&
