@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flan Server</title>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --surface2: #1a1a25;
+    --border: #2a2a3a;
+    --text: #e0e0e8;
+    --text2: #888899;
+    --accent: #6c5ce7;
+    --accent2: #a29bfe;
+    --green: #00b894;
+    --orange: #fdcb6e;
+    --red: #e17055;
+    --radius: 10px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    font-size: 13px;
+  }
+
+  header {
+    padding: 20px 28px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  header h1 { font-size: 16px; font-weight: 600; letter-spacing: 0.5px; }
+  header h1 span { color: var(--accent2); }
+
+  .status {
+    font-size: 11px;
+    color: var(--text2);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .status .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--green);
+  }
+
+  .grid-wrapper {
+    position: relative;
+    min-height: calc(100vh - 61px);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0;
+    position: relative;
+    z-index: 1;
+  }
+
+  #linkSvg {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 0;
+    pointer-events: none;
+  }
+
+  .column {
+    padding: 20px;
+    border-right: 1px solid var(--border);
+  }
+
+  .column:last-child { border-right: none; }
+
+  .column-header {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--text2);
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .count {
+    background: var(--surface2);
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 500;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    position: relative;
+  }
+
+  .card:hover {
+    border-color: var(--accent);
+    background: var(--surface2);
+  }
+
+  .card.selected {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+
+  .card.linked { border-color: var(--green); }
+
+  .card .folder { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+
+  .card .meta {
+    font-size: 11px;
+    color: var(--text2);
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .card .meta span { display: flex; align-items: center; gap: 4px; }
+
+  .card .preview {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--text2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+  }
+
+  .card .badge {
+    position: absolute;
+    top: 10px; right: 10px;
+    font-size: 9px;
+    padding: 2px 8px;
+    border-radius: 8px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .badge.linked { background: rgba(0, 184, 148, 0.15); color: var(--green); }
+  .badge.focused { background: rgba(108, 92, 231, 0.15); color: var(--accent2); }
+
+  .link-bar {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: 14px 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    transform: translateY(100%);
+    transition: transform 0.2s ease;
+    z-index: 10;
+  }
+
+  .link-bar.visible { transform: translateY(0); }
+  .link-bar .info { font-size: 12px; color: var(--text2); }
+  .link-bar .info strong { color: var(--text); }
+
+  .btn {
+    padding: 8px 20px;
+    border-radius: 6px;
+    border: none;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.1s ease;
+  }
+
+  .btn-primary { background: var(--accent); color: white; }
+  .btn-primary:hover { background: var(--accent2); }
+
+  .btn-cancel {
+    background: transparent;
+    color: var(--text2);
+    border: 1px solid var(--border);
+    margin-right: 8px;
+  }
+  .btn-cancel:hover { border-color: var(--text2); }
+
+  .btn-unlink {
+    background: transparent;
+    color: var(--red);
+    border: 1px solid var(--red);
+    padding: 4px 10px;
+    font-size: 10px;
+  }
+
+  .btn-small {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text2);
+    padding: 3px 8px;
+    font-size: 10px;
+    border-radius: 4px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.1s ease;
+  }
+  .btn-small:hover { border-color: var(--accent); color: var(--accent2); }
+
+  .card-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .toast {
+    position: fixed;
+    top: 20px; right: 20px;
+    background: var(--surface2);
+    border: 1px solid var(--green);
+    color: var(--green);
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 12px;
+    opacity: 0;
+    transform: translateY(-10px);
+    transition: all 0.2s ease;
+    z-index: 20;
+  }
+
+  .toast.show { opacity: 1; transform: translateY(0); }
+
+  .empty {
+    color: var(--text2);
+    font-size: 12px;
+    text-align: center;
+    padding: 40px 20px;
+  }
+
+  .log-panel {
+    border-top: 1px solid var(--border);
+    padding: 0 20px 20px;
+  }
+
+  .log-header {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--text2);
+    padding: 16px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .log-header:hover { color: var(--text); }
+
+  .log-entries {
+    max-height: 300px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.7;
+  }
+
+  .log-entry {
+    display: flex;
+    gap: 10px;
+    padding: 3px 0;
+    border-bottom: 1px solid rgba(42, 42, 58, 0.4);
+  }
+
+  .log-entry:last-child { border-bottom: none; }
+
+  .log-ts {
+    color: var(--text2);
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .log-dir {
+    flex-shrink: 0;
+    width: 18px;
+    text-align: center;
+    font-weight: 600;
+  }
+
+  .log-dir.in { color: var(--accent2); }
+  .log-dir.out { color: var(--orange); }
+
+  .log-summary { flex: 1; }
+
+  .log-detail {
+    color: var(--text2);
+    margin-left: 4px;
+  }
+
+  .log-fail .log-summary { color: var(--red); }
+
+</style>
+</head>
+<body>
+  <header>
+    <h1><span>flan</span> server</h1>
+    <div style="display:flex;align-items:center;gap:12px">
+      <button class="btn-small" onclick="rescan()">scan</button>
+      <div class="status">
+        <div class="dot"></div>
+        <span id="statusText">scanning...</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="grid-wrapper">
+    <svg id="linkSvg"></svg>
+    <div class="grid">
+      <div class="column">
+        <div class="column-header">
+          Flutter Apps
+          <span class="count" id="flutterCount">0</span>
+        </div>
+        <div id="flutterList"></div>
+      </div>
+      <div class="column">
+        <div class="column-header">
+          Claude Code
+          <span class="count" id="claudeCount">0</span>
+        </div>
+        <div id="claudeList"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="log-panel">
+    <div class="log-header" onclick="toggleLog()">
+      Activity Log <span class="count" id="logCount">0</span>
+    </div>
+    <div class="log-entries" id="logEntries" style="display:none"></div>
+  </div>
+
+  <div class="link-bar" id="linkBar">
+    <div class="info" id="linkInfo"></div>
+    <div>
+      <button class="btn btn-cancel" onclick="cancelLink()">Cancel</button>
+      <button class="btn btn-primary" onclick="confirmLink()">Link</button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let flutterApps = [];
+    let claudeProcesses = [];
+    let cmuxSurfaces = [];
+    let associations = [];
+    let activityLog = [];
+    let logVisible = true;
+    let selectedFlutter = null;
+    let selectedSurface = null;
+
+    async function fetchAll() {
+      try {
+        const [fRes, cRes, sRes, aRes, lRes] = await Promise.all([
+          fetch('/api/flutter-apps'),
+          fetch('/api/claude-processes'),
+          fetch('/api/cmux-surfaces'),
+          fetch('/api/associations'),
+          fetch('/api/logs'),
+        ]);
+        flutterApps = await fRes.json();
+        claudeProcesses = await cRes.json();
+        cmuxSurfaces = await sRes.json();
+        associations = await aRes.json();
+        activityLog = await lRes.json();
+
+        document.getElementById('statusText').textContent =
+          `${flutterApps.length} flutter · ${cmuxSurfaces.filter(s => s.title.includes('Claude')).length} claude · ${associations.length} linked`;
+        document.getElementById('flutterCount').textContent = flutterApps.length;
+        document.getElementById('claudeCount').textContent =
+          cmuxSurfaces.filter(s => s.title.includes('Claude')).length;
+
+        render();
+      } catch (e) {
+        document.getElementById('statusText').textContent = 'connection error';
+      }
+    }
+
+    function render() {
+      renderFlutter();
+      renderClaude();
+      renderLog();
+      updateLinkBar();
+      requestAnimationFrame(() => requestAnimationFrame(drawLinks));
+    }
+
+    function renderFlutter() {
+      const el = document.getElementById('flutterList');
+      if (flutterApps.length === 0) {
+        el.innerHTML = '<div class="empty">No Flutter apps running</div>';
+        return;
+      }
+
+      el.innerHTML = flutterApps.map(app => {
+        const assoc = associations.find(a => a.flutter_pid === app.pid);
+        const isSelected = selectedFlutter?.pid === app.pid;
+        const linkedSurface = assoc ? cmuxSurfaces.find(s => s.id === assoc.claude_surface_id) : null;
+        const flutterSurface = cmuxSurfaces.find(s =>
+          s.title.toLowerCase().includes('flutter') &&
+          (app.device ? s.title.includes(app.device) : true)
+        );
+
+        return `
+          <div class="card ${isSelected ? 'selected' : ''} ${assoc ? 'linked' : ''}"
+               data-flutter-pid="${app.pid}"
+               onclick="selectFlutter(${app.pid})">
+            ${assoc ? '<span class="badge linked">linked</span>' : ''}
+            <div class="folder">${esc(app.folder_name)}</div>
+            <div class="meta">
+              <span>PID ${app.pid}</span>
+              <span>${esc(app.device || '?')}</span>
+              ${app.vm_service_uri ? `<span>${esc(app.vm_service_uri.split('/').slice(0, 3).join('/'))}</span>` : ''}
+            </div>
+            <div class="meta" style="margin-top:4px">
+              <span style="opacity:0.6">${esc(app.cwd)}</span>
+            </div>
+            ${assoc && linkedSurface ? `
+              <div class="preview">
+                &rarr; ${esc(linkedSurface.title)} (${linkedSurface.id.slice(0, 8)}&hellip;)
+                <button class="btn btn-unlink" onclick="event.stopPropagation(); unlinkAssoc('${assoc.id}')">unlink</button>
+              </div>
+            ` : ''}
+            <div class="card-actions">
+              ${flutterSurface ? `<button class="btn-small" onclick="event.stopPropagation(); focusSurface('${flutterSurface.id}')">show</button>` : ''}
+              <button class="btn-small" onclick="event.stopPropagation(); focusApp('${esc(app.device || 'chrome')}')">app</button>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderClaude() {
+      const el = document.getElementById('claudeList');
+      const claudeSurfaces = cmuxSurfaces.filter(s => s.title.includes('Claude'));
+
+      if (claudeSurfaces.length === 0) {
+        el.innerHTML = '<div class="empty">No Claude Code surfaces in cmux</div>';
+        return;
+      }
+
+      el.innerHTML = claudeSurfaces.map(surface => {
+        const assoc = associations.find(a => a.claude_surface_id === surface.id);
+        const linkedApp = assoc ? flutterApps.find(f => f.pid === assoc.flutter_pid) : null;
+        const isSelected = selectedSurface?.id === surface.id;
+
+        return `
+          <div class="card ${isSelected ? 'selected' : ''} ${assoc ? 'linked' : ''}"
+               data-surface-id="${surface.id}"
+               onclick="selectSurface('${surface.id}')">
+            ${surface.focused ? '<span class="badge focused">focused</span>' : ''}
+            ${assoc ? '<span class="badge linked" style="right:70px">linked</span>' : ''}
+            <div class="folder">${esc(surface.title)}</div>
+            <div class="meta">
+              <span>${surface.id.slice(0, 8)}&hellip;</span>
+              <span>pane ${esc(surface.pane_id.slice(0, 8))}&hellip;</span>
+            </div>
+            ${assoc && linkedApp ? `
+              <div class="preview">
+                &larr; ${esc(linkedApp.folder_name)} (PID ${linkedApp.pid})
+                <button class="btn btn-unlink" onclick="event.stopPropagation(); unlinkAssoc('${assoc.id}')">unlink</button>
+              </div>
+            ` : ''}
+            <div class="card-actions">
+              <button class="btn-small" onclick="event.stopPropagation(); focusSurface('${surface.id}')">show</button>
+              <button class="btn-small" onclick="event.stopPropagation(); testSend('${surface.id}')">test</button>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function drawLinks() {
+      const svg = document.getElementById('linkSvg');
+      const wrapper = document.querySelector('.grid-wrapper');
+      const wrapperRect = wrapper.getBoundingClientRect();
+
+      // Size the SVG to match the wrapper
+      svg.setAttribute('width', wrapperRect.width);
+      svg.setAttribute('height', wrapperRect.height);
+      svg.setAttribute('viewBox', `0 0 ${wrapperRect.width} ${wrapperRect.height}`);
+
+      let paths = '';
+
+      for (const assoc of associations) {
+        const flutterCard = document.querySelector(`[data-flutter-pid="${assoc.flutter_pid}"]`);
+        const claudeCard = document.querySelector(`[data-surface-id="${assoc.claude_surface_id}"]`);
+        if (!flutterCard || !claudeCard) continue;
+
+        const fRect = flutterCard.getBoundingClientRect();
+        const cRect = claudeCard.getBoundingClientRect();
+
+        // Start: right edge center of flutter card
+        const x1 = fRect.right - wrapperRect.left;
+        const y1 = fRect.top + fRect.height / 2 - wrapperRect.top;
+
+        // End: left edge center of claude card
+        const x2 = cRect.left - wrapperRect.left;
+        const y2 = cRect.top + cRect.height / 2 - wrapperRect.top;
+
+        // Control points: horizontal bezier
+        const dx = Math.abs(x2 - x1) * 0.5;
+        const cx1 = x1 + dx;
+        const cy1 = y1;
+        const cx2 = x2 - dx;
+        const cy2 = y2;
+
+        paths += `
+          <path d="M ${x1} ${y1} C ${cx1} ${cy1}, ${cx2} ${cy2}, ${x2} ${y2}"
+                fill="none"
+                stroke="rgba(0, 184, 148, 0.3)"
+                stroke-width="2"
+                stroke-dasharray="6 4" />
+          <circle cx="${x1}" cy="${y1}" r="4" fill="rgba(0, 184, 148, 0.5)" />
+          <circle cx="${x2}" cy="${y2}" r="4" fill="rgba(0, 184, 148, 0.5)" />
+        `;
+      }
+
+      svg.innerHTML = paths;
+    }
+
+    function selectFlutter(pid) {
+      selectedFlutter = selectedFlutter?.pid === pid ? null : flutterApps.find(a => a.pid === pid);
+      render();
+    }
+
+    function selectSurface(id) {
+      selectedSurface = selectedSurface?.id === id ? null : cmuxSurfaces.find(s => s.id === id);
+      render();
+    }
+
+    function updateLinkBar() {
+      const bar = document.getElementById('linkBar');
+      const info = document.getElementById('linkInfo');
+
+      if (selectedFlutter && selectedSurface) {
+        info.innerHTML = `Link <strong>${esc(selectedFlutter.folder_name)}</strong> (PID ${selectedFlutter.pid}) &rarr; <strong>${esc(selectedSurface.title)}</strong> (${selectedSurface.id.slice(0, 8)}&hellip;)`;
+        bar.classList.add('visible');
+      } else if (selectedFlutter) {
+        info.innerHTML = `Selected: <strong>${esc(selectedFlutter.folder_name)}</strong> &mdash; now select a Claude Code surface &rarr;`;
+        bar.classList.add('visible');
+      } else if (selectedSurface) {
+        info.innerHTML = `Selected: <strong>${esc(selectedSurface.title)}</strong> &mdash; now select a Flutter app &larr;`;
+        bar.classList.add('visible');
+      } else {
+        bar.classList.remove('visible');
+      }
+    }
+
+    function cancelLink() {
+      selectedFlutter = null;
+      selectedSurface = null;
+      render();
+    }
+
+    async function confirmLink() {
+      if (!selectedFlutter || !selectedSurface) return;
+
+      await fetch('/api/associations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          claude_surface_id: selectedSurface.id,
+          flutter_pid: selectedFlutter.pid,
+        }),
+      });
+
+      selectedFlutter = null;
+      selectedSurface = null;
+      showToast('Association created');
+      await fetchAll();
+    }
+
+    async function unlinkAssoc(id) {
+      await fetch(`/api/associations/${id}`, { method: 'DELETE' });
+      showToast('Association removed');
+      await fetchAll();
+    }
+
+    async function focusSurface(surfaceId) {
+      try {
+        const res = await fetch('/api/focus-surface', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ surface_id: surfaceId }),
+        });
+        if (res.ok) {
+          showToast('Switched to surface');
+        } else {
+          showToast('Failed to focus surface');
+        }
+      } catch (e) {
+        showToast('Error: ' + e.message);
+      }
+    }
+
+    async function focusApp(device) {
+      try {
+        const res = await fetch('/api/focus-app', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device }),
+        });
+        if (res.ok) {
+          showToast('Switched to ' + device);
+        } else {
+          showToast('Failed to focus app');
+        }
+      } catch (e) {
+        showToast('Error: ' + e.message);
+      }
+    }
+
+    async function rescan() {
+      document.getElementById('statusText').textContent = 'scanning...';
+      await fetch('/api/rescan', { method: 'POST' });
+      await fetchAll();
+      showToast('Scan complete');
+    }
+
+    async function testSend(surfaceId) {
+      try {
+        const res = await fetch('/api/test-send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ surface_id: surfaceId }),
+        });
+        if (res.ok) {
+          showToast('Test string sent');
+        } else {
+          showToast('Failed to send test');
+        }
+      } catch (e) {
+        showToast('Error: ' + e.message);
+      }
+    }
+
+    function renderLog() {
+      const el = document.getElementById('logEntries');
+      document.getElementById('logCount').textContent = activityLog.length;
+
+      if (activityLog.length === 0) {
+        el.innerHTML = '<div class="empty" style="padding:12px">No activity yet</div>';
+        return;
+      }
+
+      // Show newest first
+      el.innerHTML = [...activityLog].reverse().map(e => `
+        <div class="log-entry ${e.ok ? '' : 'log-fail'}">
+          <span class="log-ts">${esc(e.timestamp)}</span>
+          <span class="log-dir ${e.direction}">${e.direction === 'in' ? '→' : '←'}</span>
+          <span class="log-summary">${esc(e.summary)}${e.detail ? `<span class="log-detail">— ${esc(e.detail)}</span>` : ''}</span>
+        </div>
+      `).join('');
+
+      el.style.display = logVisible ? '' : 'none';
+    }
+
+    function toggleLog() {
+      logVisible = !logVisible;
+      document.getElementById('logEntries').style.display = logVisible ? '' : 'none';
+    }
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 2000);
+    }
+
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s || '';
+      return d.innerHTML;
+    }
+
+    // Redraw links on resize
+    window.addEventListener('resize', () => requestAnimationFrame(drawLinks));
+
+    // Initial fetch and auto-refresh
+    fetchAll();
+    setInterval(fetchAll, 5000);
+  </script>
+</body>
+</html>
