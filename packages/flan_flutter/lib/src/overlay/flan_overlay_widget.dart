@@ -2977,11 +2977,12 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
 
   /// Estimates the number of tokens that will be sent to the agent.
   ///
-  /// Uses ~4 characters per token for text. Screenshots add ~1600 tokens
-  /// each (typical 768×1024 PNG at medium detail).
+  /// Text: ~4 characters per token.
+  /// Images: (width × height) / 750 per the Anthropic vision API formula.
+  /// Falls back to 1600 tokens if dimensions can't be read.
   static int _estimateTokens(List<Map<String, dynamic>> messages) {
     var charCount = 0;
-    var imageCount = 0;
+    var imageTokens = 0;
 
     // Header: "N message(s) from user:\n\n"
     charCount += '${messages.length} message(s) from user:\n\n'.length;
@@ -2992,13 +2993,41 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
 
       final data = m['data'];
       if (data is Map<String, dynamic>) {
-        if (data.containsKey('screenshot')) imageCount++;
-        if (data.containsKey('drawingImage')) imageCount++;
+        for (final key in const ['screenshot', 'drawingImage']) {
+          final b64 = data[key];
+          if (b64 is String) {
+            imageTokens += _imageTokensFromBase64(b64);
+          }
+        }
       }
     }
 
-    // ~4 chars per token for text, ~1600 tokens per image
-    return (charCount / 4).ceil() + (imageCount * 1600);
+    return (charCount / 4).ceil() + imageTokens;
+  }
+
+  /// Reads width and height from the IHDR chunk of a base64-encoded PNG
+  /// and returns (width × height) / 750. Falls back to 1600 on failure.
+  static int _imageTokensFromBase64(String base64Data) {
+    try {
+      // PNG IHDR: bytes 16-19 = width (big-endian), 20-23 = height.
+      // We only need the first 24 bytes = 32 base64 chars.
+      if (base64Data.length < 32) return 1600;
+      final bytes = base64Decode(base64Data.substring(0, 32));
+      if (bytes.length < 24) return 1600;
+      // Verify PNG signature (first 4 bytes: 0x89 P N G).
+      if (bytes[0] != 0x89 || bytes[1] != 0x50 || bytes[2] != 0x4E ||
+          bytes[3] != 0x47) {
+        return 1600;
+      }
+      final width =
+          (bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19];
+      final height =
+          (bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23];
+      if (width <= 0 || height <= 0) return 1600;
+      return (width * height / 750).ceil();
+    } catch (_) {
+      return 1600;
+    }
   }
 
   @override
