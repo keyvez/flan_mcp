@@ -1,7 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart' hide InspectorSelection;
+import 'package:http/http.dart' as http;
 import 'package:flutter/services.dart';
 import 'package:flan_flutter/src/overlay/annotation_painter.dart';
 import 'package:flan_flutter/src/overlay/drawing_painter.dart';
@@ -420,10 +423,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
     final data = <String, dynamic>{
       'annotations': enrichedAnnotations,
-      'annotationDraft': true,
     };
     final text = _rebuildQueuedMessageText(
-      fallback: 'Annotation draft',
+      fallback: 'Annotation',
       data: data,
     );
 
@@ -460,14 +462,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       'data': data,
     });
     final pendingMessages = widget.userMessageService.peekMessages();
-    for (final message in pendingMessages.reversed) {
-      final messageData = _normalizedDataMap(message['data']);
-      if (messageData['annotationDraft'] == true) {
-        _annotationDraftQueueId = _queueIdOf(message);
-        if (_annotationDraftQueueId != null) {
-          break;
-        }
-      }
+    if (pendingMessages.isNotEmpty) {
+      _annotationDraftQueueId = _queueIdOf(pendingMessages.last);
     }
     // Attach a cropped thumbnail asynchronously.
     if (_annotationDraftQueueId != null) {
@@ -520,7 +516,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     widget.userMessageService.updateMessageByQueueId(queueId, {
       'type': 'user_feedback',
       'text': _rebuildQueuedMessageText(
-        fallback: 'Annotation draft',
+        fallback: 'Annotation',
         data: currentData,
       ),
       'data': currentData,
@@ -549,28 +545,19 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         !pendingMessages.any((m) => _queueIdOf(m) == _annotationDraftQueueId)) {
       _annotationDraftQueueId = null;
     }
-    if (_annotationDraftQueueId == null) {
-      for (final message in pendingMessages.reversed) {
-        final data = _normalizedDataMap(message['data']);
-        if (data['annotationDraft'] == true) {
-          _annotationDraftQueueId = _queueIdOf(message);
-          if (_annotationDraftQueueId != null) break;
-        }
-      }
-      if (_annotationDraftQueueId == null &&
-          !_suppressAnnotationDraftUpsert &&
-          !_isSendingToAgent &&
-          !widget.userMessageService.isAgentListening &&
-          widget.annotationService.annotations.isNotEmpty) {
-        // Only create a new draft if the annotations have changed since
-        // the last send/queue. This prevents re-creating a draft after
-        // _sendToAgent when the same annotations are still on screen.
-        final currentSignature =
-            jsonEncode(widget.annotationService.getAnnotationsData());
-        if (currentSignature != _lastQueuedAnnotationsSignature) {
-          _upsertQueuedAnnotationDraft(
-              widget.annotationService.getAnnotationsData());
-        }
+    if (_annotationDraftQueueId == null &&
+        !_suppressAnnotationDraftUpsert &&
+        !_isSendingToAgent &&
+        !widget.userMessageService.isAgentListening &&
+        widget.annotationService.annotations.isNotEmpty) {
+      // Only create a new queued message if the annotations have changed
+      // since the last send/queue. This prevents re-creating a message
+      // after _sendToAgent when the same annotations are still on screen.
+      final currentSignature =
+          jsonEncode(widget.annotationService.getAnnotationsData());
+      if (currentSignature != _lastQueuedAnnotationsSignature) {
+        _upsertQueuedAnnotationDraft(
+            widget.annotationService.getAnnotationsData());
       }
     }
 
@@ -663,6 +650,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         if (widget.annotationService.drawState != AnnotationDrawState.normal) {
           widget.annotationService.cancelEditing();
         } else {
+          // Clear annotations from the visual overlay but preserve the draft
+          // in the queue (it already has the thumbnail and annotation data).
+          _suppressAnnotationDraftUpsert = true;
+          widget.annotationService.clearAnnotations();
+          _lastQueuedAnnotationsSignature =
+              jsonEncode(widget.annotationService.getAnnotationsData());
+          _suppressAnnotationDraftUpsert = false;
           widget.annotationService.disable();
         }
         return true;
@@ -689,7 +683,17 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     }
 
     if (event.logicalKey == LogicalKeyboardKey.enter) {
-      _sendToAgent();
+      if (_showErrorPanel && widget.errorInterceptor.errors.isNotEmpty) {
+        final errors = List<InterceptedError>.of(
+          widget.errorInterceptor.errors,
+        );
+        for (final error in errors) {
+          _sendErrorToAgent(error);
+        }
+        setState(() => _showErrorPanel = false);
+      } else {
+        _sendToAgent();
+      }
       return true;
     }
 
@@ -842,11 +846,17 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     _lastQueuedAnnotationsSignature =
         jsonEncode(widget.annotationService.getAnnotationsData());
 
+    // Promote any remaining drafts in the queue so they are sent alongside
+    // the new message (e.g. drafts from earlier annotation sessions).
+    widget.userMessageService.promoteDrafts();
+
     widget.userMessageService.sendMessage({
       'type': 'user_feedback',
       'text': parts.join('\n'),
       'data': data,
     });
+    widget.userMessageService.notifyPending();
+    unawaited(_flushToServer());
     _isSendingToAgent = false;
   }
 
@@ -981,6 +991,39 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       _queuedMessagesSnapshot = const [];
       _showQueuedMessagesPanel = false;
     });
+  }
+
+  Future<void> _flushToServer() async {
+    try {
+      String? wsUri;
+      try {
+        final info = await developer.Service.getInfo();
+        if (info.serverUri != null) {
+          var uri = info.serverUri
+              .toString()
+              .replaceFirst('http://', 'ws://');
+          if (uri.endsWith('/')) {
+            uri = '${uri}ws';
+          } else {
+            uri = '$uri/ws';
+          }
+          wsUri = uri;
+        }
+      } catch (e) {
+        debugPrint('[flan] failed to get VM service URI: $e');
+      }
+      debugPrint('[flan] flushing to server, vm_service_uri=$wsUri');
+      final res = await http.post(
+        Uri.parse('http://localhost:4050/api/flush'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(<String, dynamic>{
+          if (wsUri != null) 'vm_service_uri': wsUri,
+        }),
+      );
+      debugPrint('[flan] flush response: ${res.statusCode} ${res.body}');
+    } catch (e) {
+      debugPrint('[flan] flush error: $e');
+    }
   }
 
   void _saveQueuedMessageText(int queueId, String newText) {
@@ -1169,15 +1212,14 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           // capture it without annotation/overlay layers.
           RepaintBoundary(key: _appContentKey, child: widget.child),
           // Annotations are only rendered while annotation mode is active.
-          // When the user exits annotation mode, annotations disappear from
-          // the screen but remain preserved in the queue as a draft message
-          // with a cropped thumbnail.
+          // Submitting an annotation immediately sends it to the agent.
           // Inspector overlay (when active)
           if (widget.inspectorService.enabled)
             _InspectorOverlay(
               service: widget.inspectorService,
               userMessageService: widget.userMessageService,
               screenshotService: widget.screenshotService,
+              onMessageSent: () => unawaited(_flushToServer()),
             ),
           // Annotation overlay (when active)
           if (widget.annotationService.enabled)
@@ -1260,6 +1302,15 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                     setState(() => _showErrorPanel = false);
                   }
                 },
+                onSendAllToAgent: () {
+                  final errors = List<InterceptedError>.of(
+                    widget.errorInterceptor.errors,
+                  );
+                  for (final error in errors) {
+                    _sendErrorToAgent(error);
+                  }
+                  setState(() => _showErrorPanel = false);
+                },
                 onClearAll: () {
                   widget.errorInterceptor.clear();
                   setState(() => _showErrorPanel = false);
@@ -1306,6 +1357,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 count: displayCount,
                 pushConnected:
                     widget.userMessageService.isPushCapableHostConnected,
+                serverLinked:
+                    widget.userMessageService.hasServerAssociation,
               ),
             ),
           ),
@@ -1317,6 +1370,21 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 messages: _queuedMessagesSnapshot,
                 onDeleteMessage: _removeQueuedMessage,
                 onClearAll: _clearQueuedMessages,
+                onSend: () {
+                  widget.userMessageService.promoteDrafts();
+                  widget.userMessageService.notifyPending();
+                  // Ask flan server to send `flan connect to <uri> and
+                  // process queue once connected` to a Claude Code surface
+                  // via cmux. No pre-existing association is required — the
+                  // server discovers a Claude Code surface directly if needed.
+                  // This is typically the first contact that triggers
+                  // connection.
+                  unawaited(_flushToServer());
+                  setState(() {
+                    _showQueuedMessagesPanel = false;
+                    _queuedMessagesSnapshot = const [];
+                  });
+                },
                 onSaveAnnotation: _applyQueuedAnnotationEdit,
                 onDeleteAnnotation: _removeQueuedAnnotation,
                 onSaveMessageText: _saveQueuedMessageText,
@@ -1469,11 +1537,13 @@ class _InspectorOverlay extends StatefulWidget {
     required this.service,
     required this.userMessageService,
     required this.screenshotService,
+    this.onMessageSent,
   });
 
   final InspectorService service;
   final UserMessageService userMessageService;
   final ScreenshotService screenshotService;
+  final VoidCallback? onMessageSent;
 
   @override
   State<_InspectorOverlay> createState() => _InspectorOverlayState();
@@ -1539,6 +1609,8 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
       'text': parts.join('\n'),
       'data': data,
     });
+    widget.userMessageService.notifyPending();
+    widget.onMessageSent?.call();
 
     _textController.clear();
     widget.service.disable();
@@ -1688,13 +1760,37 @@ class _AnnotationOverlay extends StatefulWidget {
 
 class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   final TextEditingController _textController = TextEditingController();
-  final FocusNode _textFocusNode = FocusNode();
+  late final FocusNode _textFocusNode;
 
   @override
   void initState() {
     super.initState();
+    _textFocusNode = FocusNode(onKeyEvent: _handleTextFieldKey);
     widget.service.addListener(_onChanged);
     widget.userMessageService.addListener(_onChanged);
+  }
+
+  /// Intercepts Cmd+Enter in the annotation text field to submit the
+  /// annotation and immediately send it to the agent.
+  /// Must be handled at the key-event level because macOS does not insert
+  /// a newline character for Cmd+Enter, so the TextInputFormatter never
+  /// sees it.
+  KeyEventResult _handleTextFieldKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey != LogicalKeyboardKey.enter) {
+      return KeyEventResult.ignored;
+    }
+    if (!HardwareKeyboard.instance.isMetaPressed) {
+      return KeyEventResult.ignored;
+    }
+    // Cmd+Enter: submit text and send to agent.
+    final text = _textController.text;
+    if (widget.service.drawState == AnnotationDrawState.editingExisting) {
+      _handleEditAnnotationSubmitAndSend(text);
+    } else {
+      _handleNewAnnotationSubmitAndSend(text);
+    }
+    return KeyEventResult.handled;
   }
 
   @override
@@ -1812,14 +1908,20 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
 
   void _handleNewAnnotationSubmit(String text) {
     widget.service.submitAnnotationText(text);
-    // Don't auto-send — the annotation is queued as a draft and the user
-    // can edit it further before explicitly sending with Ctrl+Shift+Enter.
+  }
+
+  void _handleNewAnnotationSubmitAndSend(String text) {
+    widget.service.submitAnnotationText(text);
+    widget.onAnnotationSubmitted();
   }
 
   void _handleEditAnnotationSubmit(String text) {
     widget.service.submitEditedAnnotationText(text);
-    // Don't call onAnnotationSubmitted here — editing an existing annotation
-    // should only update the draft in-place, not trigger a send to agent.
+  }
+
+  void _handleEditAnnotationSubmitAndSend(String text) {
+    widget.service.submitEditedAnnotationText(text);
+    widget.onAnnotationSubmitted();
   }
 
   Widget _buildTextField(Rect rect, Size screenSize) {
@@ -1873,6 +1975,8 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
                 ),
                 cursorColor: const Color(0xFFFF6600),
                 backgroundCursorColor: const Color(0xFF333333),
+                selectionColor: const Color(0x44FF6600),
+                enableInteractiveSelection: true,
                 inputFormatters: [
                   _SubmitOnEnterFormatter(
                     onSubmit: () =>
@@ -1943,6 +2047,8 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
                       ),
                       cursorColor: const Color(0xFFFF6600),
                       backgroundCursorColor: const Color(0xFF333333),
+                      selectionColor: const Color(0x44FF6600),
+                      enableInteractiveSelection: true,
                       inputFormatters: [
                         _SubmitOnEnterFormatter(
                           onSubmit: () =>
@@ -2618,10 +2724,12 @@ class _QueuedMessagesBadge extends StatelessWidget {
   const _QueuedMessagesBadge({
     required this.count,
     required this.pushConnected,
+    this.serverLinked = false,
   });
 
   final int count;
   final bool? pushConnected;
+  final bool serverLinked;
 
   @override
   Widget build(BuildContext context) {
@@ -2638,7 +2746,9 @@ class _QueuedMessagesBadge extends StatelessWidget {
             border: Border.all(
               color: (pushConnected ?? false)
                   ? const Color(0xFF38D76A)
-                  : const Color(0xFFFFFFFF),
+                  : serverLinked
+                      ? const Color(0xFFFF9500)
+                      : const Color(0xFFFFFFFF),
               width: 2,
             ),
             boxShadow: const [
@@ -2695,6 +2805,7 @@ class _QueuedMessagesPanel extends StatefulWidget {
     required this.messages,
     required this.onDeleteMessage,
     required this.onClearAll,
+    required this.onSend,
     required this.onSaveAnnotation,
     required this.onDeleteAnnotation,
     required this.onSaveMessageText,
@@ -2706,6 +2817,7 @@ class _QueuedMessagesPanel extends StatefulWidget {
   final List<Map<String, dynamic>> messages;
   final void Function(int queueId) onDeleteMessage;
   final VoidCallback onClearAll;
+  final VoidCallback onSend;
   final void Function(
     int queueId,
     String annotationId,
@@ -2955,7 +3067,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                   const SizedBox(width: 4),
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onTap: widget.onClearAll,
+                    onTap: widget.onSend,
                     child: Container(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 6, vertical: 2),
@@ -2964,7 +3076,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                         borderRadius: BorderRadius.circular(4),
                       ),
                       child: const Text(
-                        'Flush',
+                        'Send',
                         style: TextStyle(
                           color: Color(0xFF00AAFF),
                           fontSize: 10,
@@ -2990,19 +3102,21 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                 final queueId = _queueIdOf(message);
                 final annotations = _annotationsFromMessage(message);
 
+                final itemContent = annotations.isNotEmpty && queueId != null
+                    ? _buildAnnotationItem(
+                        queueId: queueId,
+                        screenshotBytes: _screenshotBytesForMessage(message),
+                        annotations: annotations,
+                      )
+                    : _buildGenericItem(
+                        queueId: queueId,
+                        previewBytes: previewBytes,
+                        summary: summary,
+                      );
+
                 return Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: annotations.isNotEmpty && queueId != null
-                      ? _buildAnnotationItem(
-                          queueId: queueId,
-                          screenshotBytes: _screenshotBytesForMessage(message),
-                          annotations: annotations,
-                        )
-                      : _buildGenericItem(
-                          queueId: queueId,
-                          previewBytes: previewBytes,
-                          summary: summary,
-                        ),
+                  child: itemContent,
                 );
               },
               separatorBuilder: (_, __) =>
@@ -3776,12 +3890,14 @@ class _ErrorPanel extends StatelessWidget {
     required this.errors,
     required this.onDismiss,
     required this.onAddToQueue,
+    required this.onSendAllToAgent,
     required this.onClearAll,
   });
 
   final List<InterceptedError> errors;
   final ValueChanged<int> onDismiss;
   final ValueChanged<InterceptedError> onAddToQueue;
+  final VoidCallback onSendAllToAgent;
   final VoidCallback onClearAll;
 
   @override
@@ -3839,11 +3955,17 @@ class _ErrorPanel extends StatelessWidget {
                     ),
                   ),
                   const Spacer(),
-                  if (errors.length > 1)
+                  _ErrorPanelButton(
+                    label: 'Send all',
+                    onTap: onSendAllToAgent,
+                  ),
+                  if (errors.length > 1) ...[
+                    const SizedBox(width: 4),
                     _ErrorPanelButton(
                       label: 'Clear all',
                       onTap: onClearAll,
                     ),
+                  ],
                 ],
               ),
             ),
@@ -3916,7 +4038,7 @@ class _ErrorPanelItem extends StatelessWidget {
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
                   _ErrorPanelButton(
-                    label: 'Add to queue',
+                    label: 'Send',
                     onTap: onAddToQueue,
                   ),
                   const SizedBox(width: 4),

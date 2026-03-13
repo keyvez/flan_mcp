@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flan_flutter/src/overlay/flan_overlay_widget.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
 import 'package:flan_flutter/src/services/error_interceptor.dart';
@@ -7,6 +9,8 @@ import 'package:flan_flutter/src/services/user_message_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart' as http_testing;
 import 'package:shared_preferences/shared_preferences.dart';
 
 Widget _buildTestApp({
@@ -69,10 +73,17 @@ late UserMessageService userMessageService;
 late ScreenshotService screenshotService;
 late ErrorInterceptor errorInterceptor;
 
+http.Client _noOpHttpClient() => http_testing.MockClient(
+      (_) async => http.Response(
+        jsonEncode({'has_association': false, 'association_count': 0}),
+        200,
+      ),
+    );
+
 void _createServices() {
   inspectorService = InspectorService();
   annotationService = AnnotationService();
-  userMessageService = UserMessageService();
+  userMessageService = UserMessageService(httpClient: _noOpHttpClient());
   screenshotService =
       ScreenshotService(maxScreenshotSize: const Size(1024, 1024));
   errorInterceptor = ErrorInterceptor();
@@ -488,7 +499,7 @@ void main() {
       expect(find.text('1 error'), findsNothing);
     });
 
-    testWidgets('queue panel shows Flush button', (tester) async {
+    testWidgets('queue panel shows Send button', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
@@ -502,10 +513,10 @@ void main() {
       await tester.tap(find.text('Q'));
       await tester.pumpAndSettle();
 
-      expect(find.text('Flush'), findsOneWidget);
+      expect(find.text('Send'), findsOneWidget);
     });
 
-    testWidgets('queue panel Flush clears all messages', (tester) async {
+    testWidgets('queue panel Send clears all messages', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
@@ -520,8 +531,8 @@ void main() {
       await tester.tap(find.text('Q'));
       await tester.pumpAndSettle();
 
-      // Tap Flush
-      await tester.tap(find.text('Flush'));
+      // Tap Send
+      await tester.tap(find.text('Send'));
       await tester.pumpAndSettle();
 
       expect(userMessageService.pendingMessageCount, 0);
@@ -857,7 +868,7 @@ void main() {
       final msg = userMessageService.peekMessages().first;
       expect(msg['type'], 'user_feedback');
       final data = msg['data'] as Map<String, dynamic>;
-      expect(data['annotationDraft'], isTrue);
+      expect(data['annotations'], isNotNull);
     });
 
     testWidgets('updating annotation text updates draft', (tester) async {
@@ -1801,8 +1812,8 @@ void main() {
     });
   });
 
-  group('Queued messages panel Flush button', () {
-    testWidgets('Flush button text appears when messages exist',
+  group('Queued messages panel Send button', () {
+    testWidgets('Send button text appears when messages exist',
         (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
@@ -1820,7 +1831,7 @@ void main() {
       await tester.tap(find.text('Q'));
       await tester.pumpAndSettle();
 
-      expect(find.text('Flush'), findsOneWidget);
+      expect(find.text('Send'), findsOneWidget);
     });
   });
 
@@ -3050,8 +3061,8 @@ void main() {
     });
   });
 
-  group('Queue panel Flush button', () {
-    testWidgets('Flush button tapping clears messages', (tester) async {
+  group('Queue panel Send button', () {
+    testWidgets('Send button tapping clears messages', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
       await _runAsyncAndSettle(tester, () async {
@@ -3067,8 +3078,8 @@ void main() {
       await tester.tap(find.text('Q'));
       await tester.pumpAndSettle();
 
-      // Tap the Flush button text
-      final flushButton = find.text('Flush');
+      // Tap the Send button text
+      final flushButton = find.text('Send');
       expect(flushButton, findsOneWidget);
 
       await tester.tap(flushButton);
@@ -5308,6 +5319,120 @@ void main() {
       // Or send another Escape to disable
       await tester.sendKeyEvent(LogicalKeyboardKey.escape);
       await tester.pumpAndSettle();
+    });
+  });
+
+  group('Q badge border color states', () {
+    testWidgets('white border when disconnected (default)', (tester) async {
+      await tester.pumpWidget(_app());
+      await tester.pumpAndSettle();
+
+      final container = tester.widget<Container>(
+        find.descendant(
+          of: find.byType(Stack),
+          matching: find.byWidgetPredicate(
+            (w) =>
+                w is Container &&
+                w.decoration is BoxDecoration &&
+                (w.decoration as BoxDecoration).border != null,
+          ),
+        ).first,
+      );
+      final decoration = container.decoration! as BoxDecoration;
+      final border = decoration.border! as Border;
+      expect(border.top.color, const Color(0xFFFFFFFF));
+    });
+
+    testWidgets('green border when push-connected', (tester) async {
+      userMessageService.setHostConnectionState(
+        connected: true,
+        pushCapable: true,
+      );
+      await tester.pumpWidget(_app());
+      await tester.pumpAndSettle();
+
+      final container = tester.widget<Container>(
+        find.descendant(
+          of: find.byType(Stack),
+          matching: find.byWidgetPredicate(
+            (w) =>
+                w is Container &&
+                w.decoration is BoxDecoration &&
+                (w.decoration as BoxDecoration).border != null,
+          ),
+        ).first,
+      );
+      final decoration = container.decoration! as BoxDecoration;
+      final border = decoration.border! as Border;
+      expect(border.top.color, const Color(0xFF38D76A));
+    });
+
+    testWidgets('orange border when server-linked but not push-connected',
+        (tester) async {
+      final client = http_testing.MockClient(
+        (_) async => http.Response(
+          jsonEncode({'has_association': true, 'association_count': 1}),
+          200,
+        ),
+      );
+      userMessageService = UserMessageService(httpClient: client);
+
+      // Manually trigger a poll to set hasServerAssociation
+      await tester.runAsync(() => userMessageService.pollServerStatus());
+
+      await tester.pumpWidget(_app());
+      await tester.pumpAndSettle();
+
+      final container = tester.widget<Container>(
+        find.descendant(
+          of: find.byType(Stack),
+          matching: find.byWidgetPredicate(
+            (w) =>
+                w is Container &&
+                w.decoration is BoxDecoration &&
+                (w.decoration as BoxDecoration).border != null,
+          ),
+        ).first,
+      );
+      final decoration = container.decoration! as BoxDecoration;
+      final border = decoration.border! as Border;
+      expect(border.top.color, const Color(0xFFFF9500));
+    });
+
+    testWidgets(
+        'green border takes priority over orange when both push-connected and server-linked',
+        (tester) async {
+      final client = http_testing.MockClient(
+        (_) async => http.Response(
+          jsonEncode({'has_association': true, 'association_count': 1}),
+          200,
+        ),
+      );
+      userMessageService = UserMessageService(httpClient: client);
+      userMessageService.setHostConnectionState(
+        connected: true,
+        pushCapable: true,
+      );
+
+      await tester.runAsync(() => userMessageService.pollServerStatus());
+
+      await tester.pumpWidget(_app());
+      await tester.pumpAndSettle();
+
+      final container = tester.widget<Container>(
+        find.descendant(
+          of: find.byType(Stack),
+          matching: find.byWidgetPredicate(
+            (w) =>
+                w is Container &&
+                w.decoration is BoxDecoration &&
+                (w.decoration as BoxDecoration).border != null,
+          ),
+        ).first,
+      );
+      final decoration = container.decoration! as BoxDecoration;
+      final border = decoration.border! as Border;
+      expect(border.top.color, const Color(0xFF38D76A));
     });
   });
 }

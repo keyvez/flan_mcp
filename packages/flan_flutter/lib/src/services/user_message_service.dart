@@ -3,16 +3,28 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Service that queues messages from the user in the Flutter app
 /// to be sent to the LLM agent via the MCP server.
 class UserMessageService extends ChangeNotifier {
+  UserMessageService({http.Client? httpClient, bool pollServer = false})
+      : _httpClient = httpClient ?? http.Client() {
+    if (pollServer) {
+      _startServerPolling();
+    }
+  }
+
   static const String userMessageQueuedEventKind = 'flan.userMessageQueued';
   static const String _pendingMessagesStorageKey =
       'flan.pending_user_messages.v1';
   static const String _nextQueueIdStorageKey = 'flan.pending_queue_next_id.v1';
+  static const String _agentStatusStorageKey = 'flan.agent_status.v1';
 
+  static const _serverPollInterval = Duration(seconds: 10);
+
+  final http.Client _httpClient;
   final List<Map<String, dynamic>> _pendingMessages = [];
   int _nextQueueId = 1;
   Future<void>? _hydrationFuture;
@@ -26,6 +38,21 @@ class UserMessageService extends ChangeNotifier {
   bool _waitingForActivity = false;
   String? _sentMessageText;
   Timer? _heartbeatTimer;
+
+  bool _isAgentWorking = false;
+  String? _agentStatusMessage;
+  Timer? _workingTimeoutTimer;
+  Timer? _completionClearTimer;
+
+  bool _hasServerAssociation = false;
+  Timer? _serverPollTimer;
+
+  /// Safety timeout: auto-clear working state if the agent never calls
+  /// `agent_status` with `done: true`.
+  static const _workingTimeout = Duration(minutes: 5);
+
+  /// How long the completion message is shown before auto-clearing.
+  static const _completionDisplayDuration = Duration(seconds: 4);
 
   /// How long to wait without a heartbeat before considering the agent
   /// disconnected.
@@ -42,6 +69,90 @@ class UserMessageService extends ChangeNotifier {
   /// [_heartbeatTimeout].
   bool get isAgentListening => _isAgentListening;
 
+  /// Whether the agent is actively working on consumed messages.
+  bool get isAgentWorking => _isAgentWorking;
+
+  /// Agent status text — either a streaming status while working, or a brief
+  /// completion summary shown temporarily after the agent finishes.
+  String? get agentStatusMessage => _agentStatusMessage;
+
+  set isAgentWorking(bool value) {
+    _workingTimeoutTimer?.cancel();
+    _workingTimeoutTimer = null;
+
+    if (value) {
+      // Cancel any lingering done-display timer, but do NOT clear
+      // _agentStatusMessage — the agent may have already set it via
+      // updateAgentStatus before this setter fires.
+      _completionClearTimer?.cancel();
+      _completionClearTimer = null;
+
+      _workingTimeoutTimer = Timer(_workingTimeout, () {
+        if (_isAgentWorking) {
+          _isAgentWorking = false;
+          _agentStatusMessage = null;
+          _persistAgentStatus();
+          notifyListeners();
+        }
+      });
+    }
+
+    if (_isAgentWorking != value) {
+      _isAgentWorking = value;
+      notifyListeners();
+    }
+  }
+
+  /// Updates the agent status message while the agent is working.
+  ///
+  /// Sets the working state to true, resets the safety timeout, persists the
+  /// status to SharedPreferences, and notifies listeners.
+  void updateAgentStatus(String message) {
+    _workingTimeoutTimer?.cancel();
+    _workingTimeoutTimer = null;
+    _completionClearTimer?.cancel();
+    _completionClearTimer = null;
+
+    _isAgentWorking = true;
+    _agentStatusMessage = message;
+
+    _workingTimeoutTimer = Timer(_workingTimeout, () {
+      if (_isAgentWorking) {
+        _isAgentWorking = false;
+        _agentStatusMessage = null;
+        _persistAgentStatus();
+        notifyListeners();
+      }
+    });
+
+    _persistAgentStatus();
+    notifyListeners();
+  }
+
+  /// Clears the working state and optionally shows a brief completion message.
+  void markDone({String? message}) {
+    _workingTimeoutTimer?.cancel();
+    _workingTimeoutTimer = null;
+    _completionClearTimer?.cancel();
+    _completionClearTimer = null;
+
+    _isAgentWorking = false;
+
+    if (message != null && message.isNotEmpty) {
+      _agentStatusMessage = message;
+      _completionClearTimer = Timer(_completionDisplayDuration, () {
+        _agentStatusMessage = null;
+        _persistAgentStatus();
+        notifyListeners();
+      });
+    } else {
+      _agentStatusMessage = null;
+    }
+
+    _persistAgentStatus();
+    notifyListeners();
+  }
+
   /// Whether an MCP host is currently connected to Flan.
   bool get isHostConnected => (_isHostConnected ?? false) == true;
 
@@ -49,6 +160,12 @@ class UserMessageService extends ChangeNotifier {
   /// (notifications and/or sampling).
   bool get isPushCapableHostConnected =>
       (_isPushCapableHostConnected ?? false) == true;
+
+  /// Whether the flan server has an association linking this app to a
+  /// Claude Code surface. Associations are created after a flush triggers
+  /// Claude Code to connect; this reflects post-connection state, not a
+  /// prerequisite for flushing.
+  bool get hasServerAssociation => _hasServerAssociation;
 
   /// Monotonic counter incremented whenever queued messages are consumed
   /// through the MCP consume path.
@@ -67,6 +184,14 @@ class UserMessageService extends ChangeNotifier {
           // Also clear waiting state — agent is gone, no activity coming
           _waitingForActivity = false;
           _sentMessageText = null;
+          // Clear working state and status — agent heartbeat expired
+          _isAgentWorking = false;
+          _agentStatusMessage = null;
+          _workingTimeoutTimer?.cancel();
+          _workingTimeoutTimer = null;
+          _completionClearTimer?.cancel();
+          _completionClearTimer = null;
+          _persistAgentStatus();
           notifyListeners();
         }
       });
@@ -137,7 +262,6 @@ class UserMessageService extends ChangeNotifier {
       'timestamp': timestamp,
     });
 
-    // Signal MCP bridge listeners over the VM extension stream.
     developer.postEvent(userMessageQueuedEventKind, {
       'pendingCount': _pendingMessages.length,
       'timestamp': timestamp,
@@ -147,16 +271,19 @@ class UserMessageService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Returns all pending messages and clears the queue.
+  /// Returns all pending messages and removes them from the queue.
   List<Map<String, dynamic>> consumeMessages() {
     warmUp();
     if (_pendingMessages.isEmpty) return [];
-    final messages = List<Map<String, dynamic>>.from(_pendingMessages);
+    final consumed = _pendingMessages
+        .map((m) => Map<String, dynamic>.from(m))
+        .toList();
     _pendingMessages.clear();
     _agentConsumeGeneration++;
+    isAgentWorking = true;
     unawaited(_persistQueueState());
     notifyListeners();
-    return messages;
+    return consumed;
   }
 
   /// Returns pending messages without clearing.
@@ -166,6 +293,16 @@ class UserMessageService extends ChangeNotifier {
       _pendingMessages.map((m) => Map<String, dynamic>.from(m)),
     );
   }
+
+  /// Returns pending messages without clearing.
+  /// Use this to get an accurate count of what [consumeMessages] would return.
+  List<Map<String, dynamic>> peekConsumableMessages() {
+    warmUp();
+    return peekMessages();
+  }
+
+  /// No-op. Retained for API compatibility.
+  void promoteDrafts() {}
 
   /// Removes a single queued message by queue id.
   /// Returns true if a message was found and removed.
@@ -199,6 +336,17 @@ class UserMessageService extends ChangeNotifier {
     return true;
   }
 
+  /// Re-fires the VM event to notify the agent that there are pending messages.
+  /// Call this to nudge the agent to consume queued messages.
+  void notifyPending() {
+    warmUp();
+    if (_pendingMessages.isEmpty) return;
+    developer.postEvent(userMessageQueuedEventKind, {
+      'pendingCount': _pendingMessages.length,
+      'timestamp': DateTime.now().toIso8601String(),
+    });
+  }
+
   /// Clears all queued pending messages.
   void clearMessages() {
     warmUp();
@@ -211,6 +359,14 @@ class UserMessageService extends ChangeNotifier {
   Future<void> _hydrateFromStorage() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+
+      // Restore agent status message (but NOT working state — after restart
+      // the VM service connection is gone).
+      final persistedStatus = prefs.getString(_agentStatusStorageKey);
+      if (persistedStatus != null && persistedStatus.isNotEmpty) {
+        _agentStatusMessage = persistedStatus;
+      }
+
       final rawMessages = prefs.getString(_pendingMessagesStorageKey);
       final persistedQueue = _decodePersistedMessages(rawMessages);
       final persistedNextId = prefs.getInt(_nextQueueIdStorageKey) ??
@@ -306,6 +462,24 @@ class UserMessageService extends ChangeNotifier {
     }
   }
 
+  void _persistAgentStatus() {
+    unawaited(_persistAgentStatusAsync());
+  }
+
+  Future<void> _persistAgentStatusAsync() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final msg = _agentStatusMessage;
+      if (msg != null) {
+        await prefs.setString(_agentStatusStorageKey, msg);
+      } else {
+        await prefs.remove(_agentStatusStorageKey);
+      }
+    } catch (_) {
+      // Best-effort persistence.
+    }
+  }
+
   int _inferNextQueueId(List<Map<String, dynamic>> messages) {
     var maxQueueId = 0;
     for (final message in messages) {
@@ -339,9 +513,48 @@ class UserMessageService extends ChangeNotifier {
     return '$timestamp|$type|$text';
   }
 
+  void _startServerPolling() {
+    if (_serverPollTimer != null) return;
+    unawaited(pollServerStatus());
+    _serverPollTimer = Timer.periodic(_serverPollInterval, (_) {
+      unawaited(pollServerStatus());
+    });
+  }
+
+  @visibleForTesting
+  Future<void> pollServerStatus() async {
+    try {
+      final response = await _httpClient
+          .get(Uri.parse('http://localhost:4050/api/status'))
+          .timeout(const Duration(seconds: 3));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final has = data['has_association'] == true;
+        if (_hasServerAssociation != has) {
+          _hasServerAssociation = has;
+          notifyListeners();
+        }
+      } else {
+        _setServerAssociation(false);
+      }
+    } catch (_) {
+      _setServerAssociation(false);
+    }
+  }
+
+  void _setServerAssociation(bool value) {
+    if (_hasServerAssociation != value) {
+      _hasServerAssociation = value;
+      notifyListeners();
+    }
+  }
+
   @override
   void dispose() {
     _heartbeatTimer?.cancel();
+    _workingTimeoutTimer?.cancel();
+    _completionClearTimer?.cancel();
+    _serverPollTimer?.cancel();
     super.dispose();
   }
 }

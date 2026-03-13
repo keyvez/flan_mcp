@@ -1,3 +1,5 @@
+import 'dart:developer' as developer;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart' hide InspectorSelection;
 import 'package:flan_flutter/src/binding/flan_configuration.dart';
@@ -40,11 +42,17 @@ class FlanBinding extends WidgetsFlutterBinding {
   ///
   /// [url] is the full URL (e.g. `https://dev-api.fasmac.workers.dev/api/github/issues`).
   /// [headersBuilder] returns auth headers for each request.
+  /// [userInfo] optional user details included in the issue payload (e.g. `{'name': '...', 'email': '...'}`).
   static void configureIssueEndpoint({
     required String url,
     required Map<String, String> Function() headersBuilder,
+    Map<String, String>? userInfo,
   }) {
-    GitHubIssueService.configure(url: url, headersBuilder: headersBuilder);
+    GitHubIssueService.configure(
+      url: url,
+      headersBuilder: headersBuilder,
+      userInfo: userInfo,
+    );
   }
 
   /// Whether the issue endpoint has been configured.
@@ -107,7 +115,7 @@ class FlanBinding extends WidgetsFlutterBinding {
     _textInputSimulator = TextInputSimulator(_widgetFinder);
     _inspectorService = InspectorService();
     _annotationService = AnnotationService();
-    _userMessageService = UserMessageService();
+    _userMessageService = UserMessageService(pollServer: true);
     _userMessageService.warmUp();
     _errorInterceptor = ErrorInterceptor();
     _errorInterceptor.install();
@@ -555,7 +563,19 @@ class FlanBinding extends WidgetsFlutterBinding {
       callback: (params) async {
         try {
           await _userMessageService.ensureHydrated();
+          final allCount = _userMessageService.peekMessages().length;
+          final consumableCount =
+              _userMessageService.peekConsumableMessages().length;
+          developer.log(
+            'flan.consumeUserMessages: '
+            'total=$allCount consumable=$consumableCount',
+            name: 'flan',
+          );
           final messages = _userMessageService.consumeMessages();
+          developer.log(
+            'flan.consumeUserMessages: consumed=${messages.length}',
+            name: 'flan',
+          );
           return <String, dynamic>{
             'status': 'Success',
             'messages': messages,
@@ -576,10 +596,17 @@ class FlanBinding extends WidgetsFlutterBinding {
       callback: (params) async {
         try {
           await _userMessageService.ensureHydrated();
-          final messages = _userMessageService.peekMessages();
+          final allCount = _userMessageService.peekMessages().length;
+          final consumableCount =
+              _userMessageService.peekConsumableMessages().length;
+          developer.log(
+            'flan.peekUserMessages: '
+            'total=$allCount consumable=$consumableCount',
+            name: 'flan',
+          );
           return <String, dynamic>{
             'status': 'Success',
-            'count': messages.length,
+            'count': consumableCount,
           };
         } catch (err, st) {
           return <String, dynamic>{
@@ -601,6 +628,36 @@ class FlanBinding extends WidgetsFlutterBinding {
           return <String, dynamic>{
             'status': 'Success',
             'listening': listening,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.setAgentWorking',
+      callback: (params) async {
+        try {
+          final working =
+              params['working'] == 'true' || params['working'] == true;
+          final message = params['message'] as String?;
+
+          if (!working) {
+            _userMessageService.markDone(message: message);
+          } else if (message != null && message.isNotEmpty) {
+            _userMessageService.updateAgentStatus(message);
+          } else {
+            _userMessageService.isAgentWorking = true;
+          }
+
+          return <String, dynamic>{
+            'status': 'Success',
+            'working': working,
           };
         } catch (err, st) {
           return <String, dynamic>{
