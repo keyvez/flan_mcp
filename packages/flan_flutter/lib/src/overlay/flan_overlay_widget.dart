@@ -855,9 +855,15 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       'text': parts.join('\n'),
       'data': data,
     });
+    _isSendingToAgent = false;
+  }
+
+  /// Packages annotations into a real queue item and immediately sends
+  /// to the agent via flan server flush.
+  Future<void> _sendToAgentAndFlush() async {
+    await _sendToAgent();
     widget.userMessageService.notifyPending();
     unawaited(_flushToServer());
-    _isSendingToAgent = false;
   }
 
   void _sendErrorToAgent(InterceptedError error) {
@@ -1228,6 +1234,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               userMessageService: widget.userMessageService,
               onAnnotationSubmitted: () {
                 _sendToAgent();
+              },
+              onAnnotationSubmittedAndSent: () {
+                _sendToAgentAndFlush();
               },
             ),
           if (widget.annotationService.enabled)
@@ -1762,12 +1771,13 @@ class _AnnotationOverlay extends StatefulWidget {
     required this.service,
     required this.userMessageService,
     this.onAnnotationSubmitted = _noopAnnotationSubmittedCallback,
+    this.onAnnotationSubmittedAndSent = _noopAnnotationSubmittedCallback,
   });
 
   final AnnotationService service;
   final UserMessageService userMessageService;
-  // Compatibility field kept to avoid hot-reload class shape breakage.
   final VoidCallback onAnnotationSubmitted;
+  final VoidCallback onAnnotationSubmittedAndSent;
 
   @override
   State<_AnnotationOverlay> createState() => _AnnotationOverlayState();
@@ -1923,20 +1933,26 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
 
   void _handleNewAnnotationSubmit(String text) {
     widget.service.submitAnnotationText(text);
+    // Package into a real queue item (no flush).
+    widget.onAnnotationSubmitted();
   }
 
   void _handleNewAnnotationSubmitAndSend(String text) {
     widget.service.submitAnnotationText(text);
-    widget.onAnnotationSubmitted();
+    // Package into a real queue item and flush to agent.
+    widget.onAnnotationSubmittedAndSent();
   }
 
   void _handleEditAnnotationSubmit(String text) {
     widget.service.submitEditedAnnotationText(text);
+    // Package into a real queue item (no flush).
+    widget.onAnnotationSubmitted();
   }
 
   void _handleEditAnnotationSubmitAndSend(String text) {
     widget.service.submitEditedAnnotationText(text);
-    widget.onAnnotationSubmitted();
+    // Package into a real queue item and flush to agent.
+    widget.onAnnotationSubmittedAndSent();
   }
 
   Widget _buildTextField(Rect rect, Size screenSize) {
