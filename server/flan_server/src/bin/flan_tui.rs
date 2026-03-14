@@ -3,6 +3,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use flan_server::*;
 use futures::StreamExt;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -11,16 +12,16 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
-use serde::Deserialize;
 use std::{
     io,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 // ── Colors (matching browser CSS variables) ─────────────────────────────
 
 const BG: Color = Color::Rgb(10, 10, 15);
-const SURFACE: Color = Color::Rgb(18, 18, 26);
+const SURFACE_BG: Color = Color::Rgb(18, 18, 26);
 const BORDER: Color = Color::Rgb(42, 42, 58);
 const TEXT: Color = Color::Rgb(224, 224, 232);
 const TEXT2: Color = Color::Rgb(136, 136, 153);
@@ -30,155 +31,85 @@ const GREEN: Color = Color::Rgb(0, 184, 148);
 const ORANGE: Color = Color::Rgb(253, 203, 110);
 const RED: Color = Color::Rgb(225, 112, 85);
 
-// ── Data Models (mirrors server JSON) ───────────────────────────────────
+const CONNECTOR: &str = "──────";
 
-#[derive(Debug, Clone, Deserialize)]
-struct FlutterApp {
-    pid: u32,
-    cwd: String,
-    folder_name: String,
-    vm_service_uri: Option<String>,
-    device: Option<String>,
+// ── Unified Row Model ───────────────────────────────────────────────────
+
+struct Row {
+    flutter: Option<usize>,
+    surface: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct ClaudeProcess {
-    pid: u32,
-    cwd: String,
-    folder_name: String,
-    last_message_preview: Option<String>,
-}
+fn build_rows(app: &App) -> Vec<Row> {
+    let claude_surfaces = app.claude_surfaces_indices();
+    let mut used_flutter: Vec<bool> = vec![false; app.flutter_apps.len()];
+    let mut used_surface: Vec<bool> = vec![false; claude_surfaces.len()];
+    let mut rows = Vec::new();
 
-#[derive(Debug, Clone, Deserialize)]
-struct CmuxSurface {
-    id: String,
-    title: String,
-    pane_id: String,
-    focused: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct Association {
-    id: String,
-    claude_surface_id: String,
-    flutter_pid: u32,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct LogEntry {
-    timestamp: String,
-    direction: String,
-    summary: String,
-    detail: Option<String>,
-    ok: bool,
-}
-
-// ── API Client ──────────────────────────────────────────────────────────
-
-struct FlanClient {
-    client: reqwest::Client,
-    base: String,
-}
-
-impl FlanClient {
-    fn new(port: u16) -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap(),
-            base: format!("http://localhost:{}", port),
+    for assoc in &app.associations {
+        let fi = app
+            .flutter_apps
+            .iter()
+            .position(|f| f.pid == assoc.flutter_pid);
+        let si = claude_surfaces
+            .iter()
+            .position(|&ci| app.cmux_surfaces[ci].id == assoc.claude_surface_id);
+        if let (Some(fi), Some(si)) = (fi, si) {
+            if !used_flutter[fi] && !used_surface[si] {
+                used_flutter[fi] = true;
+                used_surface[si] = true;
+                rows.push(Row {
+                    flutter: Some(fi),
+                    surface: Some(si),
+                });
+            }
         }
     }
 
-    async fn fetch_all(&self) -> Result<DashboardData, reqwest::Error> {
-        let (flutter, surfaces, associations, logs) = tokio::join!(
-            self.client.get(format!("{}/api/flutter-apps", self.base)).send(),
-            self.client.get(format!("{}/api/cmux-surfaces", self.base)).send(),
-            self.client.get(format!("{}/api/associations", self.base)).send(),
-            self.client.get(format!("{}/api/logs", self.base)).send(),
-        );
+    // Unlinked: zip Flutter-only and Claude-only side by side,
+    // then overflow the remainder as single-sided rows.
+    let mut unlinked_flutter: Vec<usize> = Vec::new();
+    let mut unlinked_surface: Vec<usize> = Vec::new();
 
-        Ok(DashboardData {
-            flutter_apps: flutter?.json().await.unwrap_or_default(),
-            cmux_surfaces: surfaces?.json().await.unwrap_or_default(),
-            associations: associations?.json().await.unwrap_or_default(),
-            logs: logs?.json().await.unwrap_or_default(),
-        })
+    for (i, used) in used_flutter.iter().enumerate() {
+        if !used {
+            unlinked_flutter.push(i);
+        }
+    }
+    for (i, used) in used_surface.iter().enumerate() {
+        if !used {
+            unlinked_surface.push(i);
+        }
     }
 
-    async fn rescan(&self) -> bool {
-        self.client
-            .post(format!("{}/api/rescan", self.base))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
+    let paired = unlinked_flutter.len().min(unlinked_surface.len());
+    for j in 0..paired {
+        rows.push(Row {
+            flutter: Some(unlinked_flutter[j]),
+            surface: Some(unlinked_surface[j]),
+        });
+    }
+    for &fi in &unlinked_flutter[paired..] {
+        rows.push(Row {
+            flutter: Some(fi),
+            surface: None,
+        });
+    }
+    for &si in &unlinked_surface[paired..] {
+        rows.push(Row {
+            flutter: None,
+            surface: Some(si),
+        });
     }
 
-    async fn create_association(&self, surface_id: &str, flutter_pid: u32) -> bool {
-        self.client
-            .post(format!("{}/api/associations", self.base))
-            .json(&serde_json::json!({
-                "claude_surface_id": surface_id,
-                "flutter_pid": flutter_pid,
-            }))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-    }
-
-    async fn delete_association(&self, id: &str) -> bool {
-        self.client
-            .delete(format!("{}/api/associations/{}", self.base, id))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-    }
-
-    async fn focus_surface(&self, surface_id: &str) -> bool {
-        self.client
-            .post(format!("{}/api/focus-surface", self.base))
-            .json(&serde_json::json!({ "surface_id": surface_id }))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-    }
-
-    async fn focus_app(&self, device: &str) -> bool {
-        self.client
-            .post(format!("{}/api/focus-app", self.base))
-            .json(&serde_json::json!({ "device": device }))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-    }
-
-    async fn test_send(&self, surface_id: &str) -> bool {
-        self.client
-            .post(format!("{}/api/test-send", self.base))
-            .json(&serde_json::json!({ "surface_id": surface_id }))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-    }
-
-    async fn flush(&self, flutter_pid: u32) -> bool {
-        self.client
-            .post(format!("{}/api/flush", self.base))
-            .json(&serde_json::json!({ "flutter_pid": flutter_pid }))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success())
-    }
+    rows
 }
 
-#[derive(Default)]
-struct DashboardData {
-    flutter_apps: Vec<FlutterApp>,
-    cmux_surfaces: Vec<CmuxSurface>,
-    associations: Vec<Association>,
-    logs: Vec<LogEntry>,
+fn row_has_column(row: &Row, col: Column) -> bool {
+    match col {
+        Column::Flutter => row.flutter.is_some(),
+        Column::Claude => row.surface.is_some(),
+    }
 }
 
 // ── App State ───────────────────────────────────────────────────────────
@@ -196,63 +127,98 @@ enum Focus {
 }
 
 struct App {
-    data: DashboardData,
+    shared: Arc<SharedState>,
+    flutter_apps: Vec<FlutterApp>,
+    cmux_surfaces: Vec<CmuxSurface>,
+    associations: Vec<Association>,
+    /// Snapshot of shared log for rendering (avoids async read during draw)
+    log_snapshot: Vec<LogEntry>,
+
     active_column: Column,
     focus: Focus,
-    flutter_state: ListState,
-    claude_state: ListState,
+    row_state: ListState,
     log_state: ListState,
     log_visible: bool,
     toast: Option<(String, Instant)>,
-    connected: bool,
+    port: u16,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(shared: Arc<SharedState>, port: u16) -> Self {
         Self {
-            data: DashboardData::default(),
+            shared,
+            flutter_apps: Vec::new(),
+            cmux_surfaces: Vec::new(),
+            associations: Vec::new(),
+            log_snapshot: Vec::new(),
+
             active_column: Column::Flutter,
             focus: Focus::Main,
-            flutter_state: ListState::default(),
-            claude_state: ListState::default(),
+            row_state: ListState::default(),
             log_state: ListState::default(),
             log_visible: true,
             toast: None,
-            connected: false,
+            port,
         }
     }
 
+    async fn log(
+        &self,
+        direction: &'static str,
+        summary: String,
+        detail: Option<String>,
+        ok: bool,
+    ) {
+        self.shared.log(direction, summary, detail, ok).await;
+    }
+
+    async fn sync_log_snapshot(&mut self) {
+        let log = self.shared.activity_log.read().await;
+        self.log_snapshot = log.iter().cloned().collect();
+    }
+
+    fn claude_surfaces_indices(&self) -> Vec<usize> {
+        self.cmux_surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.title.contains("Claude"))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn claude_surfaces(&self) -> Vec<&CmuxSurface> {
-        self.data
-            .cmux_surfaces
+        self.cmux_surfaces
             .iter()
             .filter(|s| s.title.contains("Claude"))
             .collect()
     }
 
     fn selected_flutter(&self) -> Option<&FlutterApp> {
-        self.flutter_state
+        let rows = build_rows(self);
+        self.row_state
             .selected()
-            .and_then(|i| self.data.flutter_apps.get(i))
+            .and_then(|i| rows.get(i))
+            .and_then(|row| row.flutter)
+            .and_then(|fi| self.flutter_apps.get(fi))
     }
 
     fn selected_surface(&self) -> Option<&CmuxSurface> {
-        let surfaces = self.claude_surfaces();
-        self.claude_state
+        let rows = build_rows(self);
+        let cs = self.claude_surfaces_indices();
+        self.row_state
             .selected()
-            .and_then(|i| surfaces.get(i).copied())
+            .and_then(|i| rows.get(i))
+            .and_then(|row| row.surface)
+            .and_then(|si| cs.get(si))
+            .and_then(|&ci| self.cmux_surfaces.get(ci))
     }
 
     fn assoc_for_flutter(&self, pid: u32) -> Option<&Association> {
-        self.data
-            .associations
-            .iter()
-            .find(|a| a.flutter_pid == pid)
+        self.associations.iter().find(|a| a.flutter_pid == pid)
     }
 
     fn assoc_for_surface(&self, id: &str) -> Option<&Association> {
-        self.data
-            .associations
+        self.associations
             .iter()
             .find(|a| a.claude_surface_id == id)
     }
@@ -261,9 +227,44 @@ impl App {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    async fn refresh(&mut self) {
+        let (flutter, surfaces) = tokio::task::spawn_blocking(|| {
+            (discover_flutter_apps(), cmux_surface_list())
+        })
+        .await
+        .unwrap_or_default();
+
+        self.flutter_apps = flutter.clone();
+        self.cmux_surfaces = surfaces;
+
+        // Prune stale associations where the Flutter process is gone
+        let mut assocs = load_associations(&self.shared.persistence_path);
+        let before = assocs.len();
+        assocs.retain(|a| self.flutter_apps.iter().any(|f| f.pid == a.flutter_pid));
+        if assocs.len() < before {
+            save_associations(&self.shared.persistence_path, &assocs);
+        }
+        self.associations = assocs.clone();
+        {
+            let mut shared_assocs = self.shared.associations.write().await;
+            *shared_assocs = assocs;
+        }
+
+        // Update shared cache so HTTP handlers (e.g. /api/flush) can find VM URIs
+        *self.shared.flutter_cache.write().await = Some((Instant::now(), flutter));
+        self.sync_log_snapshot().await;
+
+        let row_count = build_rows(self).len();
+        clamp_selection(&mut self.row_state, row_count);
+
+        if self.row_state.selected().is_none() && row_count > 0 {
+            self.row_state.select(Some(0));
+        }
+    }
+
     fn move_up(&mut self) {
         if self.focus == Focus::Log {
-            let len = self.data.logs.len();
+            let len = self.log_snapshot.len();
             if len == 0 {
                 return;
             }
@@ -271,29 +272,22 @@ impl App {
             self.log_state.select(Some(i.saturating_sub(1)));
             return;
         }
-        match self.active_column {
-            Column::Flutter => {
-                let len = self.data.flutter_apps.len();
-                if len == 0 {
-                    return;
-                }
-                let i = self.flutter_state.selected().unwrap_or(0);
-                self.flutter_state.select(Some(i.saturating_sub(1)));
-            }
-            Column::Claude => {
-                let len = self.claude_surfaces().len();
-                if len == 0 {
-                    return;
-                }
-                let i = self.claude_state.selected().unwrap_or(0);
-                self.claude_state.select(Some(i.saturating_sub(1)));
-            }
+        let rows = build_rows(self);
+        if rows.is_empty() {
+            return;
         }
+        let i = self.row_state.selected().unwrap_or(0);
+        // Skip rows that have nothing in the active column
+        let mut target = i.saturating_sub(1);
+        while target > 0 && !row_has_column(&rows[target], self.active_column) {
+            target = target.saturating_sub(1);
+        }
+        self.row_state.select(Some(target));
     }
 
     fn move_down(&mut self) {
         if self.focus == Focus::Log {
-            let len = self.data.logs.len();
+            let len = self.log_snapshot.len();
             if len == 0 {
                 return;
             }
@@ -302,26 +296,18 @@ impl App {
                 .select(Some((i + 1).min(len.saturating_sub(1))));
             return;
         }
-        match self.active_column {
-            Column::Flutter => {
-                let len = self.data.flutter_apps.len();
-                if len == 0 {
-                    return;
-                }
-                let i = self.flutter_state.selected().unwrap_or(0);
-                self.flutter_state
-                    .select(Some((i + 1).min(len.saturating_sub(1))));
-            }
-            Column::Claude => {
-                let len = self.claude_surfaces().len();
-                if len == 0 {
-                    return;
-                }
-                let i = self.claude_state.selected().unwrap_or(0);
-                self.claude_state
-                    .select(Some((i + 1).min(len.saturating_sub(1))));
-            }
+        let rows = build_rows(self);
+        if rows.is_empty() {
+            return;
         }
+        let last = rows.len() - 1;
+        let i = self.row_state.selected().unwrap_or(0);
+        // Skip rows that have nothing in the active column
+        let mut target = (i + 1).min(last);
+        while target < last && !row_has_column(&rows[target], self.active_column) {
+            target += 1;
+        }
+        self.row_state.select(Some(target));
     }
 
     fn toggle_column(&mut self) {
@@ -342,30 +328,38 @@ fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
-    // Determine log panel height
     let log_height = if app.log_visible { 10u16 } else { 1u16 };
 
     let outer = Layout::vertical([
-        Constraint::Length(1),  // status bar
-        Constraint::Min(6),    // main area
-        Constraint::Length(log_height), // log panel
-        Constraint::Length(1), // help bar
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(6),
+        Constraint::Length(log_height),
+        Constraint::Length(1),
     ])
     .split(area);
 
     render_status_bar(f, app, outer[0]);
-    render_main(f, app, outer[1]);
-    render_log_panel(f, app, outer[2]);
-    render_help_bar(f, app, outer[3]);
+    render_column_headers(f, app, outer[1]);
+    render_rows(f, app, outer[2]);
+    render_log_panel(f, app, outer[3]);
+    render_help_bar(f, outer[4]);
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    let flutter_count = app.data.flutter_apps.len();
+    let flutter_count = app.flutter_apps.len();
     let claude_count = app.claude_surfaces().len();
-    let link_count = app.data.associations.len();
+    let cs_indices = app.claude_surfaces_indices();
+    let link_count = app.associations.iter().filter(|a| {
+        app.flutter_apps.iter().any(|f| f.pid == a.flutter_pid)
+            && cs_indices.iter().any(|&ci| app.cmux_surfaces[ci].id == a.claude_surface_id)
+    }).count();
 
     let mut spans = vec![
-        Span::styled(" flan", Style::default().fg(ACCENT2).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " flan",
+            Style::default().fg(ACCENT2).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" tui  ", Style::default().fg(TEXT)),
     ];
 
@@ -378,15 +372,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // Right-aligned status
-    let status = if app.connected {
-        format!(
-            "● {} flutter · {} claude · {} linked  ",
-            flutter_count, claude_count, link_count
-        )
-    } else {
-        "○ disconnected  ".to_string()
-    };
+    let status = format!(
+        "● {} flutter · {} claude · {} linked · :{} ",
+        flutter_count, claude_count, link_count, app.port
+    );
 
     let status_width = status.len() as u16;
     let left_width = area.width.saturating_sub(status_width);
@@ -398,49 +387,82 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     .split(area);
 
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE_BG)),
         cols[0],
     );
 
-    let status_color = if app.connected { GREEN } else { RED };
     f.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             status,
-            Style::default().fg(status_color),
+            Style::default().fg(GREEN),
         )]))
-        .style(Style::default().bg(SURFACE))
+        .style(Style::default().bg(SURFACE_BG))
         .alignment(ratatui::layout::Alignment::Right),
         cols[1],
     );
 }
 
-fn render_main(f: &mut Frame, app: &mut App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+fn render_column_headers(f: &mut Frame, app: &App, area: Rect) {
+    let flutter_active = app.focus == Focus::Main && app.active_column == Column::Flutter;
+    let claude_active = app.focus == Focus::Main && app.active_column == Column::Claude;
 
-    render_flutter_column(f, app, cols[0]);
-    render_claude_column(f, app, cols[1]);
+    let cols = Layout::horizontal([
+        Constraint::Percentage(45),
+        Constraint::Percentage(10),
+        Constraint::Percentage(45),
+    ])
+    .split(area);
+
+    let flutter_style = if flutter_active {
+        Style::default().fg(ACCENT2).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT2)
+    };
+    let claude_style = if claude_active {
+        Style::default().fg(ACCENT2).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT2)
+    };
+
+    let fl_header = if flutter_active {
+        " ▸ FLUTTER APPS"
+    } else {
+        "   FLUTTER APPS"
+    };
+    let cl_header = if claude_active {
+        "CLAUDE CODE ◂ "
+    } else {
+        "CLAUDE CODE   "
+    };
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(fl_header, flutter_style)))
+            .style(Style::default().bg(BG)),
+        cols[0],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled("", Style::default().fg(BORDER))))
+            .style(Style::default().bg(BG)),
+        cols[1],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(cl_header, claude_style)))
+            .style(Style::default().bg(BG))
+            .alignment(ratatui::layout::Alignment::Right),
+        cols[2],
+    );
 }
 
-fn render_flutter_column(f: &mut Frame, app: &mut App, area: Rect) {
-    let is_active = app.focus == Focus::Main && app.active_column == Column::Flutter;
-    let border_color = if is_active { ACCENT } else { BORDER };
+fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
+    let rows = build_rows(app);
 
-    let title = format!(" Flutter Apps ({}) ", app.data.flutter_apps.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(if is_active { ACCENT2 } else { TEXT2 })
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(BG));
-
-    if app.data.flutter_apps.is_empty() {
+    if rows.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(BG));
         let empty = Paragraph::new(Line::from(Span::styled(
-            "No Flutter apps running",
+            "No Flutter apps or Claude surfaces found",
             Style::default().fg(TEXT2),
         )))
         .block(block)
@@ -449,205 +471,192 @@ fn render_flutter_column(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .data
-        .flutter_apps
+    let selected_row = app.row_state.selected();
+    let active_col = app.active_column;
+    let has_focus = app.focus == Focus::Main;
+
+    let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(_, app_item)| {
-            let assoc = app
-                .data
-                .associations
-                .iter()
-                .find(|a| a.flutter_pid == app_item.pid);
-            let linked_surface = assoc.and_then(|a| {
-                app.data
-                    .cmux_surfaces
-                    .iter()
-                    .find(|s| s.id == a.claude_surface_id)
-            });
+        .map(|(row_idx, row)| {
+            let is_selected = has_focus && selected_row == Some(row_idx);
+            let is_linked = row.flutter.is_some() && row.surface.is_some();
 
-            let mut lines = vec![];
+            let hl_left = is_selected && active_col == Column::Flutter && row.flutter.is_some();
+            let hl_right = is_selected && active_col == Column::Claude && row.surface.is_some();
 
-            // Folder name
-            let mut name_spans = vec![Span::styled(
-                &app_item.folder_name,
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            )];
-            if assoc.is_some() {
-                name_spans.push(Span::styled(
-                    " [linked]",
-                    Style::default().fg(GREEN),
-                ));
+            let mut lines = Vec::new();
+
+            let flutter_lines = row
+                .flutter
+                .map(|fi| build_flutter_lines(app, fi))
+                .unwrap_or_default();
+            let surface_lines = row.surface.map(|si| {
+                let cs = app.claude_surfaces_indices();
+                build_surface_lines(app, cs[si])
+            }).unwrap_or_default();
+
+            let max_lines = flutter_lines.len().max(surface_lines.len());
+
+            let left_w = (area.width as usize * 44 / 100).max(10);
+            let conn_w = (area.width as usize * 12 / 100).max(4);
+            let right_w = (area.width as usize * 44 / 100).max(10);
+
+            let hl_bg = Color::Rgb(28, 24, 50);
+
+            for line_idx in 0..max_lines {
+                let left = flutter_lines.get(line_idx);
+                let right = surface_lines.get(line_idx);
+
+                let mut spans = Vec::new();
+
+                // Left column (Flutter)
+                if let Some((text, style)) = left {
+                    let truncated = truncate_str(text, left_w);
+                    let pad = left_w.saturating_sub(char_width(&truncated));
+                    let s = if hl_left { style.bg(hl_bg) } else { *style };
+                    spans.push(Span::styled(truncated, s));
+                    if pad > 0 {
+                        let pad_style = if hl_left { Style::default().bg(hl_bg) } else { Style::default() };
+                        spans.push(Span::styled(" ".repeat(pad), pad_style));
+                    }
+                } else {
+                    spans.push(Span::raw(" ".repeat(left_w)));
+                }
+
+                // Connector
+                if line_idx == 0 && is_linked {
+                    let connector = center_pad(CONNECTOR, conn_w);
+                    spans.push(Span::styled(connector, Style::default().fg(GREEN)));
+                } else {
+                    spans.push(Span::raw(" ".repeat(conn_w)));
+                }
+
+                // Right column (Claude)
+                if let Some((text, style)) = right {
+                    let truncated = truncate_str(text, right_w);
+                    let pad = right_w.saturating_sub(char_width(&truncated));
+                    let s = if hl_right { style.bg(hl_bg) } else { *style };
+                    spans.push(Span::styled(truncated, s));
+                    if pad > 0 {
+                        let pad_style = if hl_right { Style::default().bg(hl_bg) } else { Style::default() };
+                        spans.push(Span::styled(" ".repeat(pad), pad_style));
+                    }
+                } else if hl_right {
+                    spans.push(Span::styled(" ".repeat(right_w), Style::default().bg(hl_bg)));
+                } else {
+                    spans.push(Span::raw(" ".repeat(right_w)));
+                }
+
+                lines.push(Line::from(spans));
             }
-            lines.push(Line::from(name_spans));
 
-            // Meta line
-            let device = app_item.device.as_deref().unwrap_or("?");
-            lines.push(Line::from(vec![
-                Span::styled(format!("PID {}  ", app_item.pid), Style::default().fg(TEXT2)),
-                Span::styled(device, Style::default().fg(TEXT2)),
-            ]));
-
-            // VM service URI
-            if let Some(ref uri) = app_item.vm_service_uri {
-                let short: String = uri.chars().take(40).collect();
-                lines.push(Line::from(Span::styled(short, Style::default().fg(TEXT2))));
-            }
-
-            // Link target
-            if let Some(surface) = linked_surface {
-                lines.push(Line::from(vec![
-                    Span::styled("→ ", Style::default().fg(GREEN)),
-                    Span::styled(
-                        &surface.title,
-                        Style::default().fg(GREEN),
-                    ),
-                    Span::styled(
-                        format!(" ({}…)", &surface.id[..8.min(surface.id.len())]),
-                        Style::default().fg(TEXT2),
-                    ),
-                ]));
-            }
-
-            // CWD
-            lines.push(Line::from(Span::styled(
-                &app_item.cwd,
-                Style::default().fg(Color::Rgb(80, 80, 100)),
-            )));
-
-            // Blank separator
-            lines.push(Line::from(""));
+            // Blank separator line between rows
+            lines.push(Line::from(Span::raw(" ".repeat(left_w + conn_w + right_w))));
 
             ListItem::new(lines)
         })
         .collect();
 
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(26, 26, 50))
-                .fg(TEXT)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▸ ");
-
-    f.render_stateful_widget(list, area, &mut app.flutter_state);
-}
-
-fn render_claude_column(f: &mut Frame, app: &mut App, area: Rect) {
-    let is_active = app.focus == Focus::Main && app.active_column == Column::Claude;
-    let border_color = if is_active { ACCENT } else { BORDER };
-
-    // Collect into owned Vec to avoid borrow conflict with app.claude_state
-    let claude_surfaces: Vec<CmuxSurface> = app
-        .data
-        .cmux_surfaces
-        .iter()
-        .filter(|s| s.title.contains("Claude"))
-        .cloned()
-        .collect();
-    let title = format!(" Claude Code ({}) ", claude_surfaces.len());
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(if is_active { ACCENT2 } else { TEXT2 })
-                .add_modifier(Modifier::BOLD),
-        ))
+        .border_style(Style::default().fg(BORDER))
         .style(Style::default().bg(BG));
-
-    if claude_surfaces.is_empty() {
-        let empty = Paragraph::new(Line::from(Span::styled(
-            "No Claude Code surfaces in cmux",
-            Style::default().fg(TEXT2),
-        )))
-        .block(block)
-        .alignment(ratatui::layout::Alignment::Center);
-        f.render_widget(empty, area);
-        return;
-    }
-
-    let items: Vec<ListItem> = claude_surfaces
-        .iter()
-        .map(|surface| {
-            let assoc = app
-                .data
-                .associations
-                .iter()
-                .find(|a| a.claude_surface_id == surface.id);
-            let linked_app = assoc.and_then(|a| {
-                app.data
-                    .flutter_apps
-                    .iter()
-                    .find(|f| f.pid == a.flutter_pid)
-            });
-
-            let mut lines = vec![];
-
-            // Title
-            let mut name_spans = vec![Span::styled(
-                &surface.title,
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            )];
-            if surface.focused {
-                name_spans.push(Span::styled(
-                    " [focused]",
-                    Style::default().fg(ACCENT2),
-                ));
-            }
-            if assoc.is_some() {
-                name_spans.push(Span::styled(
-                    " [linked]",
-                    Style::default().fg(GREEN),
-                ));
-            }
-            lines.push(Line::from(name_spans));
-
-            // IDs
-            let short_id = &surface.id[..8.min(surface.id.len())];
-            let short_pane = &surface.pane_id[..8.min(surface.pane_id.len())];
-            lines.push(Line::from(vec![
-                Span::styled(format!("{}…  ", short_id), Style::default().fg(TEXT2)),
-                Span::styled(format!("pane {}…", short_pane), Style::default().fg(TEXT2)),
-            ]));
-
-            // Linked flutter app
-            if let Some(flutter) = linked_app {
-                lines.push(Line::from(vec![
-                    Span::styled("← ", Style::default().fg(GREEN)),
-                    Span::styled(
-                        &flutter.folder_name,
-                        Style::default().fg(GREEN),
-                    ),
-                    Span::styled(
-                        format!(" (PID {})", flutter.pid),
-                        Style::default().fg(TEXT2),
-                    ),
-                ]));
-            }
-
-            // Blank separator
-            lines.push(Line::from(""));
-
-            ListItem::new(lines)
-        })
-        .collect();
 
     let list = List::new(items)
         .block(block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(26, 26, 50))
-                .fg(TEXT)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▸ ");
+        .highlight_symbol("▸");
 
-    f.render_stateful_widget(list, area, &mut app.claude_state);
+    f.render_stateful_widget(list, area, &mut app.row_state);
+}
+
+fn build_flutter_lines(app: &App, idx: usize) -> Vec<(String, Style)> {
+    let fl = &app.flutter_apps[idx];
+    let mut lines = Vec::new();
+
+    let device = fl.device.as_deref().unwrap_or("?");
+    lines.push((
+        format!("{}  ({})", fl.folder_name, device),
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+    ));
+
+    lines.push((
+        shorten_path(&fl.cwd),
+        Style::default().fg(TEXT2),
+    ));
+
+    lines
+}
+
+fn build_surface_lines(app: &App, cmux_idx: usize) -> Vec<(String, Style)> {
+    let surface = &app.cmux_surfaces[cmux_idx];
+    let mut lines = Vec::new();
+
+    let mut title = surface.title.clone();
+    if surface.focused {
+        title.push_str(" [focused]");
+    }
+    lines.push((
+        title,
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+    ));
+
+    // Find a sibling surface in the same pane whose title looks like a path
+    let pane_path = app.cmux_surfaces.iter()
+        .filter(|s| s.pane_id == surface.pane_id && s.id != surface.id)
+        .find(|s| {
+            let t = &s.title;
+            t.starts_with('/') || t.starts_with('~') || t.starts_with('…') || t.contains("/dev/")
+        })
+        .map(|s| s.title.clone());
+
+    if let Some(path) = pane_path {
+        lines.push((path, Style::default().fg(TEXT2)));
+    } else {
+        let short_pane = &surface.pane_id[..8.min(surface.pane_id.len())];
+        lines.push((
+            format!("pane {}…", short_pane),
+            Style::default().fg(TEXT2),
+        ));
+    }
+
+    lines
+}
+
+fn shorten_path(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && path.starts_with(&home) {
+        format!("~{}", &path[home.len()..])
+    } else {
+        path.to_string()
+    }
+}
+
+fn char_width(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn truncate_str(s: &str, max_width: usize) -> String {
+    let cw = char_width(s);
+    if cw <= max_width {
+        s.to_string()
+    } else if max_width > 1 {
+        let truncated: String = s.chars().take(max_width - 1).collect();
+        format!("{}…", truncated)
+    } else {
+        "…".to_string()
+    }
+}
+
+fn center_pad(s: &str, width: usize) -> String {
+    let cw = char_width(s);
+    if cw >= width {
+        return s.chars().take(width).collect();
+    }
+    let total_pad = width - cw;
+    let left = total_pad / 2;
+    let right = total_pad - left;
+    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
 }
 
 fn render_log_panel(f: &mut Frame, app: &mut App, area: Rect) {
@@ -656,7 +665,7 @@ fn render_log_panel(f: &mut Frame, app: &mut App, area: Rect) {
 
     let title = format!(
         " Activity Log ({}) {} ",
-        app.data.logs.len(),
+        app.log_snapshot.len(),
         if app.log_visible { "▼" } else { "▶" }
     );
 
@@ -671,7 +680,7 @@ fn render_log_panel(f: &mut Frame, app: &mut App, area: Rect) {
         ))
         .style(Style::default().bg(BG));
 
-    if !app.log_visible || app.data.logs.is_empty() {
+    if !app.log_visible || app.log_snapshot.is_empty() {
         let msg = if !app.log_visible {
             ""
         } else {
@@ -683,10 +692,8 @@ fn render_log_panel(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Show newest first
     let items: Vec<ListItem> = app
-        .data
-        .logs
+        .log_snapshot
         .iter()
         .rev()
         .map(|entry| {
@@ -732,7 +739,7 @@ fn render_log_panel(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.log_state);
 }
 
-fn render_help_bar(f: &mut Frame, _app: &App, area: Rect) {
+fn render_help_bar(f: &mut Frame, area: Rect) {
     let spans = vec![
         Span::styled(" [s]", Style::default().fg(ACCENT2)),
         Span::styled("can ", Style::default().fg(TEXT2)),
@@ -742,15 +749,13 @@ fn render_help_bar(f: &mut Frame, _app: &App, area: Rect) {
         Span::styled("nlink ", Style::default().fg(TEXT2)),
         Span::styled("[f]", Style::default().fg(ACCENT2)),
         Span::styled("ocus ", Style::default().fg(TEXT2)),
-        Span::styled("[a]", Style::default().fg(ACCENT2)),
-        Span::styled("pp ", Style::default().fg(TEXT2)),
         Span::styled("[t]", Style::default().fg(ACCENT2)),
         Span::styled("est ", Style::default().fg(TEXT2)),
         Span::styled("[x]", Style::default().fg(ACCENT2)),
         Span::styled("flush ", Style::default().fg(TEXT2)),
         Span::styled("[g]", Style::default().fg(ACCENT2)),
         Span::styled("log ", Style::default().fg(TEXT2)),
-        Span::styled("[Tab]", Style::default().fg(ACCENT2)),
+        Span::styled("[←→]", Style::default().fg(ACCENT2)),
         Span::styled("switch ", Style::default().fg(TEXT2)),
         Span::styled("[r]", Style::default().fg(ACCENT2)),
         Span::styled("efresh ", Style::default().fg(TEXT2)),
@@ -759,7 +764,7 @@ fn render_help_bar(f: &mut Frame, _app: &App, area: Rect) {
     ];
 
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE_BG)),
         area,
     );
 }
@@ -779,7 +784,18 @@ async fn main() -> io::Result<()> {
         })
         .unwrap_or(4050);
 
-    let client = FlanClient::new(port);
+    // Shared state between TUI and HTTP server
+    let shared = Arc::new(SharedState::new());
+
+    // Spawn the HTTP server in the background
+    let server_state = shared.clone();
+    tokio::spawn(async move {
+        let router = build_router(server_state);
+        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+            .await
+            .expect("failed to bind HTTP server");
+        axum::serve(listener, router).await.ok();
+    });
 
     // Terminal setup
     enable_raw_mode()?;
@@ -788,7 +804,6 @@ async fn main() -> io::Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Panic hook to restore terminal
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -796,32 +811,16 @@ async fn main() -> io::Result<()> {
         original_hook(info);
     }));
 
-    let mut app = App::new();
-
-    // Initial fetch
-    match client.fetch_all().await {
-        Ok(data) => {
-            app.data = data;
-            app.connected = true;
-            // Auto-select first items
-            if !app.data.flutter_apps.is_empty() {
-                app.flutter_state.select(Some(0));
-            }
-            if !app.claude_surfaces().is_empty() {
-                app.claude_state.select(Some(0));
-            }
-        }
-        Err(_) => {
-            app.connected = false;
-        }
-    }
+    let mut app = App::new(shared, port);
+    app.refresh().await;
 
     let mut event_stream = event::EventStream::new();
     let mut refresh_interval = tokio::time::interval(Duration::from_secs(5));
-    refresh_interval.tick().await; // consume first immediate tick
+    refresh_interval.tick().await;
+    let mut log_poll = tokio::time::interval(Duration::from_millis(500));
+    log_poll.tick().await;
 
     loop {
-        // Clear stale toast
         if let Some((_, ts)) = &app.toast {
             if ts.elapsed() > Duration::from_secs(3) {
                 app.toast = None;
@@ -832,24 +831,18 @@ async fn main() -> io::Result<()> {
 
         tokio::select! {
             _ = refresh_interval.tick() => {
-                match client.fetch_all().await {
-                    Ok(data) => {
-                        app.data = data;
-                        app.connected = true;
-                        // Clamp selections
-                        clamp_selection(&mut app.flutter_state, app.data.flutter_apps.len());
-                        let cs_len = app.claude_surfaces().len();
-                        clamp_selection(&mut app.claude_state, cs_len);
-                    }
-                    Err(_) => {
-                        app.connected = false;
-                    }
+                app.refresh().await;
+            }
+            _ = log_poll.tick() => {
+                let prev_len = app.log_snapshot.len();
+                app.sync_log_snapshot().await;
+                if app.log_snapshot.len() != prev_len {
+                    // New log entries arrived (e.g. from HTTP flush) — redraw
                 }
             }
             Some(Ok(evt)) = event_stream.next() => {
                 match evt {
                     Event::Key(KeyEvent { code, modifiers, .. }) => {
-                        // Ctrl+C always quits
                         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
                             break;
                         }
@@ -860,7 +853,7 @@ async fn main() -> io::Result<()> {
                             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
 
-                            KeyCode::Tab | KeyCode::BackTab => app.toggle_column(),
+                            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => app.toggle_column(),
 
                             KeyCode::Char('g') => {
                                 if app.focus == Focus::Log {
@@ -868,71 +861,52 @@ async fn main() -> io::Result<()> {
                                     app.log_visible = false;
                                 } else if app.log_visible {
                                     app.focus = Focus::Log;
-                                    if !app.data.logs.is_empty() {
+                                    if !app.log_snapshot.is_empty() {
                                         app.log_state.select(Some(0));
                                     }
                                 } else {
                                     app.log_visible = true;
                                     app.focus = Focus::Log;
-                                    if !app.data.logs.is_empty() {
+                                    if !app.log_snapshot.is_empty() {
                                         app.log_state.select(Some(0));
                                     }
                                 }
                             }
 
-                            KeyCode::Char('s') => {
-                                if client.rescan().await {
-                                    app.set_toast("Scan complete");
-                                    if let Ok(data) = client.fetch_all().await {
-                                        app.data = data;
-                                        app.connected = true;
-                                        clamp_selection(&mut app.flutter_state, app.data.flutter_apps.len());
-                                        let cs_len = app.claude_surfaces().len();
-                                        clamp_selection(&mut app.claude_state, cs_len);
-                                    }
-                                } else {
-                                    app.set_toast("Scan failed");
-                                }
-                            }
-
-                            KeyCode::Char('r') => {
-                                match client.fetch_all().await {
-                                    Ok(data) => {
-                                        app.data = data;
-                                        app.connected = true;
-                                        clamp_selection(&mut app.flutter_state, app.data.flutter_apps.len());
-                                        let cs_len = app.claude_surfaces().len();
-                                        clamp_selection(&mut app.claude_state, cs_len);
-                                        app.set_toast("Refreshed");
-                                    }
-                                    Err(_) => {
-                                        app.connected = false;
-                                        app.set_toast("Refresh failed");
-                                    }
-                                }
+                            KeyCode::Char('s') | KeyCode::Char('r') => {
+                                app.refresh().await;
+                                app.log("in", "Scan complete".into(), None, true).await;
+                                app.sync_log_snapshot().await;
+                                app.set_toast("Scan complete");
                             }
 
                             KeyCode::Char('l') => {
-                                // Link: need both a flutter app and a claude surface selected
                                 let flutter_pid = app.selected_flutter().map(|f| f.pid);
                                 let surface_id = app.selected_surface().map(|s| s.id.clone());
 
                                 if let (Some(pid), Some(sid)) = (flutter_pid, surface_id) {
-                                    if client.create_association(&sid, pid).await {
-                                        app.set_toast("Link created");
-                                        if let Ok(data) = client.fetch_all().await {
-                                            app.data = data;
-                                        }
-                                    } else {
-                                        app.set_toast("Link failed");
+                                    let assoc = Association {
+                                        id: new_association_id(),
+                                        claude_surface_id: sid.clone(),
+                                        flutter_pid: pid,
+                                    };
+                                    // Update shared state
+                                    {
+                                        let mut assocs = app.shared.associations.write().await;
+                                        assocs.retain(|a| a.flutter_pid != pid);
+                                        assocs.push(assoc);
+                                        save_associations(&app.shared.persistence_path, &assocs);
                                     }
+                                    app.associations = app.shared.associations.read().await.clone();
+                                    app.log("in", format!("Link created: PID {} → {}", pid, &sid[..8.min(sid.len())]), None, true).await;
+                                    app.sync_log_snapshot().await;
+                                    app.set_toast("Link created");
                                 } else {
                                     app.set_toast("Select both a Flutter app and Claude surface first");
                                 }
                             }
 
                             KeyCode::Char('u') => {
-                                // Unlink: find association for current selection
                                 let assoc_id = match app.active_column {
                                     Column::Flutter => app
                                         .selected_flutter()
@@ -945,78 +919,95 @@ async fn main() -> io::Result<()> {
                                 };
 
                                 if let Some(id) = assoc_id {
-                                    if client.delete_association(&id).await {
-                                        app.set_toast("Unlinked");
-                                        if let Ok(data) = client.fetch_all().await {
-                                            app.data = data;
-                                        }
-                                    } else {
-                                        app.set_toast("Unlink failed");
+                                    {
+                                        let mut assocs = app.shared.associations.write().await;
+                                        assocs.retain(|a| a.id != id);
+                                        save_associations(&app.shared.persistence_path, &assocs);
                                     }
+                                    app.associations = app.shared.associations.read().await.clone();
+                                    app.log("in", format!("Unlinked: {}", id), None, true).await;
+                                    app.sync_log_snapshot().await;
+                                    app.set_toast("Unlinked");
                                 } else {
                                     app.set_toast("No link on this item");
                                 }
                             }
 
                             KeyCode::Char('f') => {
-                                // Focus surface
-                                let sid = match app.active_column {
-                                    Column::Claude => app.selected_surface().map(|s| s.id.clone()),
+                                match app.active_column {
                                     Column::Flutter => {
-                                        app.selected_flutter()
-                                            .and_then(|f| app.assoc_for_flutter(f.pid))
-                                            .map(|a| a.claude_surface_id.clone())
+                                        let device = app
+                                            .selected_flutter()
+                                            .and_then(|f| f.device.clone())
+                                            .unwrap_or_else(|| "chrome".to_string());
+                                        let d = device.clone();
+                                        let ok = tokio::task::spawn_blocking(move || focus_app_by_device(&d))
+                                            .await
+                                            .unwrap_or(false);
+                                        app.log("out", format!("Focus app: {}", device), None, ok).await;
+                                        app.sync_log_snapshot().await;
+                                        app.set_toast(if ok { format!("Focused {}", device) } else { "Focus failed".into() });
                                     }
-                                };
-                                if let Some(id) = sid {
-                                    if client.focus_surface(&id).await {
-                                        app.set_toast("Focused surface");
-                                    } else {
-                                        app.set_toast("Focus failed");
+                                    Column::Claude => {
+                                        let sid = app.selected_surface().map(|s| s.id.clone());
+                                        if let Some(id) = sid {
+                                            let id2 = id.clone();
+                                            let ok = tokio::task::spawn_blocking(move || cmux_focus_surface(&id2))
+                                                .await
+                                                .unwrap_or(false);
+                                            app.log("out", format!("Focus surface {}…", &id[..8.min(id.len())]), None, ok).await;
+                                            app.sync_log_snapshot().await;
+                                            app.set_toast(if ok { "Focused pane" } else { "Focus failed".into() });
+                                        } else {
+                                            app.set_toast("No surface to focus");
+                                        }
                                     }
-                                } else {
-                                    app.set_toast("No surface to focus");
-                                }
-                            }
-
-                            KeyCode::Char('a') => {
-                                // Focus app
-                                let device = app
-                                    .selected_flutter()
-                                    .and_then(|f| f.device.clone())
-                                    .unwrap_or_else(|| "chrome".to_string());
-                                if client.focus_app(&device).await {
-                                    app.set_toast(format!("Focused {}", device));
-                                } else {
-                                    app.set_toast("Focus app failed");
                                 }
                             }
 
                             KeyCode::Char('t') => {
-                                // Test send
                                 if let Some(surface) = app.selected_surface() {
                                     let sid = surface.id.clone();
-                                    if client.test_send(&sid).await {
-                                        app.set_toast("Test sent");
-                                    } else {
-                                        app.set_toast("Test send failed");
-                                    }
+                                    let ok = tokio::task::spawn_blocking(move || {
+                                        cmux_send_text(&sid, "[flan test] hello from flan tui")
+                                    })
+                                    .await
+                                    .unwrap_or(false);
+                                    app.log("out", "Test send".into(), None, ok).await;
+                                    app.sync_log_snapshot().await;
+                                    app.set_toast(if ok { "Test sent" } else { "Test send failed" });
                                 } else {
                                     app.set_toast("Select a Claude surface first");
                                 }
                             }
 
                             KeyCode::Char('x') => {
-                                // Flush
                                 if let Some(flutter) = app.selected_flutter() {
                                     let pid = flutter.pid;
-                                    if client.flush(pid).await {
-                                        app.set_toast("Flushed");
-                                        if let Ok(data) = client.fetch_all().await {
-                                            app.data = data;
-                                        }
+                                    let vm_uri = flutter.vm_service_uri.clone();
+
+                                    let assoc = app.assoc_for_flutter(pid).cloned();
+                                    if let Some(assoc) = assoc {
+                                        let text = match &vm_uri {
+                                            Some(uri) => format!("flan connect to {} and process queue once connected", uri),
+                                            None => "process queue".to_string(),
+                                        };
+                                        let sid = assoc.claude_surface_id.clone();
+                                        let t = text.clone();
+                                        let ok = tokio::task::spawn_blocking(move || {
+                                            if cmux_send_text(&sid, &t) {
+                                                cmux_send_text(&sid, "\n")
+                                            } else {
+                                                false
+                                            }
+                                        })
+                                        .await
+                                        .unwrap_or(false);
+                                        app.log("out", format!("Flush → {}…", &assoc.claude_surface_id[..8]), Some(text), ok).await;
+                                        app.sync_log_snapshot().await;
+                                        app.set_toast(if ok { "Flushed" } else { "Flush failed" });
                                     } else {
-                                        app.set_toast("Flush failed");
+                                        app.set_toast("No association for this Flutter app");
                                     }
                                 } else {
                                     app.set_toast("Select a Flutter app first");
@@ -1026,14 +1017,13 @@ async fn main() -> io::Result<()> {
                             _ => {}
                         }
                     }
-                    Event::Resize(_, _) => {} // terminal.draw handles resize
+                    Event::Resize(_, _) => {}
                     _ => {}
                 }
             }
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
