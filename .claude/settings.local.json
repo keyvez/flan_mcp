@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "mcp__flan__wait_for_user_message",
-      "mcp__flan__connect"
+      "mcp__flan__connect",
+      "mcp__flan__take_screenshots",
+      "mcp__flan__enable_annotations"
     ]
   }
 }

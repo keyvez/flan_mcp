@@ -4,11 +4,11 @@
       "command": "dart",
       "args": [
         "run",
-        "/Users/gaurav/Documents/Code/flutter/flan_mcp/packages/flan_mcp/bin/flan_mcp.dart",
+        "/Users/gaurav/dev/flan_mcp/packages/flan_mcp/bin/flan_mcp_trm.dart",
         "-l",
         "FINEST"
       ],
-      "cwd": "/Users/gaurav/Documents/Code/flutter/flan_mcp"
+      "cwd": "/Users/gaurav/dev/flan_mcp"
     }
   }
 }

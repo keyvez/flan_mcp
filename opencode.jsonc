@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "flan": {
+      "type": "local",
+      "command": [
+        "dart",
+        "run",
+        "/Users/gaurav/dev/flan_mcp/packages/flan_mcp/bin/flan_mcp.dart",
+        "-l",
+        "FINEST"
+      ]
+    }
+  }
+}
