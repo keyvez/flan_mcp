@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 import 'package:flutter/services.dart';
 import 'package:flan_flutter/src/overlay/annotation_painter.dart';
 import 'package:flan_flutter/src/overlay/drawing_painter.dart';
+import 'package:flan_flutter/src/binding/flan_binding.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
 import 'package:flan_flutter/src/services/drawing_service.dart';
 import 'package:flan_flutter/src/services/inspector_service.dart';
@@ -180,6 +181,15 @@ Future<String?> _buildQueueThumbnailFromScreenshot({
     thumbnailImage?.dispose();
     sourceImage?.dispose();
     codec?.dispose();
+  }
+}
+
+/// Returns the current route name from the binding, or null if unavailable.
+String? _currentRouteName() {
+  try {
+    return FlanBinding.instance.getCurrentRouteName();
+  } catch (_) {
+    return null;
   }
 }
 
@@ -731,6 +741,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       widget.userMessageService.clearWaiting();
     }
     final data = <String, dynamic>{'userMessage': text};
+    final routeName = _currentRouteName();
+    if (routeName != null) {
+      data['currentRoute'] = routeName;
+    }
     if (drawingBase64 != null) {
       data['drawingImage'] = drawingBase64;
     }
@@ -754,6 +768,12 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
     final parts = <String>[];
     final data = <String, dynamic>{};
+
+    // Include current route/URL
+    final routeName = _currentRouteName();
+    if (routeName != null) {
+      data['currentRoute'] = routeName;
+    }
 
     // Include inspector selection if available
     final selection = widget.inspectorService.lastSelection;
@@ -1603,6 +1623,12 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
 
     final parts = <String>[];
     final data = <String, dynamic>{};
+
+    // Include current route/URL
+    final routeName = _currentRouteName();
+    if (routeName != null) {
+      data['currentRoute'] = routeName;
+    }
 
     data['inspectorSelection'] = selection.toJson();
     parts.add(

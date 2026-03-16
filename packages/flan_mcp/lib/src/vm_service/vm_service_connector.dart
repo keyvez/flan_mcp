@@ -476,6 +476,18 @@ class VmServiceConnector {
     });
   }
 
+  // --- Navigation methods ---
+
+  /// Gets the current route name from the Flutter app.
+  Future<Map<String, dynamic>> getCurrentRoute() {
+    return _callExtension('flan.getCurrentRoute', {});
+  }
+
+  /// Navigates to the given named route in the Flutter app.
+  Future<Map<String, dynamic>> navigate(String route) {
+    return _callExtension('flan.navigate', {'route': route});
+  }
+
   /// Performs a hot restart of the Flutter app (full state reset).
   ///
   /// Returns true if the restart was successful.

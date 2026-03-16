@@ -952,6 +952,88 @@ final class VmServiceContext {
           }
         },
       )
+      // --- Navigation tools ---
+      ..registerTool(
+        'get_current_route',
+        description:
+            'Returns the current route/URL of the Flutter app. '
+            'This is the named route from the Navigator (e.g. "/", "/settings", "/profile/123"). '
+            'Requires an active connection established via connect.',
+        annotations: const ToolAnnotations(
+          title: 'Get Current Route',
+          readOnlyHint: true,
+          idempotentHint: true,
+        ),
+        inputSchema: const ToolInputSchema(properties: {}),
+        callback: (args, extra) async {
+          _logger.info('Getting current route');
+
+          try {
+            final response = await connector.getCurrentRoute();
+            final route = response['route'] as String?;
+
+            if (route == null) {
+              return CallToolResult(
+                content: [
+                  const TextContent(
+                    text: 'No named route found. The app may use an unnamed '
+                        'or custom router.',
+                  ),
+                ],
+              );
+            }
+
+            return CallToolResult(
+              content: [TextContent(text: 'Current route: $route')],
+            );
+          } catch (err) {
+            _logger.warning('Failed to get current route', err);
+            return CallToolResult(
+              isError: true,
+              content: [TextContent(text: err.toString())],
+            );
+          }
+        },
+      )
+      ..registerTool(
+        'navigate',
+        description:
+            'Navigates the Flutter app to a named route (e.g. "/settings", "/profile/123"). '
+            'This pushes the route onto the Navigator stack. '
+            'The route must be defined in the app\'s route table. '
+            'Requires an active connection established via connect.',
+        annotations: const ToolAnnotations(title: 'Navigate to Route'),
+        inputSchema: ToolInputSchema(
+          properties: {
+            'route': JsonSchema.string(
+              description:
+                  'The named route to navigate to (e.g. "/settings", "/profile/123").',
+            ),
+          },
+          required: ['route'],
+        ),
+        callback: (args, extra) async {
+          final route = args['route'] as String;
+          _logger.info('Navigating to $route');
+
+          try {
+            final response = await connector.navigate(route);
+            final message = response['message'] as String?;
+
+            return CallToolResult(
+              content: [
+                TextContent(text: message ?? 'Navigated to $route'),
+              ],
+            );
+          } catch (err) {
+            _logger.warning('Failed to navigate', err);
+            return CallToolResult(
+              isError: true,
+              content: [TextContent(text: err.toString())],
+            );
+          }
+        },
+      )
       // --- Inspector tools ---
       ..registerTool(
         'enable_inspector',

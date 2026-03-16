@@ -696,6 +696,76 @@ class FlanBinding extends WidgetsFlutterBinding {
       },
     );
 
+    // --- Navigation extensions ---
+
+    registerServiceExtension(
+      name: 'flan.getCurrentRoute',
+      callback: (params) async {
+        try {
+          final element = renderViewElement;
+          if (element == null) {
+            return <String, dynamic>{
+              'status': 'Success',
+              'route': null,
+            };
+          }
+          String? routeName;
+          String? routePath;
+          // Walk the element tree looking for ModalRoute
+          element.visitChildElements(
+            _RouteVisitor((route) {
+              routeName = route.settings.name;
+              routePath = route.settings.name;
+            }).visit,
+          );
+          return <String, dynamic>{
+            'status': 'Success',
+            'route': routeName,
+            'path': routePath,
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
+    registerServiceExtension(
+      name: 'flan.navigate',
+      callback: (params) async {
+        try {
+          final route = params['route'] as String?;
+          if (route == null || route.isEmpty) {
+            return <String, dynamic>{
+              'status': 'Error',
+              'error': 'Missing required parameter: route',
+            };
+          }
+          final navigatorState = _findNavigator();
+          if (navigatorState == null) {
+            return <String, dynamic>{
+              'status': 'Error',
+              'error': 'No Navigator found in the widget tree',
+            };
+          }
+          await navigatorState.pushNamed(route);
+          return <String, dynamic>{
+            'status': 'Success',
+            'message': 'Navigated to $route',
+          };
+        } catch (err, st) {
+          return <String, dynamic>{
+            'status': 'Error',
+            'error': err.toString(),
+            'stackTrace': st.toString(),
+          };
+        }
+      },
+    );
+
     registerServiceExtension(
       name: 'flan.annotationAdd',
       callback: (params) async {
@@ -727,10 +797,54 @@ class FlanBinding extends WidgetsFlutterBinding {
     );
   }
 
+  /// Finds the root Navigator in the widget tree.
+  NavigatorState? _findNavigator() {
+    NavigatorState? found;
+    void visitor(Element element) {
+      if (found != null) return;
+      if (element is StatefulElement && element.state is NavigatorState) {
+        found = element.state as NavigatorState;
+        return;
+      }
+      element.visitChildren(visitor);
+    }
+    renderViewElement?.visitChildElements(visitor);
+    return found;
+  }
+
+  /// Returns the current route name from the deepest active [ModalRoute].
+  String? getCurrentRouteName() {
+    String? routeName;
+    void visitor(Element element) {
+      final route = ModalRoute.of(element);
+      if (route != null) {
+        routeName = route.settings.name;
+      }
+      element.visitChildren(visitor);
+    }
+    renderViewElement?.visitChildElements(visitor);
+    return routeName;
+  }
+
   @override
   Future<void> reassembleApplication() {
     _logCollector.clear();
     _userMessageService.clearWaiting();
     return super.reassembleApplication();
+  }
+}
+
+/// Visitor that finds the deepest [ModalRoute] in the element tree.
+class _RouteVisitor {
+  _RouteVisitor(this.onFound);
+
+  final void Function(ModalRoute<dynamic> route) onFound;
+
+  void visit(Element element) {
+    final route = ModalRoute.of(element);
+    if (route != null) {
+      onFound(route);
+    }
+    element.visitChildren(visit);
   }
 }
