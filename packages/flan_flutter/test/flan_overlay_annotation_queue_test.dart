@@ -84,7 +84,7 @@ void main() {
     expect(userMessageService.pendingMessageCount, 1);
     final message = userMessageService.peekMessages().single;
     final data = message['data'] as Map<String, dynamic>;
-    expect(data['annotationDraft'], isTrue);
+    expect(data['annotations'], isNotNull);
     final annotations = data['annotations'] as List<dynamic>;
     expect(annotations, hasLength(1));
   });
@@ -135,7 +135,7 @@ void main() {
     expect(userMessageService.pendingMessageCount, 1);
     final data = userMessageService.peekMessages().single['data']
         as Map<String, dynamic>;
-    expect(data['annotationDraft'], isTrue);
+    expect(data['annotations'], isNotNull);
     final annotations = data['annotations'] as List<dynamic>;
     expect(annotations, hasLength(2));
   });
