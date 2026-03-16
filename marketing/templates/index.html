@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+
+{% block title %}Flan MCP - Runtime Collaboration for Flutter + AI{% endblock title %}
+
+{% block content %}
+<section class="hero">
+  <div class="hero-copy">
+    <p class="kicker">Runtime feedback loop for Flutter</p>
+    <h1>Point. Annotate. Ship.</h1>
+    <p class="lede">
+      Flan MCP connects your coding agent to a live Flutter app. Your agent can tap,
+      inspect, and hot reload. You can point at widgets, draw annotations, and send
+      precise instructions directly from inside the app.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="{{ config.extra.repo_url }}" target="_blank" rel="noreferrer">Get Started on GitHub</a>
+      <a class="btn btn-ghost" href="#workflow">See the Flow</a>
+    </div>
+    <div class="proof">
+      <span>Works with Cursor</span>
+      <span>Claude Code</span>
+      <span>Copilot</span>
+      <span>Gemini CLI</span>
+    </div>
+  </div>
+  <div class="hero-card" aria-label="terminal demo">
+    <p class="line prompt">$ flutter run</p>
+    <p class="line">This app is linked to the debug service:</p>
+    <p class="line highlight">ws://127.0.0.1:52794/N2Tizytts-E=/ws</p>
+    <p class="line prompt">$ flan.connect "ws://127.0.0.1:52794/N2Tizytts-E=/ws"</p>
+    <p class="line ok">[ok] Agent connected</p>
+    <p class="line prompt">$ flan.process_queue</p>
+    <p class="line">Waiting for in-app message...</p>
+  </div>
+</section>
+
+<section id="features" class="section notable-features">
+  <h2>Notable features</h2>
+  <p class="section-lede">
+    Flan MCP is built for fast, low-friction UI iteration between a developer and an agent.
+  </p>
+  <div class="grid cards-3">
+    <article class="card notable-card">
+      <p class="feature-pill">Runtime Control</p>
+      <h3>Drive the live app from tools</h3>
+      <p>Call <code>tap</code>, <code>enter_text</code>, and <code>scroll_to</code> to execute real user flows without adding Flutter Driver instrumentation.</p>
+    </article>
+    <article class="card notable-card">
+      <p class="feature-pill">Widget Precision</p>
+      <h3>Inspect exact widgets by coordinates</h3>
+      <p>Use <code>inspect_widget_at</code> to get widget type, path, bounds, and source location at a screen point with much lower token cost than screenshots.</p>
+    </article>
+    <article class="card notable-card">
+      <p class="feature-pill">In-App Feedback</p>
+      <h3>Send intent from inside the app</h3>
+      <p>The overlay lets developers point at widgets, annotate issues, and provide instructions in context instead of describing UI bugs from memory.</p>
+    </article>
+    <article class="card notable-card">
+      <p class="feature-pill">Queued Messaging</p>
+      <h3>Never lose a message</h3>
+      <p>User instructions are queued with timestamps and can be consumed via <code>get_user_message</code> or batch-drained using <code>process_queue</code>.</p>
+    </article>
+    <article class="card notable-card">
+      <p class="feature-pill">Tight Edit Loop</p>
+      <h3>Edit, hot reload, verify</h3>
+      <p>After a patch, call <code>hot_reload</code> and re-check the same coordinates to validate behavior quickly and keep momentum high.</p>
+    </article>
+    <article class="card notable-card">
+      <p class="feature-pill">Tooling Fit</p>
+      <h3>Works with major coding agents</h3>
+      <p>Integrates with Cursor, Claude Code, Copilot, and Gemini CLI over a simple stdio MCP setup.</p>
+    </article>
+  </div>
+</section>
+
+<section id="demo" class="section">
+  <h2>Recorded End-to-End Flow</h2>
+  <p class="demo-lede">Live capture of a developer annotation, agent context pickup, patch, and hot reload.</p>
+  <div class="demo-video-shell">
+    <iframe
+      class="demo-video-embed"
+      src="{{ get_url(path='remotion-player/player.html') }}"
+      title="Flan MCP Remotion player embed"
+      loading="lazy"
+      allow="autoplay; fullscreen; picture-in-picture"
+      allowfullscreen
+    ></iframe>
+  </div>
+</section>
+
+<section id="workflow" class="section workflow">
+  <h2>A practical feedback loop</h2>
+  <ol class="steps">
+    <li>
+      <h3>Connect to live debug session</h3>
+      <p>Copy the <code>ws://.../ws</code> URL from <code>flutter run</code> output and call <code>connect</code>.</p>
+    </li>
+    <li>
+      <h3>Wait for developer intent</h3>
+      <p>Run <code>process_queue</code> and consume the queued batch with real widget and screen-coordinate context.</p>
+    </li>
+    <li>
+      <h3>Edit, reload, verify</h3>
+      <p>Make code changes, then automatically run <code>hot_reload</code>. After reload, validate using <code>inspect_widget_at</code> on the same coordinates.</p>
+      <p><code>Agent instruction:</code> after every successful code edit, call <code>hot_reload</code> without waiting for a separate user prompt.</p>
+    </li>
+  </ol>
+</section>
+
+<section id="tools" class="section">
+  <h2>Core toolset</h2>
+  <div class="grid cards-2">
+    <article class="card">
+      <h3>Interaction</h3>
+      <ul>
+        <li><code>tap</code></li>
+        <li><code>enter_text</code></li>
+        <li><code>scroll_to</code></li>
+        <li><code>take_screenshots</code></li>
+      </ul>
+    </article>
+    <article class="card">
+      <h3>Collaboration</h3>
+      <ul>
+        <li><code>inspect_widget_at</code></li>
+        <li><code>process_queue</code></li>
+        <li><code>get_user_message</code></li>
+        <li><code>enable_annotations</code></li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+<section class="section cta-band">
+  <h2>Replace guesswork with visual intent.</h2>
+  <p>Flan MCP closes the gap between &quot;what I meant&quot; and &quot;what shipped.&quot;</p>
+  <a class="btn btn-primary" href="{{ config.extra.repo_url }}" target="_blank" rel="noreferrer">Start Integrating Flan MCP</a>
+</section>
+{% endblock content %}

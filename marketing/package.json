@@ -1,0 +1,14 @@
+{
+  "name": "flan-mcp-marketing",
+  "private": true,
+  "scripts": {
+    "sync:player": "npm --prefix video run player:build && rm -rf static/remotion-player && mkdir -p static/remotion-player && cp -R video/out/player/. static/remotion-player/",
+    "dev": "npm run sync:player && zola serve --interface 0.0.0.0 --port 1111",
+    "build": "npm run sync:player && zola build",
+    "preview:worker": "wrangler dev",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

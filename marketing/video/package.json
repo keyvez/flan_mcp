@@ -1,0 +1,33 @@
+{
+  "name": "video",
+  "version": "1.0.0",
+  "description": "My Remotion video",
+  "repository": {},
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "@remotion/cli": "4.0.423",
+    "@remotion/player": "^4.0.423",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "remotion": "4.0.423"
+  },
+  "devDependencies": {
+    "@remotion/eslint-config-flat": "4.0.423",
+    "@types/react": "19.2.7",
+    "@types/web": "0.0.166",
+    "@vitejs/plugin-react": "^5.1.4",
+    "eslint": "9.19.0",
+    "prettier": "3.6.0",
+    "typescript": "5.9.3",
+    "vite": "^7.3.1"
+  },
+  "scripts": {
+    "dev": "remotion studio",
+    "build": "remotion bundle",
+    "upgrade": "remotion upgrade",
+    "lint": "eslint src && tsc",
+    "player:dev": "vite --config vite.config.mjs",
+    "player:build": "vite build --config vite.config.mjs --outDir out/player"
+  }
+}
