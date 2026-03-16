@@ -3,10 +3,26 @@ import 'dart:io';
 
 import 'package:args/args.dart';
 import 'package:logging/logging.dart' as logging;
+import 'package:flan_mcp/src/cmux_pane_bridge.dart';
 import 'package:flan_mcp/src/compat/copilot_stdio_server_transport.dart';
+import 'package:flan_mcp/src/trm_pane_bridge.dart';
 import 'package:flan_mcp/src/version.g.dart';
 import 'package:flan_mcp/src/vm_service/vm_service_context.dart';
 import 'package:mcp_dart/mcp_dart.dart';
+
+const _instructions = '''
+Flan MCP enables AI agents to interact with Flutter apps running in debug mode. It provides tools to inspect UI elements, tap buttons, enter text, scroll, take screenshots, retrieve logs, and perform hot reloads.
+
+Usage:
+1. Start the Flutter app in debug mode and note the VM service URI (e.g., ws://127.0.0.1:8181/ws).
+2. Use the "connect" tool with the VM service URI to establish a connection.
+3. Use "get_interactive_elements" to discover available UI elements.
+4. Interact with elements using "tap", "enter_text", or "scroll_to" tools.
+5. Use "take_screenshots" to see the current app state and "get_logs" to debug issues.
+6. Use "hot_reload" after making code changes to reload the app without losing state.
+
+Important: Elements are matched by their key (ValueKey<String>) or text content. Keys are more reliable. If you cannot locate a widget, you may need to add a ValueKey to it in the Flutter source code. For example: `ElevatedButton(key: ValueKey('submit_button'), ...)`.
+''';
 
 ArgParser buildParser() {
   return ArgParser()
@@ -28,8 +44,15 @@ ArgParser buildParser() {
       help: 'Path to log file. If not set, logs to stderr.',
     )
     ..addOption(
+      'port',
+      abbr: 'p',
+      help: 'Port for Streamable HTTP server. Each client gets an independent '
+          'session with its own Flutter app connection.',
+    )
+    ..addOption(
       'sse-port',
-      help: 'Port for SSE server. If not set, uses stdio transport.',
+      help: 'Port for SSE server (legacy, single session). '
+          'Prefer --port for multi-session support.',
     );
 }
 
@@ -41,6 +64,62 @@ void printUsage(ArgParser argParser) {
     ..writeln()
     ..writeln('Options:')
     ..writeln(argParser.usage);
+}
+
+/// Creates a fresh McpServer + VmServiceContext pair.
+/// Each call returns an independent session.
+({McpServer server, VmServiceContext vmService}) createSession({
+  TrmPaneBridge? bridge,
+  CmuxPaneBridge? cmuxBridge,
+}) {
+  final logger = logging.Logger('main');
+  final vmService = VmServiceContext();
+
+  final server = McpServer(
+    const Implementation(name: 'flan-mcp', version: version),
+    options: McpServerOptions(
+      capabilities: ServerCapabilities(
+        tools: const ServerCapabilitiesTools(),
+        resources: const ServerCapabilitiesResources(
+          subscribe: true,
+          listChanged: true,
+        ),
+        logging: const <String, dynamic>{},
+      ),
+      instructions: _instructions,
+    ),
+  );
+
+  vmService.registerTools(server);
+
+  if (bridge != null || cmuxBridge != null) {
+    final registeredCallback = vmService.connector.onUserMessageQueued;
+    vmService.connector.onUserMessageQueued = () {
+      registeredCallback?.call();
+      if (bridge != null) {
+        unawaited(() async {
+          try {
+            await bridge.sendProcessQueue();
+          } catch (err) {
+            logger.fine('TrmPaneBridge send failed: $err');
+          }
+        }());
+      }
+      if (cmuxBridge != null) {
+        unawaited(() async {
+          try {
+            await cmuxBridge.sendProcessQueue(
+              vmService.connector.connectedUri,
+            );
+          } catch (err) {
+            logger.fine('CmuxPaneBridge send failed: $err');
+          }
+        }());
+      }
+    };
+  }
+
+  return (server: server, vmService: vmService);
 }
 
 Future<int> main(List<String> arguments) async {
@@ -59,46 +138,45 @@ Future<int> main(List<String> arguments) async {
 
     final logLevelName = (results.option('log-level') ?? 'INFO').toUpperCase();
     final logFile = results.option('log-file');
+    final portStr = results.option('port');
+    final port = portStr != null ? int.tryParse(portStr) : null;
     final ssePortStr = results.option('sse-port');
     final ssePort = ssePortStr != null ? int.tryParse(ssePortStr) : null;
 
     setupLogging(logLevelName, logFile);
 
-    final vmService = VmServiceContext();
+    final logger = logging.Logger('main');
 
-    final server = McpServer(
-      const Implementation(name: 'flan-mcp', version: version),
-      options: McpServerOptions(
-        capabilities: ServerCapabilities(
-          tools: const ServerCapabilitiesTools(),
-          resources: const ServerCapabilitiesResources(
-            subscribe: true,
-            listChanged: true,
-          ),
-          logging: const <String, dynamic>{},
-        ),
-        instructions: '''
-Flan MCP enables AI agents to interact with Flutter apps running in debug mode. It provides tools to inspect UI elements, tap buttons, enter text, scroll, take screenshots, retrieve logs, and perform hot reloads.
+    // --- Best-effort trm Text Tap bridge ---
+    TrmPaneBridge? bridge;
+    try {
+      bridge = TrmPaneBridge();
+      await bridge.connect();
+      logger.info('Connected to trm Text Tap socket');
+    } catch (err) {
+      logger.fine('trm socket not available (not running in trm?): $err');
+      bridge = null;
+    }
 
-Usage:
-1. Start the Flutter app in debug mode and note the VM service URI (e.g., ws://127.0.0.1:8181/ws).
-2. Use the "connect" tool with the VM service URI to establish a connection.
-3. Use "get_interactive_elements" to discover available UI elements.
-4. Interact with elements using "tap", "enter_text", or "scroll_to" tools.
-5. Use "take_screenshots" to see the current app state and "get_logs" to debug issues.
-6. Use "hot_reload" after making code changes to reload the app without losing state.
+    // --- Best-effort cmux bridge ---
+    CmuxPaneBridge? cmuxBridge;
+    try {
+      cmuxBridge = CmuxPaneBridge();
+      await cmuxBridge.connect();
+      logger.info('Connected to cmux socket');
+    } catch (err) {
+      logger.fine('cmux socket not available (not running in cmux?): $err');
+      cmuxBridge = null;
+    }
 
-Important: Elements are matched by their key (ValueKey<String>) or text content. Keys are more reliable. If you cannot locate a widget, you may need to add a ValueKey to it in the Flutter source code. For example: `ElevatedButton(key: ValueKey('submit_button'), ...)`.
-''',
-      ),
-    );
-
-    vmService.registerTools(server);
-
-    if (ssePort != null) {
-      return await runSseServer(server, ssePort);
+    if (port != null) {
+      return await runStreamableServer(port, bridge, cmuxBridge);
+    } else if (ssePort != null) {
+      final session = createSession(bridge: bridge, cmuxBridge: cmuxBridge);
+      return await runSseServer(session.server, ssePort, bridge, cmuxBridge);
     } else {
-      return await runStdioServer(server);
+      final session = createSession(bridge: bridge, cmuxBridge: cmuxBridge);
+      return await runStdioServer(session.server, bridge, cmuxBridge);
     }
   } on FormatException catch (e) {
     stderr
@@ -143,10 +221,10 @@ String _formatTime(DateTime time) {
       '${time.second.toString().padLeft(2, '0')}';
 }
 
-Future<int> runStdioServer(McpServer server) async {
+Future<int> runStdioServer(
+    McpServer server, TrmPaneBridge? bridge, CmuxPaneBridge? cmuxBridge) async {
   final logger = logging.Logger('main');
 
-  // Use a stdio transport with small compatibility fixes for clients like Copilot.
   final transport = CopilotCompatStdioServerTransport();
 
   try {
@@ -161,13 +239,20 @@ Future<int> runStdioServer(McpServer server) async {
   final signal = await _ExitSignal().wait;
   logger.info('Received ${signal.name}, stopping');
 
+  await bridge?.close();
+  await cmuxBridge?.close();
   await server.close();
   await transport.close();
   logger.info('Stopped');
   return 0;
 }
 
-Future<int> runSseServer(McpServer server, int ssePort) async {
+Future<int> runSseServer(
+  McpServer server,
+  int ssePort,
+  TrmPaneBridge? bridge,
+  CmuxPaneBridge? cmuxBridge,
+) async {
   final logger = logging.Logger('main');
   final sseServerManager = SseServerManager(server);
   try {
@@ -188,6 +273,8 @@ Future<int> runSseServer(McpServer server, int ssePort) async {
     }
 
     logger.info('Stopping');
+    await bridge?.close();
+    await cmuxBridge?.close();
     await server.close();
   } catch (e, st) {
     logger.severe('Error when waiting for MCP client connection', e, st);
@@ -198,9 +285,62 @@ Future<int> runSseServer(McpServer server, int ssePort) async {
   return 0;
 }
 
+Future<int> runStreamableServer(
+    int port, TrmPaneBridge? bridge, CmuxPaneBridge? cmuxBridge) async {
+  final logger = logging.Logger('main');
+  final sessions = <String, VmServiceContext>{};
+
+  final streamableServer = StreamableMcpServer(
+    serverFactory: (sessionId) {
+      logger.info('Creating session $sessionId');
+      final session = createSession(bridge: bridge, cmuxBridge: cmuxBridge);
+      sessions[sessionId] = session.vmService;
+
+      // Clean up VM service connection when the session closes.
+      session.server.server.onclose = () {
+        final vmService = sessions.remove(sessionId);
+        if (vmService != null) {
+          logger.info('Disposing session $sessionId');
+          unawaited(vmService.dispose());
+        }
+      };
+
+      return session.server;
+    },
+    host: 'localhost',
+    port: port,
+    path: '/mcp',
+  );
+
+  try {
+    await streamableServer.start();
+    logger.info(
+      'Streamable HTTP server listening on http://localhost:$port/mcp',
+    );
+  } catch (e, st) {
+    logger.severe('Error starting Streamable HTTP server', e, st);
+    return 1;
+  }
+
+  final signal = await _ExitSignal().wait;
+  logger.info('Received ${signal.name}, stopping');
+
+  // Dispose all active sessions.
+  for (final entry in sessions.entries) {
+    logger.info('Disposing session ${entry.key}');
+    await entry.value.dispose();
+  }
+  sessions.clear();
+
+  await streamableServer.stop();
+  await bridge?.close();
+  await cmuxBridge?.close();
+  logger.info('Stopped');
+  return 0;
+}
+
 class _ExitSignal {
   _ExitSignal() {
-    // SIGTERM is not supported on Windows, only listen on non-Windows platforms
     if (!Platform.isWindows) {
       _sigtermSubscription = ProcessSignal.sigterm.watch().listen(
         _handleSignal,
