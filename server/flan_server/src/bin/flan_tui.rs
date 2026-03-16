@@ -131,6 +131,7 @@ struct App {
     flutter_apps: Vec<FlutterApp>,
     cmux_surfaces: Vec<CmuxSurface>,
     associations: Vec<Association>,
+    desktop_target: Option<DesktopTarget>,
     /// Snapshot of shared log for rendering (avoids async read during draw)
     log_snapshot: Vec<LogEntry>,
 
@@ -150,6 +151,7 @@ impl App {
             flutter_apps: Vec::new(),
             cmux_surfaces: Vec::new(),
             associations: Vec::new(),
+            desktop_target: None,
             log_snapshot: Vec::new(),
 
             active_column: Column::Flutter,
@@ -228,14 +230,20 @@ impl App {
     }
 
     async fn refresh(&mut self) {
-        let (flutter, surfaces) = tokio::task::spawn_blocking(|| {
-            (discover_flutter_apps(), cmux_surface_list())
+        let (flutter, surfaces, desktop) = tokio::task::spawn_blocking(|| {
+            (discover_flutter_apps(), cmux_surface_list(), discover_desktop_target())
         })
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|_| (Vec::new(), Vec::new(), DesktopTarget {
+            alive: false,
+            socket_path: desktop_bridge::floss_socket_path().to_string_lossy().to_string(),
+            version: None,
+        }));
 
         self.flutter_apps = flutter.clone();
         self.cmux_surfaces = surfaces;
+        self.desktop_target = if desktop.alive { Some(desktop.clone()) } else { None };
+        *self.shared.desktop_cache.write().await = Some((Instant::now(), desktop));
 
         // Prune stale associations where the Flutter process is gone
         let mut assocs = load_associations(&self.shared.persistence_path);
@@ -372,9 +380,15 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    let desktop_str = if app.desktop_target.is_some() {
+        "● desktop"
+    } else {
+        "○ desktop"
+    };
+
     let status = format!(
-        "● {} flutter · {} claude · {} linked · :{} ",
-        flutter_count, claude_count, link_count, app.port
+        "{} · ● {} flutter · {} claude · {} linked · :{} ",
+        desktop_str, flutter_count, claude_count, link_count, app.port
     );
 
     let status_width = status.len() as u16;

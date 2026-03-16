@@ -10,6 +10,8 @@ use std::{
 };
 use tokio::sync::RwLock;
 
+pub mod desktop_bridge;
+
 // ── Models ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +46,14 @@ pub struct Association {
     pub flutter_pid: u32,
 }
 
+/// Represents the floss desktop agent (system-wide interaction target).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopTarget {
+    pub alive: bool,
+    pub socket_path: String,
+    pub version: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
     pub timestamp: String,
@@ -62,6 +72,7 @@ pub struct SharedState {
     pub persistence_path: PathBuf,
     pub claude_cache: RwLock<Option<(Instant, Vec<ClaudeProcess>)>>,
     pub flutter_cache: RwLock<Option<(Instant, Vec<FlutterApp>)>>,
+    pub desktop_cache: RwLock<Option<(Instant, DesktopTarget)>>,
     pub activity_log: RwLock<VecDeque<LogEntry>>,
 }
 
@@ -74,6 +85,7 @@ impl SharedState {
             persistence_path,
             claude_cache: RwLock::new(None),
             flutter_cache: RwLock::new(None),
+            desktop_cache: RwLock::new(None),
             activity_log: RwLock::new(VecDeque::new()),
         }
     }
@@ -124,6 +136,8 @@ mod server {
     struct FlushRequest {
         flutter_pid: Option<u32>,
         vm_service_uri: Option<String>,
+        /// "desktop" to route to floss instead of Flutter VM service.
+        mode: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -174,6 +188,30 @@ mod server {
             .unwrap_or_default();
         *state.flutter_cache.write().await = Some((Instant::now(), apps.clone()));
         Json(apps)
+    }
+
+    async fn get_desktop_target(
+        State(state): State<Arc<SharedState>>,
+    ) -> Json<DesktopTarget> {
+        {
+            let cache = state.desktop_cache.read().await;
+            if let Some((ts, ref data)) = *cache {
+                if ts.elapsed() < Duration::from_secs(5) {
+                    return Json(data.clone());
+                }
+            }
+        }
+        let target = tokio::task::spawn_blocking(discover_desktop_target)
+            .await
+            .unwrap_or_else(|_| DesktopTarget {
+                alive: false,
+                socket_path: desktop_bridge::floss_socket_path()
+                    .to_string_lossy()
+                    .to_string(),
+                version: None,
+            });
+        *state.desktop_cache.write().await = Some((Instant::now(), target.clone()));
+        Json(target)
     }
 
     async fn get_cmux_surfaces() -> Json<Vec<CmuxSurface>> {
@@ -299,23 +337,33 @@ mod server {
             );
         };
 
-        let vm_uri = body.vm_service_uri.clone().or_else(|| {
-            let flutter_pid = assoc.as_ref().map(|a| a.flutter_pid)?;
-            if let Ok(cache) = state.flutter_cache.try_read() {
-                if let Some((_, ref apps)) = *cache {
-                    if let Some(app) = apps.iter().find(|a| a.pid == flutter_pid) {
-                        return app.vm_service_uri.clone();
+        // Desktop mode: tell Claude to connect in desktop mode instead of Flutter
+        let is_desktop = body.mode.as_deref() == Some("desktop")
+            || (body.flutter_pid.is_none()
+                && body.vm_service_uri.is_none()
+                && desktop_bridge::floss_is_alive());
+
+        let text = if is_desktop {
+            "flan connect --mode desktop and process queue once connected".to_string()
+        } else {
+            let vm_uri = body.vm_service_uri.clone().or_else(|| {
+                let flutter_pid = assoc.as_ref().map(|a| a.flutter_pid)?;
+                if let Ok(cache) = state.flutter_cache.try_read() {
+                    if let Some((_, ref apps)) = *cache {
+                        if let Some(app) = apps.iter().find(|a| a.pid == flutter_pid) {
+                            return app.vm_service_uri.clone();
+                        }
                     }
                 }
-            }
-            probe_vm_service_uri(flutter_pid)
-        });
+                probe_vm_service_uri(flutter_pid)
+            });
 
-        let text = match &vm_uri {
-            Some(uri) => {
-                format!("flan connect to {} and process queue once connected", uri)
+            match &vm_uri {
+                Some(uri) => {
+                    format!("flan connect to {} and process queue once connected", uri)
+                }
+                None => "process queue".to_string(),
             }
-            None => "process queue".to_string(),
         };
 
         let t = text.clone();
@@ -455,6 +503,7 @@ mod server {
     async fn handle_rescan(State(state): State<Arc<SharedState>>) -> impl IntoResponse {
         *state.claude_cache.write().await = None;
         *state.flutter_cache.write().await = None;
+        *state.desktop_cache.write().await = None;
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     }
 
@@ -487,6 +536,7 @@ mod server {
             .route("/", get(serve_ui))
             .route("/api/claude-processes", get(get_claude_processes))
             .route("/api/flutter-apps", get(get_flutter_apps))
+            .route("/api/desktop-target", get(get_desktop_target))
             .route("/api/cmux-surfaces", get(get_cmux_surfaces))
             .route(
                 "/api/associations",
@@ -807,6 +857,34 @@ pub fn probe_port(port: u16) -> Option<String> {
     }
 
     None
+}
+
+// ── Discovery: Floss Desktop ──────────────────────────────────────────
+
+pub fn discover_desktop_target() -> DesktopTarget {
+    let socket_path = desktop_bridge::floss_socket_path()
+        .to_string_lossy()
+        .to_string();
+
+    let result = desktop_bridge::floss_rpc("flan.ping", serde_json::json!({}));
+    match result {
+        Some(resp) => {
+            let version = resp
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            DesktopTarget {
+                alive: true,
+                socket_path,
+                version,
+            }
+        }
+        None => DesktopTarget {
+            alive: false,
+            socket_path,
+            version: None,
+        },
+    }
 }
 
 // ── cmux ────────────────────────────────────────────────────────────────
