@@ -1,0 +1,7 @@
+title = "flan_mcp example"
+rows = 1
+cols = 1
+
+[[panes]]
+title = "example"
+cwd = "/Users/gaurav/dev/flan_mcp/example"
