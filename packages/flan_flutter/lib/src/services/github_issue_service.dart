@@ -10,24 +10,31 @@ class GitHubIssueService {
 
   static String? _endpointUrl;
   static Map<String, String> Function()? _headersBuilder;
+  static Map<String, String>? _userInfo;
 
   /// Whether the issue endpoint has been configured.
   static bool get isConfigured =>
       _endpointUrl != null && _headersBuilder != null;
 
   /// Configures the backend endpoint and auth headers builder.
+  ///
+  /// [userInfo] is an optional map of user details (e.g. `{'name': '...', 'email': '...'}`).
+  /// When provided, these details are included in the issue payload.
   static void configure({
     required String url,
     required Map<String, String> Function() headersBuilder,
+    Map<String, String>? userInfo,
   }) {
     _endpointUrl = url;
     _headersBuilder = headersBuilder;
+    _userInfo = userInfo;
   }
 
   /// Clears the configured endpoint (e.g. on logout).
   static void reset() {
     _endpointUrl = null;
     _headersBuilder = null;
+    _userInfo = null;
   }
 
   /// Creates a GitHub issue from a list of queued messages.
@@ -48,21 +55,15 @@ class GitHubIssueService {
       'first data keys: ${(messages.firstOrNull?['data'] as Map?)?.keys.toList()}',
     );
 
-    // Filter out annotation drafts for the issue body/title.
-    final filtered = messages.where((m) {
-      final data = m['data'] as Map<String, dynamic>?;
-      return data?['annotationDraft'] != true;
-    }).toList(growable: false);
-    final effective = filtered.isNotEmpty ? filtered : messages;
-
-    final title = _buildTitle(effective);
-    final body = _buildBody(effective);
+    final title = _buildTitle(messages);
+    final body = _buildBody(messages);
 
     final payload = <String, dynamic>{
       'title': title,
       'body': body,
       'labels': ['flan', 'dev-site'],
       'screenshots': screenshots,
+      if (_userInfo != null) 'createdBy': _userInfo,
     };
 
     final headers = {
@@ -107,7 +108,7 @@ class GitHubIssueService {
       ..writeln('```')
       ..writeln()
       ..writeln(
-        '_Created automatically by flan on '
+        '_Created automatically by ${_userInfo?['name'] ?? 'flan'} via flan on '
         '${DateTime.now().toIso8601String()}_',
       );
 
@@ -116,6 +117,7 @@ class GitHubIssueService {
       'body': body.toString(),
       'labels': ['flan', 'dev-site', 'bug'],
       'screenshots': <Map<String, dynamic>>[],
+      if (_userInfo != null) 'createdBy': _userInfo,
     };
 
     final headers = {
@@ -246,8 +248,9 @@ class GitHubIssueService {
     }
 
     buf.writeln('---');
+    final createdBy = _userInfo?['name'] ?? 'flan';
     buf.writeln(
-      '_Created by flan on '
+      '_Created by $createdBy via flan on '
       '${DateTime.now().toIso8601String()}_',
     );
 

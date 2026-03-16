@@ -79,9 +79,6 @@ class ScreenshotService {
   }) async {
     // ignore: invalid_use_of_protected_member
     if (view.layer == null) {
-      debugPrint(
-        'ScreenshotService: Layer is null. Scheduling frame.',
-      );
       // Schedule a frame to ensure the layer tree is built and painted.
       WidgetsBinding.instance.scheduleFrame();
       // Wait for the frame to likely complete.
@@ -91,16 +88,12 @@ class ScreenshotService {
     // ignore: invalid_use_of_protected_member
     final layer = view.layer;
     if (layer == null) {
-      debugPrint(
-        'ScreenshotService: Skipping view: Layer is null after delay.',
-      );
       return null;
     }
 
     // Get physical size for accurate rendering from the corresponding FlutterView.
     final size = flutterView.physicalSize;
     if (size.isEmpty) {
-      debugPrint('ScreenshotService: Skipping view: Physical size is empty.');
       return null;
     }
 
@@ -123,9 +116,6 @@ class ScreenshotService {
       final height = size.height.ceil();
 
       if (width <= 0 || height <= 0) {
-        debugPrint(
-          'ScreenshotService: Skipping view: Invalid image dimensions ($width x $height).',
-        );
         return null; // scene will be disposed in finally
       }
 
@@ -151,20 +141,11 @@ class ScreenshotService {
 
       if (byteData != null) {
         final pngBytes = byteData.buffer.asUint8List();
-        debugPrint(
-          'ScreenshotService: Successfully captured screenshot '
-          '(${pngBytes.lengthInBytes} bytes).',
-        );
         return base64Encode(pngBytes);
       } else {
-        debugPrint(
-          'ScreenshotService: Failed to get byte data for screenshot.',
-        );
         return null;
       }
-    } catch (e, stackTrace) {
-      debugPrint('ScreenshotService: Error capturing screenshot: $e');
-      debugPrintStack(stackTrace: stackTrace);
+    } catch (_) {
       return null;
     } finally {
       // Dispose image immediately after use.
@@ -249,13 +230,8 @@ class ScreenshotService {
       if (byteData == null) return null;
 
       final pngBytes = byteData.buffer.asUint8List();
-      debugPrint(
-        'ScreenshotService: Captured boundary screenshot '
-        '(${pngBytes.lengthInBytes} bytes).',
-      );
       return base64Encode(pngBytes);
-    } catch (e) {
-      debugPrint('ScreenshotService: Boundary capture failed: $e');
+    } catch (_) {
       return null;
     } finally {
       if (resizedImage != null && resizedImage != image) {
