@@ -39,11 +39,10 @@ void main() {
     );
 
     test(
-      'emits sampling/createMessage request when sampling_push is enabled',
+      'emits sampling/createMessage request when client supports sampling',
       () async {
         final connector = _FakeVmServiceConnector();
-        final context = VmServiceContext(connector: connector)
-          ..debugSetSamplingPushEnabled(true);
+        final context = VmServiceContext(connector: connector);
         final server = _buildServer();
         context.registerTools(server);
 

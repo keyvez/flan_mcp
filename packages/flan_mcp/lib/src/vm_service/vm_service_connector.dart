@@ -52,6 +52,7 @@ class VmServiceConnector {
   final logging.Logger _logger;
   VmService? _service;
   String? _isolateId;
+  String? _connectedUri;
   StreamSubscription<Event>? _serviceEventSubscription;
   StreamSubscription<Event>? _extensionEventSubscription;
 
@@ -63,6 +64,9 @@ class VmServiceConnector {
   /// WebSocket close). Set by [VmServiceContext] to clean up state.
   void Function()? onDisconnect;
 
+  /// Called when a Flutter app is successfully connected via [connect].
+  void Function()? onConnect;
+
   /// Called when the Flutter app emits a user-message-queued extension event.
   void Function()? onUserMessageQueued;
 
@@ -71,6 +75,9 @@ class VmServiceConnector {
 
   /// Returns true if currently connected to a VM service.
   bool get isConnected => _service != null && _isolateId != null;
+
+  /// The VM service URI that was used to connect, or null if not connected.
+  String? get connectedUri => _connectedUri;
 
   /// Connects to a VM service at the given URI.
   ///
@@ -99,6 +106,7 @@ class VmServiceConnector {
             _extensionEventSubscription = null;
             _service = null;
             _isolateId = null;
+            _connectedUri = null;
             _registeredServices.clear();
             _pendingServiceRequests.clear();
             onDisconnect?.call();
@@ -145,7 +153,9 @@ class VmServiceConnector {
       await _service!.streamListen(EventStreams.kExtension);
 
       _isolateId = await _findIsolateWithFlanExtensions();
+      _connectedUri = uri;
       _logger.info('Connected to isolate: $_isolateId');
+      onConnect?.call();
     } catch (err) {
       await _serviceEventSubscription?.cancel();
       await _extensionEventSubscription?.cancel();
@@ -153,6 +163,7 @@ class VmServiceConnector {
       _extensionEventSubscription = null;
       _service = null;
       _isolateId = null;
+      _connectedUri = null;
       _logger.severe('Failed to connect to VM service', err);
       rethrow;
     }
@@ -169,6 +180,7 @@ class VmServiceConnector {
       await _service!.dispose();
       _service = null;
       _isolateId = null;
+      _connectedUri = null;
       _registeredServices.clear();
       _pendingServiceRequests.clear();
       _logger.fine('Disconnected');

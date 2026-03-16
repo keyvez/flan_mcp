@@ -37,8 +37,19 @@ final class VmServiceContext {
   DateTime? _lastMessageReceivedAt;
   int _lastKnownAppPendingCount = 0;
   int _drainGeneration = 0;
-  bool _enableSamplingPush = false;
   DateTime? _lastSamplingPushAt;
+
+  /// Cleans up all state: cancels timers, clears buffers, disconnects VM service.
+  Future<void> dispose() async {
+    _stopAgentListeningHeartbeat();
+    _isProcessingQueue = false;
+    _isDrainingMessages = false;
+    _drainRequested = false;
+    _bufferedMessages.clear();
+    _messageArrived?.complete();
+    _messageArrived = null;
+    await connector.disconnect();
+  }
 
   void _onUserMessageQueued() {
     unawaited(_refreshPendingQueueAndNotify(origin: 'extension-event'));
@@ -172,7 +183,7 @@ final class VmServiceContext {
   }
 
   void _maybeTriggerSamplingPush(List<Map<String, dynamic>> newMessages) {
-    if (!_enableSamplingPush || _isProcessingQueue) {
+    if (_isProcessingQueue) {
       return;
     }
 
@@ -229,7 +240,7 @@ final class VmServiceContext {
   }
 
   void _maybeTriggerSamplingPushForPendingCount(int pendingCount) {
-    if (!_enableSamplingPush || _isProcessingQueue || pendingCount <= 0) {
+    if (_isProcessingQueue || pendingCount <= 0) {
       return;
     }
 
@@ -281,10 +292,6 @@ final class VmServiceContext {
 
   int get debugBufferedMessageCount => _bufferedMessages.length;
 
-  void debugSetSamplingPushEnabled(bool enabled) {
-    _enableSamplingPush = enabled;
-  }
-
   void _startAgentListeningHeartbeat() {
     _agentListeningHeartbeat?.cancel();
     _agentListeningHeartbeat = Timer.periodic(const Duration(seconds: 2), (_) {
@@ -312,7 +319,6 @@ final class VmServiceContext {
     _drainRequested = false;
     _isProcessingQueue = false;
     _lastKnownAppPendingCount = 0;
-    _enableSamplingPush = false;
     _lastSamplingPushAt = null;
     unawaited(() async {
       try {
@@ -384,17 +390,11 @@ final class VmServiceContext {
               description:
                   'VM service URI (e.g., ws://127.0.0.1:8181/ws). This is printed in the Flutter app console when running in debug mode.',
             ),
-            'sampling_push': JsonSchema.boolean(
-              description:
-                  'Enable server-initiated sampling/createMessage triggers when user messages arrive. '
-                  'Only works if the MCP client advertises sampling capability.',
-            ),
           },
           required: ['uri'],
         ),
         callback: (args, extra) async {
           final uri = args['uri'] as String;
-          _enableSamplingPush = args['sampling_push'] as bool? ?? false;
           _logger.info('Connecting to app at $uri');
 
           try {
@@ -414,9 +414,6 @@ final class VmServiceContext {
             } catch (err) {
               _logger.fine('Failed to set host connection state: $err');
             }
-            final samplingState = !_enableSamplingPush
-                ? 'disabled'
-                : (samplingAvailable ? 'enabled' : 'requested (unsupported)');
             return CallToolResult(
               content: [
                 TextContent(
@@ -425,8 +422,7 @@ final class VmServiceContext {
                       'Message delivery is event-driven now (no timer polling). '
                       'You can use process_queue to drain pending messages, '
                       'get_user_message for manual retrieval, '
-                      'or read flan://messages/pending.\n'
-                      'sampling_push: $samplingState',
+                      'or read flan://messages/pending.',
                 ),
               ],
             );
@@ -454,7 +450,6 @@ final class VmServiceContext {
             _drainRequested = false;
             _isProcessingQueue = false;
             _lastKnownAppPendingCount = 0;
-            _enableSamplingPush = false;
             _lastSamplingPushAt = null;
             if (_messageArrived != null && !_messageArrived!.isCompleted) {
               _messageArrived!.complete();
