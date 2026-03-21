@@ -4,6 +4,8 @@ import 'dart:io';
 
 import 'package:logging/logging.dart' as logging;
 
+enum _FlanFlushResult { ok, failed, unreachable }
+
 /// Connects to cmux's JSON-RPC Unix socket and sends
 /// `flan connect to <uri> and process queue once connected`
 /// to a Claude Code surface in the same project.
@@ -69,6 +71,14 @@ class CmuxPaneBridge {
       return;
     }
 
+    _lastSendTime = now;
+
+    // Prefer the flan server flush endpoint — it knows the correct target
+    // surface via the TUI-created association.
+    final flanResult = await _flushViaFlanServer(vmServiceUri);
+    if (flanResult != _FlanFlushResult.unreachable) return;
+
+    // Fallback: flan server is not running — find target surface ourselves and send directly.
     try {
       if (!_connected) await connect();
 
@@ -77,8 +87,6 @@ class CmuxPaneBridge {
         _logger.warning('No target surface found');
         return;
       }
-
-      _lastSendTime = now;
 
       final text = vmServiceUri != null
           ? 'flan connect to $vmServiceUri and process queue once connected'
@@ -103,6 +111,40 @@ class CmuxPaneBridge {
     } catch (err) {
       _logger.warning('Error sending to cmux: $err');
       _connected = false;
+    }
+  }
+
+  /// POST to the flan server's /api/flush endpoint.
+  Future<_FlanFlushResult> _flushViaFlanServer(String? vmServiceUri) async {
+    final port = int.tryParse(
+          Platform.environment['FLAN_SERVER_PORT'] ?? '',
+        ) ??
+        4050;
+    try {
+      final client = HttpClient();
+      client.connectionTimeout = const Duration(seconds: 2);
+      final request = await client
+          .postUrl(Uri.parse('http://127.0.0.1:$port/api/flush'));
+      request.headers.contentType = ContentType.json;
+      final bodyMap = <String, dynamic>{'flutter_pid': pid};
+      if (vmServiceUri != null) bodyMap['vm_service_uri'] = vmServiceUri;
+      final body = jsonEncode(bodyMap);
+      request.contentLength = utf8.encode(body).length;
+      request.write(body);
+      final response = await request.close().timeout(const Duration(seconds: 3));
+      final responseBody =
+          await response.transform(utf8.decoder).join();
+      client.close();
+      if (response.statusCode == 200) {
+        _logger.info('Flushed via flan server: $responseBody');
+        return _FlanFlushResult.ok;
+      }
+      _logger.fine(
+          'Flan server flush returned ${response.statusCode}: $responseBody');
+      return _FlanFlushResult.failed;
+    } catch (err) {
+      _logger.fine('Flan server not reachable, falling back: $err');
+      return _FlanFlushResult.unreachable;
     }
   }
 

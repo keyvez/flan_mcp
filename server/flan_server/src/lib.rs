@@ -37,6 +37,21 @@ pub struct CmuxSurface {
     pub title: String,
     pub pane_id: String,
     pub focused: bool,
+    /// Working directory of the Claude process in this surface, if known.
+    pub cwd: Option<String>,
+}
+
+/// A pane in the trm terminal emulator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrmPane {
+    /// Zero-based pane index (used to send input via trm socket).
+    pub index: usize,
+    /// Folder name of the cwd (e.g. "charge/web"), or None if empty/unknown.
+    pub folder_name: Option<String>,
+    /// Full cwd path, if known.
+    pub cwd: Option<String>,
+    /// Whether a claude process is running in this pane.
+    pub has_claude: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,7 +310,10 @@ mod server {
 
         let mut assocs = state.associations.write().await;
         let before = assocs.len();
-        assocs.retain(|a| live_surface_ids.contains(&a.claude_surface_id));
+        assocs.retain(|a| {
+            a.claude_surface_id.starts_with("trm:")
+                || live_surface_ids.contains(&a.claude_surface_id)
+        });
         if assocs.len() < before {
             save_associations(&state.persistence_path, &assocs);
         }
@@ -316,9 +334,30 @@ mod server {
         let surface_id = if let Some(ref assoc) = assoc {
             Some(assoc.claude_surface_id.clone())
         } else {
-            surfaces
+            // Try to find the Claude Code surface whose cwd matches the
+            // flutter app's cwd (or an ancestor/descendant), preferring an
+            // exact match. Falls back to any Claude Code surface.
+            let flutter_cwd = body.flutter_pid
+                .map(|pid| get_process_cwd(pid))
+                .unwrap_or_default();
+
+            let cc_surfaces: Vec<&CmuxSurface> = surfaces
                 .iter()
-                .find(|s| s.title.contains("Claude Code"))
+                .filter(|s| s.title.contains("Claude"))
+                .collect();
+
+            cc_surfaces
+                .iter()
+                .find(|s| {
+                    if let (Some(ref scwd), false) = (&s.cwd, flutter_cwd.is_empty()) {
+                        scwd == &flutter_cwd
+                            || flutter_cwd.starts_with(&format!("{}/", scwd))
+                            || scwd.starts_with(&format!("{}/", flutter_cwd))
+                    } else {
+                        false
+                    }
+                })
+                .or_else(|| cc_surfaces.first())
                 .map(|s| s.id.clone())
         };
 
@@ -370,7 +409,13 @@ mod server {
         let sid = surface_id.clone();
 
         let ok = tokio::task::spawn_blocking(move || {
-            if cmux_send_text(&sid, &t) {
+            if sid.starts_with("trm:") {
+                if let Ok(idx) = sid["trm:".len()..].parse::<usize>() {
+                    trm_send_to_pane(idx, &t)
+                } else {
+                    false
+                }
+            } else if cmux_send_text(&sid, &t) {
                 cmux_send_text(&sid, "\n")
             } else {
                 false
@@ -388,7 +433,7 @@ mod server {
             state
                 .log(
                     "out",
-                    format!("Flush → surface {}…{}", &surface_id[..8], pruned_note),
+                    format!("Flush → surface {}…{}", &surface_id[..8.min(surface_id.len())], pruned_note),
                     Some(format!("sent: {}", text)),
                     true,
                 )
@@ -401,7 +446,7 @@ mod server {
             state
                 .log(
                     "out",
-                    format!("Flush failed → surface {}…", &surface_id[..8]),
+                    format!("Flush failed → surface {}…", &surface_id[..8.min(surface_id.len())]),
                     Some("cmux send_text returned false".into()),
                     false,
                 )
@@ -747,10 +792,6 @@ pub fn discover_flutter_apps() -> Vec<FlutterApp> {
             continue;
         };
 
-        if !has_listening_ports(pid) {
-            continue;
-        }
-
         let device = extract_device_flag(line);
         let cwd = get_process_cwd(pid);
         let folder_name = cwd.rsplit('/').next().unwrap_or(&cwd).to_string();
@@ -794,6 +835,19 @@ pub fn extract_device_flag(cmd_line: &str) -> String {
 }
 
 pub fn probe_vm_service_uri(pid: u32) -> Option<String> {
+    // First try the process itself
+    if let Some(uri) = probe_vm_service_uri_for_pid(pid) {
+        return Some(uri);
+    }
+    // For macOS flutter_tools, the DDS child process holds the listen ports.
+    // Check children for a `development-service` process.
+    if let Some(uri) = probe_dds_child(pid) {
+        return Some(uri);
+    }
+    None
+}
+
+fn probe_vm_service_uri_for_pid(pid: u32) -> Option<String> {
     let output = Command::new("lsof")
         .args([
             "-i", "TCP", "-a", "-p",
@@ -821,6 +875,107 @@ pub fn probe_vm_service_uri(pid: u32) -> Option<String> {
     }
 
     None
+}
+
+/// Find a `dart development-service` child of `parent_pid`, extract its
+/// `--vm-service-uri=` flag, follow the HTTP redirect that the raw VM service
+/// returns to discover the DDS URI (which includes the DDS auth token), and
+/// return that as a `ws://` URI.
+fn probe_dds_child(parent_pid: u32) -> Option<String> {
+    let ps_out = Command::new("ps")
+        .args(["-eo", "pid,ppid,command"])
+        .output()
+        .ok()?;
+    let ps_str = String::from_utf8_lossy(&ps_out.stdout);
+
+    for line in ps_str.lines() {
+        if !line.contains("development-service") {
+            continue;
+        }
+        // Columns: PID  PPID  COMMAND…
+        let mut parts = line.trim().splitn(3, char::is_whitespace);
+        let _child_pid = parts.next()?;
+        let ppid: u32 = parts.next()?.trim().parse().ok()?;
+        if ppid != parent_pid {
+            continue;
+        }
+        let cmd = parts.next().unwrap_or("");
+
+        // Extract --vm-service-uri=http://127.0.0.1:<port>/<token>/
+        let raw_uri = cmd
+            .split_whitespace()
+            .find(|s| s.starts_with("--vm-service-uri="))?
+            .trim_start_matches("--vm-service-uri=");
+
+        // Parse host:port and path from the URI
+        let after_http = raw_uri.trim_start_matches("http://");
+        let slash = after_http.find('/')?;
+        let host_port = &after_http[..slash];
+        let path = &after_http[slash..];
+
+        let port: u16 = host_port.split(':').nth(1)?.parse().ok()?;
+
+        // Connect to the raw VM service; it will 302-redirect to the DDS URI
+        let addr = format!("127.0.0.1:{}", port);
+        let mut stream =
+            TcpStream::connect_timeout(&addr.parse().ok()?, Duration::from_secs(2)).ok()?;
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            path, host_port
+        );
+        stream.write_all(req.as_bytes()).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+        let mut body = String::new();
+        stream.read_to_string(&mut body).ok();
+
+        // Look for Location: header.
+        // The VM service redirects to a devtools URL like:
+        //   http://127.0.0.1:<dds>/<token>/devtools/?uri=ws%3A%2F%2F…%2Fws
+        // The WS URI we need is in the `uri=` query parameter.
+        for hdr_line in body.lines() {
+            if !hdr_line.to_lowercase().starts_with("location:") {
+                continue;
+            }
+            let location = hdr_line[9..].trim();
+            // Try to extract `uri=` query param (URL-encoded ws:// URI)
+            if let Some(after_uri) = location.split("uri=").nth(1) {
+                let encoded = after_uri.split('&').next().unwrap_or(after_uri);
+                let decoded = percent_decode(encoded);
+                if decoded.starts_with("ws://") {
+                    return Some(decoded);
+                }
+            }
+            // Fallback: plain http:// → ws:// conversion (no devtools redirect)
+            if location.starts_with("http://") {
+                let ws = location
+                    .trim_end_matches('/')
+                    .replace("http://", "ws://");
+                return Some(format!("{}/ws", ws));
+            }
+        }
+    }
+    None
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let h1 = chars.next().unwrap_or('0');
+            let h2 = chars.next().unwrap_or('0');
+            if let Ok(byte) = u8::from_str_radix(&format!("{}{}", h1, h2), 16) {
+                out.push(byte as char);
+            } else {
+                out.push('%');
+                out.push(h1);
+                out.push(h2);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 pub fn probe_port(port: u16) -> Option<String> {
@@ -857,6 +1012,136 @@ pub fn probe_port(port: u16) -> Option<String> {
     }
 
     None
+}
+
+// ── Discovery: trm Panes ────────────────────────────────────────────────
+
+pub fn discover_trm_panes() -> Vec<TrmPane> {
+    // Find the trm process.
+    let Ok(ps_out) = Command::new("ps").args(["-eo", "pid,comm"]).output() else {
+        return Vec::new();
+    };
+    let ps_str = String::from_utf8_lossy(&ps_out.stdout);
+    let trm_pid: u32 = ps_str
+        .lines()
+        .find(|l| l.contains("/trm") || l.trim().ends_with(" trm"))
+        .and_then(|l| l.trim().split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if trm_pid == 0 {
+        return Vec::new();
+    }
+
+    // Get trm's direct children that are login/shell processes — one per pane.
+    // Use `ps -eo pid,ppid,comm` instead of `pgrep -P` because pgrep truncates
+    // output at ~10 results on macOS, silently missing panes.
+    let Ok(ps_all) = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output() else {
+        return Vec::new();
+    };
+    let mut children: Vec<u32> = String::from_utf8_lossy(&ps_all.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut parts = l.trim().splitn(3, char::is_whitespace);
+            let pid: u32 = parts.next()?.trim().parse().ok()?;
+            let ppid: u32 = parts.next()?.trim().parse().ok()?;
+            let comm = parts.next()?.trim();
+            if ppid == trm_pid
+                && (comm.contains("login")
+                    || comm.ends_with("zsh")
+                    || comm.ends_with("bash")
+                    || comm.ends_with("fish"))
+            {
+                Some(pid)
+            } else {
+                None
+            }
+        })
+        .collect();
+    children.sort();
+
+    if children.is_empty() {
+        return Vec::new();
+    }
+
+    let mut panes = Vec::new();
+    for (idx, &child_pid) in children.iter().enumerate() {
+        let (cwd, has_claude) = trm_pane_info(child_pid);
+        let folder_name = cwd.as_deref().map(|p| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let shortened = if !home.is_empty() && p.starts_with(&home) {
+                format!("~{}", &p[home.len()..])
+            } else {
+                p.to_string()
+            };
+            // Take last two path components for readability.
+            let parts: Vec<&str> = shortened.trim_end_matches('/').rsplitn(3, '/').collect();
+            match parts.len() {
+                0 => shortened.clone(),
+                1 => parts[0].to_string(),
+                _ => format!("{}/{}", parts[1], parts[0]),
+            }
+        });
+        panes.push(TrmPane { index: idx, folder_name, cwd, has_claude });
+    }
+
+    panes
+}
+
+/// Walk the process subtree rooted at `root_pid`, find the deepest claude
+/// process or the leaf shell, and return its (cwd, has_claude).
+fn trm_pane_info(root_pid: u32) -> (Option<String>, bool) {
+    // Collect all descendants up to depth 6.
+    let mut descendants = vec![root_pid];
+    let mut frontier = vec![root_pid];
+    for _ in 0..6 {
+        let mut next = Vec::new();
+        for &pid in &frontier {
+            let Ok(out) = Command::new("pgrep").args(["-P", &pid.to_string()]).output() else {
+                continue;
+            };
+            for child in String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+            {
+                descendants.push(child);
+                next.push(child);
+            }
+        }
+        if next.is_empty() { break; }
+        frontier = next;
+    }
+
+    // Among all descendants, find a claude process first.
+    let Ok(ps_out) = Command::new("ps")
+        .args(["-eo", "pid,comm"])
+        .output() else {
+        return (None, false);
+    };
+    let ps_str = String::from_utf8_lossy(&ps_out.stdout);
+
+    // Build pid→comm map for our descendants.
+    let mut claude_pid: Option<u32> = None;
+    let mut leaf_pid: Option<u32> = None;
+    for line in ps_str.lines() {
+        let parts: Vec<&str> = line.trim().splitn(2, char::is_whitespace).collect();
+        if parts.len() < 2 { continue; }
+        let Ok(pid) = parts[0].trim().parse::<u32>() else { continue; };
+        if !descendants.contains(&pid) { continue; }
+        let comm = parts[1].trim();
+        if comm.contains("claude") && !comm.contains("flan") {
+            claude_pid = Some(pid);
+        }
+        // Track any non-login shell as a fallback leaf.
+        if comm.ends_with("zsh") || comm.ends_with("bash") || comm.ends_with("fish") {
+            leaf_pid = Some(pid);
+        }
+    }
+
+    let target = claude_pid.or(leaf_pid).unwrap_or(root_pid);
+    let has_claude = claude_pid.is_some();
+    let cwd = get_process_cwd(target);
+    (if cwd.is_empty() { None } else { Some(cwd) }, has_claude)
 }
 
 // ── Discovery: Floss Desktop ──────────────────────────────────────────
@@ -935,7 +1220,8 @@ pub fn cmux_surface_list() -> Vec<CmuxSurface> {
         return Vec::new();
     };
 
-    surfaces
+    // Parse all surfaces first (without cwd).
+    let mut result: Vec<CmuxSurface> = surfaces
         .iter()
         .filter_map(|s| {
             Some(CmuxSurface {
@@ -943,9 +1229,67 @@ pub fn cmux_surface_list() -> Vec<CmuxSurface> {
                 title: s.get("title")?.as_str()?.to_string(),
                 pane_id: s.get("pane_id")?.as_str()?.to_string(),
                 focused: s.get("focused")?.as_bool()?,
+                cwd: None,
             })
         })
-        .collect()
+        .collect();
+
+    // Resolve cwd for each Claude Code surface using pane siblings.
+    // A pane sibling whose title looks like an absolute or home path gives
+    // us the cwd of the claude process in that pane.
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    for i in 0..result.len() {
+        if !result[i].title.contains("Claude") {
+            continue;
+        }
+        let pane = result[i].pane_id.clone();
+
+        // Collect path-like sibling titles in the same pane.
+        let sibling_path = result
+            .iter()
+            .filter(|s| s.pane_id == pane && s.id != result[i].id)
+            .find_map(|s| {
+                let t = &s.title;
+                // Expand ~ prefix so we can use it as a real path.
+                if t.starts_with("~/") || t == "~" {
+                    Some(format!("{}{}", home, &t[1..]))
+                } else if t.starts_with('/') {
+                    Some(t.clone())
+                } else if t.starts_with('…') {
+                    // Truncated path like "…/dev/pe/admin" — try to resolve
+                    // by finding a claude process whose cwd ends with the suffix.
+                    None
+                } else {
+                    None
+                }
+            });
+
+        if let Some(path) = sibling_path {
+            result[i].cwd = Some(path);
+            continue;
+        }
+
+        // Fallback: try to match by truncated "…/suffix" sibling title against
+        // running claude process cwds.
+        let truncated_suffix = result
+            .iter()
+            .filter(|s| s.pane_id == pane && s.id != result[i].id)
+            .find_map(|s| {
+                s.title.strip_prefix('…').map(|suf| suf.to_string())
+            });
+
+        if let Some(suffix) = truncated_suffix {
+            // Find a claude process whose cwd ends with this suffix.
+            let claude_cwd = discover_claude_processes()
+                .into_iter()
+                .find(|p| p.cwd.ends_with(&suffix))
+                .map(|p| p.cwd);
+            result[i].cwd = claude_cwd;
+        }
+    }
+
+    result
 }
 
 pub fn cmux_send_text(surface_id: &str, text: &str) -> bool {
@@ -966,6 +1310,32 @@ pub fn cmux_focus_surface(surface_id: &str) -> bool {
         serde_json::json!({ "surface_id": surface_id }),
     )
     .and_then(|r| r.get("ok")?.as_bool())
+    .unwrap_or(false)
+}
+
+/// Send `text` to a trm pane by zero-based index, then submit with Enter.
+/// Uses the trm Unix socket protocol: `{"type":"send","pane":N,"text":"..."}\n`.
+/// The server responds with `{"status":"queued"}` on success.
+pub fn trm_send_to_pane(index: usize, text: &str) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let socket_path = std::env::var("TRM_SOCKET_PATH")
+        .unwrap_or_else(|_| "/tmp/trm.sock".into());
+    (|| {
+        let mut stream = UnixStream::connect(&socket_path).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        // Append \r (carriage return) to submit the command in the terminal.
+        let text_with_cr = format!("{}\r", text);
+        let msg = format!("{}\n", serde_json::json!({"type":"send","pane":index,"text":text_with_cr}));
+        stream.write_all(msg.as_bytes()).ok()?;
+        stream.flush().ok()?;
+        let mut buf = String::new();
+        BufReader::new(&stream).read_line(&mut buf).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&buf).ok()?;
+        v.get("status").and_then(|s| s.as_str()).map(|s| s == "queued")
+    })()
     .unwrap_or(false)
 }
 

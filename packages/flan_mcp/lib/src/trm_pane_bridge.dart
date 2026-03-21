@@ -322,16 +322,19 @@ class TrmPaneBridge {
     if (ancestors.length < 2) return null;
 
     // The last PID in the chain (before init) should be trm.
-    // Find trm's direct children (one per pane), sorted by PID.
+    // Use `ps -eo pid,ppid` instead of `pgrep -P` because pgrep truncates
+    // output at ~10 results on macOS, silently missing panes.
     final trmPid = ancestors.last;
-    final childrenStr = await _runCommand('/usr/bin/pgrep', ['-P', '$trmPid']);
-    if (childrenStr == null) return null;
+    final psAll = await _runCommand('/bin/ps', ['-eo', 'pid,ppid']);
+    if (psAll == null) return null;
 
-    final children = childrenStr
+    final children = psAll
         .split('\n')
-        .map((s) => s.trim())
-        .where((s) => s.isNotEmpty)
-        .map((s) => int.tryParse(s))
+        .skip(1)
+        .map((s) => s.trim().split(RegExp(r'\s+')))
+        .where((p) => p.length >= 2)
+        .where((p) => int.tryParse(p[1]) == trmPid)
+        .map((p) => int.tryParse(p[0]))
         .whereType<int>()
         .toList()
       ..sort();

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
+import 'dart:io' show pid;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart' hide InspectorSelection;
@@ -1040,9 +1041,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       }
       debugPrint('[flan] flushing to server, vm_service_uri=$wsUri');
       final res = await http.post(
-        Uri.parse('http://localhost:4050/api/flush'),
+        Uri.parse('http://127.0.0.1:4050/api/flush'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode(<String, dynamic>{
+          'flutter_pid': pid,
           if (wsUri != null) 'vm_service_uri': wsUri,
         }),
       );
@@ -1257,6 +1259,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               },
               onAnnotationSubmittedAndSent: () {
                 _sendToAgentAndFlush();
+              },
+              onFlushRequested: () {
+                widget.userMessageService.notifyPending();
+                unawaited(_flushToServer());
               },
             ),
           if (widget.annotationService.enabled)
@@ -1798,12 +1804,17 @@ class _AnnotationOverlay extends StatefulWidget {
     required this.userMessageService,
     this.onAnnotationSubmitted = _noopAnnotationSubmittedCallback,
     this.onAnnotationSubmittedAndSent = _noopAnnotationSubmittedCallback,
+    this.onFlushRequested = _noopAnnotationSubmittedCallback,
   });
 
   final AnnotationService service;
   final UserMessageService userMessageService;
   final VoidCallback onAnnotationSubmitted;
   final VoidCallback onAnnotationSubmittedAndSent;
+
+  /// Called when an edit needs to flush the existing draft to the agent
+  /// without creating a new queue entry (used by edit-and-send).
+  final VoidCallback onFlushRequested;
 
   @override
   State<_AnnotationOverlay> createState() => _AnnotationOverlayState();
@@ -1971,14 +1982,18 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
 
   void _handleEditAnnotationSubmit(String text) {
     widget.service.submitEditedAnnotationText(text);
-    // Package into a real queue item (no flush).
-    widget.onAnnotationSubmitted();
+    // The change listener (_onAnnotationServiceChanged) already updates the
+    // existing draft message with the new text. Do NOT call
+    // onAnnotationSubmitted here — that would create a duplicate queue entry
+    // on top of the one that already exists.
   }
 
   void _handleEditAnnotationSubmitAndSend(String text) {
     widget.service.submitEditedAnnotationText(text);
-    // Package into a real queue item and flush to agent.
-    widget.onAnnotationSubmittedAndSent();
+    // The change listener (_onAnnotationServiceChanged) already updates the
+    // existing draft. Just flush the updated draft to the agent without
+    // creating a duplicate queue entry via _sendToAgent.
+    widget.onFlushRequested();
   }
 
   Widget _buildTextField(Rect rect, Size screenSize) {

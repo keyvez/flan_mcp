@@ -17,6 +17,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc;
 
 // ── Colors (matching browser CSS variables) ─────────────────────────────
 
@@ -41,9 +42,9 @@ struct Row {
 }
 
 fn build_rows(app: &App) -> Vec<Row> {
-    let claude_surfaces = app.claude_surfaces_indices();
+    let entries = app.claude_entries();
     let mut used_flutter: Vec<bool> = vec![false; app.flutter_apps.len()];
-    let mut used_surface: Vec<bool> = vec![false; claude_surfaces.len()];
+    let mut used_surface: Vec<bool> = vec![false; entries.len()];
     let mut rows = Vec::new();
 
     for assoc in &app.associations {
@@ -51,9 +52,9 @@ fn build_rows(app: &App) -> Vec<Row> {
             .flutter_apps
             .iter()
             .position(|f| f.pid == assoc.flutter_pid);
-        let si = claude_surfaces
+        let si = entries
             .iter()
-            .position(|&ci| app.cmux_surfaces[ci].id == assoc.claude_surface_id);
+            .position(|e| e.id() == assoc.claude_surface_id);
         if let (Some(fi), Some(si)) = (fi, si) {
             if !used_flutter[fi] && !used_surface[si] {
                 used_flutter[fi] = true;
@@ -66,7 +67,7 @@ fn build_rows(app: &App) -> Vec<Row> {
         }
     }
 
-    // Unlinked: zip Flutter-only and Claude-only side by side,
+    // Unlinked: pair by cwd proximity (Claude cwd == Flutter cwd or a parent),
     // then overflow the remainder as single-sided rows.
     let mut unlinked_flutter: Vec<usize> = Vec::new();
     let mut unlinked_surface: Vec<usize> = Vec::new();
@@ -82,24 +83,58 @@ fn build_rows(app: &App) -> Vec<Row> {
         }
     }
 
-    let paired = unlinked_flutter.len().min(unlinked_surface.len());
+    // Greedily pair each Flutter app with the best-matching Claude entry.
+    // "Best" = longest Claude cwd that is a prefix of the Flutter cwd.
+    let mut used_surface2 = vec![false; unlinked_surface.len()];
+    let mut leftover_flutter: Vec<usize> = Vec::new();
+
+    for &fi in &unlinked_flutter {
+        let flutter_cwd = app.flutter_apps[fi].cwd.as_str();
+        let best = unlinked_surface
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| !used_surface2[*j])
+            .filter_map(|(j, &si)| {
+                let claude_cwd = entries[si].cwd().unwrap_or("");
+                if claude_cwd.is_empty() {
+                    return None;
+                }
+                // Claude cwd must equal or be a parent of the Flutter cwd.
+                let matches = flutter_cwd == claude_cwd
+                    || flutter_cwd.starts_with(&format!("{}/", claude_cwd));
+                if matches { Some((j, si, claude_cwd.len())) } else { None }
+            })
+            .max_by_key(|&(_, _, len)| len);
+
+        if let Some((j, si, _)) = best {
+            used_surface2[j] = true;
+            rows.push(Row { flutter: Some(fi), surface: Some(si) });
+        } else {
+            leftover_flutter.push(fi);
+        }
+    }
+
+    // Remaining unmatched surfaces.
+    let leftover_surface: Vec<usize> = unlinked_surface
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| !used_surface2[*j])
+        .map(|(_, &si)| si)
+        .collect();
+
+    // Zip any leftover Flutter and Claude entries side-by-side (no path match).
+    let paired = leftover_flutter.len().min(leftover_surface.len());
     for j in 0..paired {
         rows.push(Row {
-            flutter: Some(unlinked_flutter[j]),
-            surface: Some(unlinked_surface[j]),
+            flutter: Some(leftover_flutter[j]),
+            surface: Some(leftover_surface[j]),
         });
     }
-    for &fi in &unlinked_flutter[paired..] {
-        rows.push(Row {
-            flutter: Some(fi),
-            surface: None,
-        });
+    for &fi in &leftover_flutter[paired..] {
+        rows.push(Row { flutter: Some(fi), surface: None });
     }
-    for &si in &unlinked_surface[paired..] {
-        rows.push(Row {
-            flutter: None,
-            surface: Some(si),
-        });
+    for &si in &leftover_surface[paired..] {
+        rows.push(Row { flutter: None, surface: Some(si) });
     }
 
     rows
@@ -110,6 +145,22 @@ fn row_has_column(row: &Row, col: Column) -> bool {
         Column::Flutter => row.flutter.is_some(),
         Column::Claude => row.surface.is_some(),
     }
+}
+
+// ── Background refresh ───────────────────────────────────────────────────
+
+type DiscoveryResult = (Vec<FlutterApp>, Vec<CmuxSurface>, Vec<TrmPane>, DesktopTarget);
+
+fn spawn_discovery(tx: mpsc::Sender<DiscoveryResult>) {
+    tokio::task::spawn_blocking(move || {
+        let result = (
+            discover_flutter_apps(),
+            cmux_surface_list(),
+            discover_trm_panes(),
+            discover_desktop_target(),
+        );
+        let _ = tx.blocking_send(result);
+    });
 }
 
 // ── App State ───────────────────────────────────────────────────────────
@@ -126,10 +177,39 @@ enum Focus {
     Log,
 }
 
+/// Unified handle for anything that can appear in the Claude column.
+#[derive(Clone)]
+enum ClaudeEntry {
+    Cmux(CmuxSurface),
+    Trm(TrmPane),
+}
+
+impl ClaudeEntry {
+    fn id(&self) -> String {
+        match self {
+            ClaudeEntry::Cmux(s) => s.id.clone(),
+            ClaudeEntry::Trm(p) => format!("trm:{}", p.index),
+        }
+    }
+    fn is_claude(&self) -> bool {
+        match self {
+            ClaudeEntry::Cmux(s) => s.title.contains("Claude"),
+            ClaudeEntry::Trm(p) => p.has_claude,
+        }
+    }
+    fn cwd(&self) -> Option<&str> {
+        match self {
+            ClaudeEntry::Cmux(s) => s.cwd.as_deref(),
+            ClaudeEntry::Trm(p) => p.cwd.as_deref(),
+        }
+    }
+}
+
 struct App {
     shared: Arc<SharedState>,
     flutter_apps: Vec<FlutterApp>,
     cmux_surfaces: Vec<CmuxSurface>,
+    trm_panes: Vec<TrmPane>,
     associations: Vec<Association>,
     desktop_target: Option<DesktopTarget>,
     /// Snapshot of shared log for rendering (avoids async read during draw)
@@ -137,6 +217,9 @@ struct App {
 
     active_column: Column,
     focus: Focus,
+    /// Per-column row selection — each column tracks its own cursor independently
+    flutter_row: Option<usize>,
+    claude_row: Option<usize>,
     row_state: ListState,
     log_state: ListState,
     log_visible: bool,
@@ -150,18 +233,42 @@ impl App {
             shared,
             flutter_apps: Vec::new(),
             cmux_surfaces: Vec::new(),
+            trm_panes: Vec::new(),
             associations: Vec::new(),
             desktop_target: None,
             log_snapshot: Vec::new(),
 
             active_column: Column::Flutter,
             focus: Focus::Main,
+            flutter_row: None,
+            claude_row: None,
             row_state: ListState::default(),
             log_state: ListState::default(),
             log_visible: true,
             toast: None,
             port,
         }
+    }
+
+    /// Get the active column's row selection
+    fn active_row(&self) -> Option<usize> {
+        match self.active_column {
+            Column::Flutter => self.flutter_row,
+            Column::Claude => self.claude_row,
+        }
+    }
+
+    /// Set the active column's row selection
+    fn set_active_row(&mut self, row: Option<usize>) {
+        match self.active_column {
+            Column::Flutter => self.flutter_row = row,
+            Column::Claude => self.claude_row = row,
+        }
+    }
+
+    /// Sync row_state from the active column's selection (for rendering)
+    fn sync_row_state(&mut self) {
+        self.row_state.select(self.active_row());
     }
 
     async fn log(
@@ -179,6 +286,23 @@ impl App {
         self.log_snapshot = log.iter().cloned().collect();
     }
 
+    /// All Claude-bearing entries across cmux and trm, in display order.
+    /// cmux Claude surfaces first, then trm panes.
+    fn claude_entries(&self) -> Vec<ClaudeEntry> {
+        let mut entries: Vec<ClaudeEntry> = self
+            .cmux_surfaces
+            .iter()
+            .filter(|s| s.title.contains("Claude"))
+            .cloned()
+            .map(ClaudeEntry::Cmux)
+            .collect();
+        for pane in &self.trm_panes {
+            entries.push(ClaudeEntry::Trm(pane.clone()));
+        }
+        entries
+    }
+
+    // Keep for legacy callers that only need cmux surface indices (e.g. association lookup).
     fn claude_surfaces_indices(&self) -> Vec<usize> {
         self.cmux_surfaces
             .iter()
@@ -188,31 +312,30 @@ impl App {
             .collect()
     }
 
-    fn claude_surfaces(&self) -> Vec<&CmuxSurface> {
-        self.cmux_surfaces
-            .iter()
-            .filter(|s| s.title.contains("Claude"))
-            .collect()
-    }
-
     fn selected_flutter(&self) -> Option<&FlutterApp> {
         let rows = build_rows(self);
-        self.row_state
-            .selected()
+        self.flutter_row
             .and_then(|i| rows.get(i))
             .and_then(|row| row.flutter)
             .and_then(|fi| self.flutter_apps.get(fi))
     }
 
-    fn selected_surface(&self) -> Option<&CmuxSurface> {
+    fn selected_entry(&self) -> Option<ClaudeEntry> {
         let rows = build_rows(self);
-        let cs = self.claude_surfaces_indices();
-        self.row_state
-            .selected()
+        let entries = self.claude_entries();
+        self.claude_row
             .and_then(|i| rows.get(i))
             .and_then(|row| row.surface)
-            .and_then(|si| cs.get(si))
-            .and_then(|&ci| self.cmux_surfaces.get(ci))
+            .and_then(|si| entries.get(si))
+            .cloned()
+    }
+
+    /// Returns the selected entry only if it is a cmux surface.
+    fn selected_surface(&self) -> Option<CmuxSurface> {
+        match self.selected_entry() {
+            Some(ClaudeEntry::Cmux(s)) => Some(s),
+            _ => None,
+        }
     }
 
     fn assoc_for_flutter(&self, pid: u32) -> Option<&Association> {
@@ -229,19 +352,12 @@ impl App {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
-    async fn refresh(&mut self) {
-        let (flutter, surfaces, desktop) = tokio::task::spawn_blocking(|| {
-            (discover_flutter_apps(), cmux_surface_list(), discover_desktop_target())
-        })
-        .await
-        .unwrap_or_else(|_| (Vec::new(), Vec::new(), DesktopTarget {
-            alive: false,
-            socket_path: desktop_bridge::floss_socket_path().to_string_lossy().to_string(),
-            version: None,
-        }));
+    async fn apply_discovery(&mut self, result: DiscoveryResult) {
+        let (flutter, surfaces, trm, desktop) = result;
 
         self.flutter_apps = flutter.clone();
         self.cmux_surfaces = surfaces;
+        self.trm_panes = trm;
         self.desktop_target = if desktop.alive { Some(desktop.clone()) } else { None };
         *self.shared.desktop_cache.write().await = Some((Instant::now(), desktop));
 
@@ -262,12 +378,34 @@ impl App {
         *self.shared.flutter_cache.write().await = Some((Instant::now(), flutter));
         self.sync_log_snapshot().await;
 
-        let row_count = build_rows(self).len();
-        clamp_selection(&mut self.row_state, row_count);
+        let rows = build_rows(self);
+        let row_count = rows.len();
 
-        if self.row_state.selected().is_none() && row_count > 0 {
-            self.row_state.select(Some(0));
+        // Clamp per-column selections
+        if row_count == 0 {
+            self.flutter_row = None;
+            self.claude_row = None;
+        } else {
+            if let Some(i) = self.flutter_row {
+                if i >= row_count {
+                    self.flutter_row = Some(row_count - 1);
+                }
+            }
+            if let Some(i) = self.claude_row {
+                if i >= row_count {
+                    self.claude_row = Some(row_count - 1);
+                }
+            }
+
+            if self.flutter_row.is_none() {
+                self.flutter_row = rows.iter().position(|r| r.flutter.is_some());
+            }
+            if self.claude_row.is_none() {
+                self.claude_row = rows.iter().position(|r| r.surface.is_some());
+            }
         }
+
+        self.sync_row_state();
     }
 
     fn move_up(&mut self) {
@@ -284,13 +422,14 @@ impl App {
         if rows.is_empty() {
             return;
         }
-        let i = self.row_state.selected().unwrap_or(0);
+        let i = self.active_row().unwrap_or(0);
         // Skip rows that have nothing in the active column
         let mut target = i.saturating_sub(1);
         while target > 0 && !row_has_column(&rows[target], self.active_column) {
             target = target.saturating_sub(1);
         }
-        self.row_state.select(Some(target));
+        self.set_active_row(Some(target));
+        self.sync_row_state();
     }
 
     fn move_down(&mut self) {
@@ -309,13 +448,14 @@ impl App {
             return;
         }
         let last = rows.len() - 1;
-        let i = self.row_state.selected().unwrap_or(0);
+        let i = self.active_row().unwrap_or(0);
         // Skip rows that have nothing in the active column
         let mut target = (i + 1).min(last);
         while target < last && !row_has_column(&rows[target], self.active_column) {
             target += 1;
         }
-        self.row_state.select(Some(target));
+        self.set_active_row(Some(target));
+        self.sync_row_state();
     }
 
     fn toggle_column(&mut self) {
@@ -327,6 +467,8 @@ impl App {
             Column::Flutter => Column::Claude,
             Column::Claude => Column::Flutter,
         };
+        // Restore the target column's own row selection
+        self.sync_row_state();
     }
 }
 
@@ -356,11 +498,11 @@ fn ui(f: &mut Frame, app: &mut App) {
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let flutter_count = app.flutter_apps.len();
-    let claude_count = app.claude_surfaces().len();
-    let cs_indices = app.claude_surfaces_indices();
+    let entries = app.claude_entries();
+    let claude_count = entries.len();
     let link_count = app.associations.iter().filter(|a| {
         app.flutter_apps.iter().any(|f| f.pid == a.flutter_pid)
-            && cs_indices.iter().any(|&ci| app.cmux_surfaces[ci].id == a.claude_surface_id)
+            && entries.iter().any(|e| e.id() == a.claude_surface_id)
     }).count();
 
     let mut spans = vec![
@@ -485,19 +627,20 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let selected_row = app.row_state.selected();
     let active_col = app.active_column;
     let has_focus = app.focus == Focus::Main;
+    let flutter_sel = app.flutter_row;
+    let claude_sel = app.claude_row;
 
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
         .map(|(row_idx, row)| {
-            let is_selected = has_focus && selected_row == Some(row_idx);
             let is_linked = row.flutter.is_some() && row.surface.is_some();
 
-            let hl_left = is_selected && active_col == Column::Flutter && row.flutter.is_some();
-            let hl_right = is_selected && active_col == Column::Claude && row.surface.is_some();
+            // Highlight each column cell independently based on its own selection
+            let hl_left = has_focus && flutter_sel == Some(row_idx) && row.flutter.is_some();
+            let hl_right = has_focus && claude_sel == Some(row_idx) && row.surface.is_some();
 
             let mut lines = Vec::new();
 
@@ -506,8 +649,8 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
                 .map(|fi| build_flutter_lines(app, fi))
                 .unwrap_or_default();
             let surface_lines = row.surface.map(|si| {
-                let cs = app.claude_surfaces_indices();
-                build_surface_lines(app, cs[si])
+                let entries = app.claude_entries();
+                build_entry_lines(app, &entries[si])
             }).unwrap_or_default();
 
             let max_lines = flutter_lines.len().max(surface_lines.len());
@@ -516,7 +659,16 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
             let conn_w = (area.width as usize * 12 / 100).max(4);
             let right_w = (area.width as usize * 44 / 100).max(10);
 
-            let hl_bg = Color::Rgb(28, 24, 50);
+            // Active column gets brighter highlight, inactive gets dimmer
+            let hl_bg_active = Color::Rgb(28, 24, 50);
+            let hl_bg_inactive = Color::Rgb(20, 18, 35);
+
+            let left_bg = if hl_left {
+                if active_col == Column::Flutter { hl_bg_active } else { hl_bg_inactive }
+            } else { BG };
+            let right_bg = if hl_right {
+                if active_col == Column::Claude { hl_bg_active } else { hl_bg_inactive }
+            } else { BG };
 
             for line_idx in 0..max_lines {
                 let left = flutter_lines.get(line_idx);
@@ -528,10 +680,10 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
                 if let Some((text, style)) = left {
                     let truncated = truncate_str(text, left_w);
                     let pad = left_w.saturating_sub(char_width(&truncated));
-                    let s = if hl_left { style.bg(hl_bg) } else { *style };
+                    let s = if hl_left { style.bg(left_bg) } else { *style };
                     spans.push(Span::styled(truncated, s));
                     if pad > 0 {
-                        let pad_style = if hl_left { Style::default().bg(hl_bg) } else { Style::default() };
+                        let pad_style = if hl_left { Style::default().bg(left_bg) } else { Style::default() };
                         spans.push(Span::styled(" ".repeat(pad), pad_style));
                     }
                 } else {
@@ -550,14 +702,14 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
                 if let Some((text, style)) = right {
                     let truncated = truncate_str(text, right_w);
                     let pad = right_w.saturating_sub(char_width(&truncated));
-                    let s = if hl_right { style.bg(hl_bg) } else { *style };
+                    let s = if hl_right { style.bg(right_bg) } else { *style };
                     spans.push(Span::styled(truncated, s));
                     if pad > 0 {
-                        let pad_style = if hl_right { Style::default().bg(hl_bg) } else { Style::default() };
+                        let pad_style = if hl_right { Style::default().bg(right_bg) } else { Style::default() };
                         spans.push(Span::styled(" ".repeat(pad), pad_style));
                     }
                 } else if hl_right {
-                    spans.push(Span::styled(" ".repeat(right_w), Style::default().bg(hl_bg)));
+                    spans.push(Span::styled(" ".repeat(right_w), Style::default().bg(right_bg)));
                 } else {
                     spans.push(Span::raw(" ".repeat(right_w)));
                 }
@@ -577,9 +729,11 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
         .border_style(Style::default().fg(BORDER))
         .style(Style::default().bg(BG));
 
+    // Use stateful rendering for scroll tracking, but suppress the default
+    // whole-row highlight — we handle per-cell highlighting ourselves.
     let list = List::new(items)
         .block(block)
-        .highlight_symbol("▸");
+        .highlight_style(Style::default());
 
     f.render_stateful_widget(list, area, &mut app.row_state);
 }
@@ -602,39 +756,53 @@ fn build_flutter_lines(app: &App, idx: usize) -> Vec<(String, Style)> {
     lines
 }
 
-fn build_surface_lines(app: &App, cmux_idx: usize) -> Vec<(String, Style)> {
-    let surface = &app.cmux_surfaces[cmux_idx];
-    let mut lines = Vec::new();
+fn build_entry_lines(app: &App, entry: &ClaudeEntry) -> Vec<(String, Style)> {
+    match entry {
+        ClaudeEntry::Cmux(surface) => {
+            let mut lines = Vec::new();
+            let mut title = surface.title.clone();
+            if surface.focused {
+                title.push_str(" [focused]");
+            }
+            lines.push((title, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)));
 
-    let mut title = surface.title.clone();
-    if surface.focused {
-        title.push_str(" [focused]");
+            if let Some(ref cwd) = surface.cwd {
+                lines.push((shorten_path(cwd), Style::default().fg(TEXT2)));
+                return lines;
+            }
+
+            // Fall back to a path-like sibling surface title in the same pane.
+            let pane_path = app.cmux_surfaces.iter()
+                .filter(|s| s.pane_id == surface.pane_id && s.id != surface.id)
+                .find(|s| {
+                    let t = &s.title;
+                    t.starts_with('/') || t.starts_with('~') || t.starts_with('…') || t.contains("/dev/")
+                })
+                .map(|s| s.title.clone());
+
+            if let Some(path) = pane_path {
+                lines.push((path, Style::default().fg(TEXT2)));
+            } else {
+                let short_pane = &surface.pane_id[..8.min(surface.pane_id.len())];
+                lines.push((format!("pane {}…", short_pane), Style::default().fg(TEXT2)));
+            }
+            lines
+        }
+        ClaudeEntry::Trm(pane) => {
+            let mut lines = Vec::new();
+            let status = if pane.has_claude { "Claude Code" } else { "(shell)" };
+            lines.push((
+                format!("trm:{}  {}", pane.index, status),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ));
+            if let Some(ref cwd) = pane.cwd {
+                lines.push((shorten_path(cwd), Style::default().fg(TEXT2)));
+            } else {
+                lines.push(("(empty pane)".into(), Style::default().fg(TEXT2)));
+            }
+            lines
+        }
     }
-    lines.push((
-        title,
-        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-    ));
-
-    // Find a sibling surface in the same pane whose title looks like a path
-    let pane_path = app.cmux_surfaces.iter()
-        .filter(|s| s.pane_id == surface.pane_id && s.id != surface.id)
-        .find(|s| {
-            let t = &s.title;
-            t.starts_with('/') || t.starts_with('~') || t.starts_with('…') || t.contains("/dev/")
-        })
-        .map(|s| s.title.clone());
-
-    if let Some(path) = pane_path {
-        lines.push((path, Style::default().fg(TEXT2)));
-    } else {
-        let short_pane = &surface.pane_id[..8.min(surface.pane_id.len())];
-        lines.push((
-            format!("pane {}…", short_pane),
-            Style::default().fg(TEXT2),
-        ));
-    }
-
-    lines
 }
 
 fn shorten_path(path: &str) -> String {
@@ -826,11 +994,16 @@ async fn main() -> io::Result<()> {
     }));
 
     let mut app = App::new(shared, port);
-    app.refresh().await;
+
+    // Channel for background discovery results.
+    let (discovery_tx, mut discovery_rx) = mpsc::channel::<DiscoveryResult>(1);
+
+    // Kick off the initial discovery immediately.
+    spawn_discovery(discovery_tx.clone());
 
     let mut event_stream = event::EventStream::new();
     let mut refresh_interval = tokio::time::interval(Duration::from_secs(5));
-    refresh_interval.tick().await;
+    refresh_interval.tick().await; // consume the immediate tick
     let mut log_poll = tokio::time::interval(Duration::from_millis(500));
     log_poll.tick().await;
 
@@ -844,16 +1017,7 @@ async fn main() -> io::Result<()> {
         terminal.draw(|f| ui(f, &mut app))?;
 
         tokio::select! {
-            _ = refresh_interval.tick() => {
-                app.refresh().await;
-            }
-            _ = log_poll.tick() => {
-                let prev_len = app.log_snapshot.len();
-                app.sync_log_snapshot().await;
-                if app.log_snapshot.len() != prev_len {
-                    // New log entries arrived (e.g. from HTTP flush) — redraw
-                }
-            }
+            biased;
             Some(Ok(evt)) = event_stream.next() => {
                 match evt {
                     Event::Key(KeyEvent { code, modifiers, .. }) => {
@@ -888,15 +1052,13 @@ async fn main() -> io::Result<()> {
                             }
 
                             KeyCode::Char('s') | KeyCode::Char('r') => {
-                                app.refresh().await;
-                                app.log("in", "Scan complete".into(), None, true).await;
-                                app.sync_log_snapshot().await;
-                                app.set_toast("Scan complete");
+                                spawn_discovery(discovery_tx.clone());
+                                app.set_toast("Scanning…");
                             }
 
                             KeyCode::Char('l') => {
                                 let flutter_pid = app.selected_flutter().map(|f| f.pid);
-                                let surface_id = app.selected_surface().map(|s| s.id.clone());
+                                let surface_id = app.selected_entry().map(|e| e.id());
 
                                 if let (Some(pid), Some(sid)) = (flutter_pid, surface_id) {
                                     let assoc = Association {
@@ -927,8 +1089,8 @@ async fn main() -> io::Result<()> {
                                         .and_then(|f| app.assoc_for_flutter(f.pid))
                                         .map(|a| a.id.clone()),
                                     Column::Claude => app
-                                        .selected_surface()
-                                        .and_then(|s| app.assoc_for_surface(&s.id))
+                                        .selected_entry()
+                                        .and_then(|e| app.assoc_for_surface(&e.id()))
                                         .map(|a| a.id.clone()),
                                 };
 
@@ -963,35 +1125,58 @@ async fn main() -> io::Result<()> {
                                         app.set_toast(if ok { format!("Focused {}", device) } else { "Focus failed".into() });
                                     }
                                     Column::Claude => {
-                                        let sid = app.selected_surface().map(|s| s.id.clone());
-                                        if let Some(id) = sid {
-                                            let id2 = id.clone();
-                                            let ok = tokio::task::spawn_blocking(move || cmux_focus_surface(&id2))
-                                                .await
-                                                .unwrap_or(false);
-                                            app.log("out", format!("Focus surface {}…", &id[..8.min(id.len())]), None, ok).await;
-                                            app.sync_log_snapshot().await;
-                                            app.set_toast(if ok { "Focused pane" } else { "Focus failed".into() });
-                                        } else {
-                                            app.set_toast("No surface to focus");
+                                        match app.selected_entry() {
+                                            Some(ClaudeEntry::Cmux(surface)) => {
+                                                let id = surface.id.clone();
+                                                let id2 = id.clone();
+                                                let ok = tokio::task::spawn_blocking(move || cmux_focus_surface(&id2))
+                                                    .await
+                                                    .unwrap_or(false);
+                                                app.log("out", format!("Focus surface {}…", &id[..8.min(id.len())]), None, ok).await;
+                                                app.sync_log_snapshot().await;
+                                                app.set_toast(if ok { "Focused pane" } else { "Focus failed".into() });
+                                            }
+                                            Some(ClaudeEntry::Trm(pane)) => {
+                                                let label = pane.folder_name.clone().unwrap_or_else(|| format!("trm:{}", pane.index));
+                                                app.set_toast(format!("trm pane {} has no focus RPC", label));
+                                            }
+                                            None => {
+                                                app.set_toast("No surface to focus");
+                                            }
                                         }
                                     }
                                 }
                             }
 
                             KeyCode::Char('t') => {
-                                if let Some(surface) = app.selected_surface() {
-                                    let sid = surface.id.clone();
-                                    let ok = tokio::task::spawn_blocking(move || {
-                                        cmux_send_text(&sid, "[flan test] hello from flan tui")
-                                    })
-                                    .await
-                                    .unwrap_or(false);
-                                    app.log("out", "Test send".into(), None, ok).await;
-                                    app.sync_log_snapshot().await;
-                                    app.set_toast(if ok { "Test sent" } else { "Test send failed" });
-                                } else {
-                                    app.set_toast("Select a Claude surface first");
+                                match app.selected_entry() {
+                                    Some(ClaudeEntry::Cmux(surface)) => {
+                                        let sid = surface.id.clone();
+                                        let ok = tokio::task::spawn_blocking(move || {
+                                            cmux_send_text(&sid, "TEST MESSAGE FROM FLAN")
+                                                && cmux_send_text(&sid, "\n")
+                                        })
+                                        .await
+                                        .unwrap_or(false);
+                                        let short = surface.id[..8.min(surface.id.len())].to_string();
+                                        app.log("out", format!("Test send → {}…", short), Some("text: TEST MESSAGE FROM FLAN".into()), ok).await;
+                                        app.sync_log_snapshot().await;
+                                        app.set_toast(if ok { "Test sent" } else { "Test send failed" });
+                                    }
+                                    Some(ClaudeEntry::Trm(pane)) => {
+                                        let idx = pane.index;
+                                        let ok = tokio::task::spawn_blocking(move || {
+                                            trm_send_to_pane(idx, "TEST MESSAGE FROM FLAN")
+                                        })
+                                        .await
+                                        .unwrap_or(false);
+                                        app.log("out", format!("Test send → trm:{}", pane.index), Some("text: TEST MESSAGE FROM FLAN".into()), ok).await;
+                                        app.sync_log_snapshot().await;
+                                        app.set_toast(if ok { "Test sent" } else { "Test send failed" });
+                                    }
+                                    None => {
+                                        app.set_toast("Select a Claude surface first");
+                                    }
                                 }
                             }
 
@@ -1008,8 +1193,15 @@ async fn main() -> io::Result<()> {
                                         };
                                         let sid = assoc.claude_surface_id.clone();
                                         let t = text.clone();
+                                        let label = sid[..8.min(sid.len())].to_string();
                                         let ok = tokio::task::spawn_blocking(move || {
-                                            if cmux_send_text(&sid, &t) {
+                                            if sid.starts_with("trm:") {
+                                                if let Ok(idx) = sid["trm:".len()..].parse::<usize>() {
+                                                    trm_send_to_pane(idx, &t)
+                                                } else {
+                                                    false
+                                                }
+                                            } else if cmux_send_text(&sid, &t) {
                                                 cmux_send_text(&sid, "\n")
                                             } else {
                                                 false
@@ -1017,7 +1209,7 @@ async fn main() -> io::Result<()> {
                                         })
                                         .await
                                         .unwrap_or(false);
-                                        app.log("out", format!("Flush → {}…", &assoc.claude_surface_id[..8]), Some(text), ok).await;
+                                        app.log("out", format!("Flush → {}…", label), Some(text), ok).await;
                                         app.sync_log_snapshot().await;
                                         app.set_toast(if ok { "Flushed" } else { "Flush failed" });
                                     } else {
@@ -1035,6 +1227,19 @@ async fn main() -> io::Result<()> {
                     _ => {}
                 }
             }
+            Some(result) = discovery_rx.recv() => {
+                app.apply_discovery(result).await;
+            }
+            _ = refresh_interval.tick() => {
+                spawn_discovery(discovery_tx.clone());
+            }
+            _ = log_poll.tick() => {
+                let prev_len = app.log_snapshot.len();
+                app.sync_log_snapshot().await;
+                if app.log_snapshot.len() != prev_len {
+                    // New log entries arrived (e.g. from HTTP flush) — redraw
+                }
+            }
         }
     }
 
@@ -1043,12 +1248,3 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn clamp_selection(state: &mut ListState, len: usize) {
-    if len == 0 {
-        state.select(None);
-    } else if let Some(i) = state.selected() {
-        if i >= len {
-            state.select(Some(len - 1));
-        }
-    }
-}
