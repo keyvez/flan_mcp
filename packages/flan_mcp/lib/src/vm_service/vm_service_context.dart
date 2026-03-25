@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:logging/logging.dart' as logging;
+import 'package:flan_mcp/src/macro/macro_recorder.dart';
 import 'package:flan_mcp/src/utils/num_parser.dart';
 import 'package:flan_mcp/src/vm_service/vm_service_connector.dart';
 import 'package:mcp_dart/mcp_dart.dart';
@@ -19,6 +20,7 @@ final class VmServiceContext {
 
   final VmServiceConnector connector;
   final logging.Logger _logger;
+  final MacroRecorder _macroRecorder = MacroRecorder();
   McpServer? _server;
 
   /// Buffered messages consumed from the Flutter app queue, available for
@@ -615,6 +617,15 @@ final class VmServiceContext {
             final response = await connector.tap(matcher);
             final message = response['message'] as String?;
 
+            // Record the step if recording is active.
+            if (_macroRecorder.isRecording) {
+              _macroRecorder.recordTap(
+                key: matcher['key'] as String?,
+                text: matcher['text'] as String?,
+                type: matcher['type'] as String?,
+              );
+            }
+
             return CallToolResult(
               content: [TextContent(text: message ?? 'Successfully tapped')],
             );
@@ -653,6 +664,16 @@ final class VmServiceContext {
           try {
             final response = await connector.enterText(matcher, input);
             final message = response['message'] as String?;
+
+            // Record the step if recording is active.
+            if (_macroRecorder.isRecording) {
+              _macroRecorder.recordEnterText(
+                input: input,
+                key: matcher['key'] as String?,
+                text: matcher['text'] as String?,
+                type: matcher['type'] as String?,
+              );
+            }
 
             return CallToolResult(
               content: [
@@ -693,6 +714,15 @@ final class VmServiceContext {
           try {
             final response = await connector.scrollToElement(matcher);
             final message = response['message'] as String?;
+
+            // Record the step if recording is active.
+            if (_macroRecorder.isRecording) {
+              _macroRecorder.recordScrollTo(
+                key: matcher['key'] as String?,
+                text: matcher['text'] as String?,
+                type: matcher['type'] as String?,
+              );
+            }
 
             return CallToolResult(
               content: [
@@ -1019,6 +1049,11 @@ final class VmServiceContext {
           try {
             final response = await connector.navigate(route);
             final message = response['message'] as String?;
+
+            // Record the step if recording is active.
+            if (_macroRecorder.isRecording) {
+              _macroRecorder.recordNavigate(route);
+            }
 
             return CallToolResult(
               content: [
@@ -1485,6 +1520,347 @@ final class VmServiceContext {
               content: [TextContent(text: err.toString())],
             );
           }
+        },
+      )
+      // --- Macro recording tools ---
+      ..registerTool(
+        'start_recording',
+        description:
+            'Starts recording a macro. While recording is active, every '
+            'tap, enter_text, scroll_to, and navigate action is captured as '
+            'a named step. Recording does NOT affect normal tool execution — '
+            'the app still responds to every action as usual. '
+            'Call stop_recording when done to save the macro. '
+            'Does not require an active app connection.',
+        annotations: const ToolAnnotations(title: 'Start Recording Macro'),
+        inputSchema: ToolInputSchema(
+          properties: {
+            'name': JsonSchema.string(
+              description:
+                  'Unique name for the macro (e.g. "login_flow"). '
+                  'Used to retrieve or run it later.',
+            ),
+            'description': JsonSchema.string(
+              description: 'Optional human-readable description of the macro.',
+            ),
+          },
+          required: ['name'],
+        ),
+        callback: (args, extra) async {
+          final name = args['name'] as String;
+          final description = args['description'] as String? ?? '';
+          _logger.info('Starting macro recording: $name');
+
+          try {
+            _macroRecorder.startRecording(
+              name: name,
+              description: description,
+            );
+            return CallToolResult(
+              content: [
+                TextContent(
+                  text:
+                      'Recording started for macro "$name". '
+                      'All tap, enter_text, scroll_to, and navigate calls '
+                      'will be captured. Call stop_recording when done.',
+                ),
+              ],
+            );
+          } catch (err) {
+            return CallToolResult(
+              isError: true,
+              content: [TextContent(text: err.toString())],
+            );
+          }
+        },
+      )
+      ..registerTool(
+        'stop_recording',
+        description:
+            'Stops the active macro recording and saves it under the name '
+            'given to start_recording. Returns a summary of all captured steps. '
+            'Use get_macro or export_macro_as_flutter_test to retrieve the macro.',
+        annotations: const ToolAnnotations(title: 'Stop Recording Macro'),
+        inputSchema: const ToolInputSchema(properties: {}),
+        callback: (args, extra) async {
+          _logger.info('Stopping macro recording');
+
+          try {
+            final macro = _macroRecorder.stopRecording();
+            return CallToolResult(
+              content: [TextContent(text: macro.toSummary())],
+            );
+          } catch (err) {
+            return CallToolResult(
+              isError: true,
+              content: [TextContent(text: err.toString())],
+            );
+          }
+        },
+      )
+      ..registerTool(
+        'list_macros',
+        description:
+            'Lists all saved macros with their names, descriptions, '
+            'step counts, and creation timestamps.',
+        annotations: const ToolAnnotations(
+          title: 'List Macros',
+          readOnlyHint: true,
+          idempotentHint: true,
+        ),
+        inputSchema: const ToolInputSchema(properties: {}),
+        callback: (args, extra) async {
+          final macros = _macroRecorder.listMacros();
+
+          if (macros.isEmpty) {
+            final recordingNote = _macroRecorder.isRecording
+                ? ' (recording "${_macroRecorder.recordingName}" in progress)'
+                : '';
+            return CallToolResult(
+              content: [
+                TextContent(
+                  text: 'No saved macros.$recordingNote',
+                ),
+              ],
+            );
+          }
+
+          final buffer = StringBuffer()
+            ..writeln('${macros.length} macro(s):\n');
+          for (final m in macros) {
+            buffer
+              ..writeln('  Name: ${m.name}')
+              ..writeln(
+                '  Description: ${m.description.isEmpty ? "(none)" : m.description}',
+              )
+              ..writeln('  Steps: ${m.steps.length}')
+              ..writeln('  Created: ${m.createdAt.toIso8601String()}')
+              ..writeln();
+          }
+
+          if (_macroRecorder.isRecording) {
+            final steps = _macroRecorder.currentRecordingSteps ?? [];
+            buffer.writeln(
+              '(Recording "${_macroRecorder.recordingName}" in progress — '
+              '${steps.length} step(s) so far)',
+            );
+          }
+
+          return CallToolResult(
+            content: [TextContent(text: buffer.toString().trimRight())],
+          );
+        },
+      )
+      ..registerTool(
+        'get_macro',
+        description:
+            'Returns the full step-by-step details of a saved macro, '
+            'including each action type, target (key/text/type), and parameters.',
+        annotations: const ToolAnnotations(
+          title: 'Get Macro',
+          readOnlyHint: true,
+          idempotentHint: true,
+        ),
+        inputSchema: ToolInputSchema(
+          properties: {
+            'name': JsonSchema.string(
+              description: 'The name of the macro to retrieve.',
+            ),
+          },
+          required: ['name'],
+        ),
+        callback: (args, extra) async {
+          final name = args['name'] as String;
+          final macro = _macroRecorder.getMacro(name);
+
+          if (macro == null) {
+            return CallToolResult(
+              isError: true,
+              content: [
+                TextContent(text: 'No macro named "$name" found.'),
+              ],
+            );
+          }
+
+          return CallToolResult(
+            content: [TextContent(text: macro.toSummary())],
+          );
+        },
+      )
+      ..registerTool(
+        'delete_macro',
+        description: 'Deletes a saved macro by name.',
+        annotations: const ToolAnnotations(title: 'Delete Macro'),
+        inputSchema: ToolInputSchema(
+          properties: {
+            'name': JsonSchema.string(
+              description: 'The name of the macro to delete.',
+            ),
+          },
+          required: ['name'],
+        ),
+        callback: (args, extra) async {
+          final name = args['name'] as String;
+          final deleted = _macroRecorder.deleteMacro(name);
+
+          if (!deleted) {
+            return CallToolResult(
+              isError: true,
+              content: [TextContent(text: 'No macro named "$name" found.')],
+            );
+          }
+
+          return CallToolResult(
+            content: [TextContent(text: 'Macro "$name" deleted.')],
+          );
+        },
+      )
+      ..registerTool(
+        'run_macro',
+        description:
+            'Replays a saved macro by executing each recorded step against '
+            'the connected Flutter app in order. Steps are: tap, enter_text, '
+            'scroll_to, navigate, wait. '
+            'Requires an active connection established via connect.',
+        annotations: const ToolAnnotations(title: 'Run Macro'),
+        inputSchema: ToolInputSchema(
+          properties: {
+            'name': JsonSchema.string(
+              description: 'The name of the macro to run.',
+            ),
+            'step_delay_ms': JsonSchema.integer(
+              description:
+                  'Optional delay in milliseconds between each step. '
+                  'Defaults to 300.',
+            ),
+          },
+          required: ['name'],
+        ),
+        callback: (args, extra) async {
+          final name = args['name'] as String;
+          final stepDelayMs = (args['step_delay_ms'] as int?) ?? 300;
+          final macro = _macroRecorder.getMacro(name);
+
+          if (macro == null) {
+            return CallToolResult(
+              isError: true,
+              content: [TextContent(text: 'No macro named "$name" found.')],
+            );
+          }
+
+          _logger.info(
+            'Running macro "$name" (${macro.steps.length} steps, '
+            'delay=${stepDelayMs}ms)',
+          );
+
+          final log = StringBuffer()
+            ..writeln('Running macro "${macro.name}" (${macro.steps.length} steps):\n');
+
+          for (var i = 0; i < macro.steps.length; i++) {
+            final step = macro.steps[i];
+            final stepNum = i + 1;
+            log.write('  Step $stepNum/${macro.steps.length}: ${step.toDescription()} … ');
+
+            try {
+              switch (step) {
+                case TapStep(:final key, :final text, :final type):
+                  final matcher = <String, dynamic>{
+                    if (key != null) 'key': key,
+                    if (text != null) 'text': text,
+                    if (type != null) 'type': type,
+                  };
+                  await connector.tap(matcher);
+
+                case EnterTextStep(:final input, :final key, :final text, :final type):
+                  final matcher = <String, dynamic>{
+                    if (key != null) 'key': key,
+                    if (text != null) 'text': text,
+                    if (type != null) 'type': type,
+                  };
+                  await connector.enterText(matcher, input);
+
+                case ScrollToStep(:final key, :final text, :final type):
+                  final matcher = <String, dynamic>{
+                    if (key != null) 'key': key,
+                    if (text != null) 'text': text,
+                    if (type != null) 'type': type,
+                  };
+                  await connector.scrollToElement(matcher);
+
+                case NavigateStep(:final route):
+                  await connector.navigate(route);
+
+                case WaitStep(:final milliseconds):
+                  await Future<void>.delayed(
+                    Duration(milliseconds: milliseconds),
+                  );
+              }
+
+              log.writeln('OK');
+            } catch (err) {
+              log.writeln('FAILED: $err');
+              return CallToolResult(
+                isError: true,
+                content: [
+                  TextContent(
+                    text:
+                        '${log.toString()}\n'
+                        'Macro aborted at step $stepNum.',
+                  ),
+                ],
+              );
+            }
+
+            if (i < macro.steps.length - 1 && stepDelayMs > 0) {
+              await Future<void>.delayed(
+                Duration(milliseconds: stepDelayMs),
+              );
+            }
+          }
+
+          log.writeln('\nMacro "${macro.name}" completed successfully.');
+          return CallToolResult(
+            content: [TextContent(text: log.toString())],
+          );
+        },
+      )
+      ..registerTool(
+        'export_macro_as_flutter_test',
+        description:
+            'Exports a saved macro as a Flutter integration test file '
+            '(Dart source code). The generated test uses the '
+            'flutter_test and integration_test packages and maps each '
+            'recorded step to the appropriate widget finder and test action. '
+            'Steps that targeted elements by key use find.byKey, by text '
+            'use find.text, and by type use find.byType — making the tests '
+            'robust and human-readable.',
+        annotations: const ToolAnnotations(
+          title: 'Export Macro as Flutter Test',
+          readOnlyHint: true,
+          idempotentHint: true,
+        ),
+        inputSchema: ToolInputSchema(
+          properties: {
+            'name': JsonSchema.string(
+              description: 'The name of the macro to export.',
+            ),
+          },
+          required: ['name'],
+        ),
+        callback: (args, extra) async {
+          final name = args['name'] as String;
+          final macro = _macroRecorder.getMacro(name);
+
+          if (macro == null) {
+            return CallToolResult(
+              isError: true,
+              content: [TextContent(text: 'No macro named "$name" found.')],
+            );
+          }
+
+          return CallToolResult(
+            content: [TextContent(text: macro.toFlutterTestFile())],
+          );
         },
       )
       // --- Queue processing tool ---
