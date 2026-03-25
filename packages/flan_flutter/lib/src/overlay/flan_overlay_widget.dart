@@ -340,8 +340,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// Tracks the last time a Ctrl key was pressed for double-tap detection.
   DateTime? _lastCtrlPressTime;
 
-  /// Set to true right after stop_recording so we can show the "copy" sheet.
+  /// Set after stop_recording so we can show the result sheet.
   String? _lastGeneratedTest;
+  List<String> _lastRecordedStepLabels = const [];
 
   @override
   void initState() {
@@ -732,6 +733,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   void _toggleRecording() {
     final recorder = widget.macroRecorderService;
     if (recorder.isRecording) {
+      // Capture labels before stopRecording clears nothing (steps persist).
+      final stepLabels = recorder.steps.map((s) => s.label).toList();
       final source = recorder.stopRecording();
       // Print to the debug console so the developer can copy it from their IDE.
       developer.log(
@@ -740,7 +743,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         '// ─────────────────────────────────────────────────────────────\n',
         name: 'FlanRecorder',
       );
-      setState(() => _lastGeneratedTest = source);
+      setState(() {
+        _lastGeneratedTest = source;
+        _lastRecordedStepLabels = stepLabels;
+      });
     } else {
       // Disable other overlay modes while recording.
       if (widget.inspectorService.enabled) widget.inspectorService.disable();
@@ -756,6 +762,52 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       widget.inspectorService,
       position,
     );
+  }
+
+  /// Sends the generated test source to the agent as a user message.
+  void _sendRecordingToAgent(String source, List<String> stepLabels) {
+    String stepsBlock;
+    if (stepLabels.isEmpty) {
+      stepsBlock = '(no steps recorded)';
+    } else {
+      final buf = StringBuffer();
+      for (var i = 0; i < stepLabels.length; i++) {
+        buf.writeln('  ${i + 1}. ${stepLabels[i]}');
+      }
+      stepsBlock = buf.toString().trimRight();
+    }
+
+    final routeName = _currentRouteName();
+    final data = <String, dynamic>{
+      'kind': 'recorded_integration_test',
+      'testSource': source,
+      if (routeName != null) 'currentRoute': routeName,
+    };
+
+    widget.userMessageService.sendMessage({
+      'type': 'user_feedback',
+      'text':
+          'I recorded an integration test flow in the app.\n'
+          'Please:\n'
+          '1. Save the code below as a new file in the integration_test/ directory '
+          'with a descriptive snake_case filename.\n'
+          '2. Rename the testWidgets description to something meaningful that '
+          'describes what the flow tests.\n'
+          '3. Add brief inline comments above each step explaining what it does '
+          'in terms of user intent (not just the widget name).\n'
+          '4. Replace the TODO pumpWidget line with the correct app entry point '
+          'if you can infer it from the codebase.\n\n'
+          'Recorded steps:\n$stepsBlock\n\n'
+          'Generated test source:\n```dart\n$source```',
+      'data': data,
+    });
+
+    widget.userMessageService.notifyPending();
+    unawaited(_flushToServer());
+    setState(() {
+      _lastGeneratedTest = null;
+      _lastRecordedStepLabels = const [];
+    });
   }
 
   void _openTextMessageOverlay() {
@@ -1359,7 +1411,15 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               _lastGeneratedTest != null)
             _RecordingResultSheet(
               source: _lastGeneratedTest!,
-              onDismiss: () => setState(() => _lastGeneratedTest = null),
+              stepLabels: _lastRecordedStepLabels,
+              onDismiss: () => setState(() {
+                _lastGeneratedTest = null;
+                _lastRecordedStepLabels = const [];
+              }),
+              onSendToAgent: () => _sendRecordingToAgent(
+                _lastGeneratedTest!,
+                _lastRecordedStepLabels,
+              ),
             ),
           // Error indicator dot (positioned to the left of the queue badge)
           if (widget.errorInterceptor.errors.isNotEmpty)
@@ -4475,11 +4535,15 @@ class _RecordingDotState extends State<_RecordingDot>
 class _RecordingResultSheet extends StatelessWidget {
   const _RecordingResultSheet({
     required this.source,
+    required this.stepLabels,
     required this.onDismiss,
+    required this.onSendToAgent,
   });
 
   final String source;
+  final List<String> stepLabels;
   final VoidCallback onDismiss;
+  final VoidCallback onSendToAgent;
 
   @override
   Widget build(BuildContext context) {
@@ -4496,7 +4560,7 @@ class _RecordingResultSheet extends StatelessWidget {
                   children: [
                     const Expanded(
                       child: Text(
-                        'Test generated — copy from IDE console\nor use the clipboard button below.',
+                        'Test recorded',
                         style: TextStyle(
                           color: Colors.white,
                           fontSize: 14,
@@ -4543,6 +4607,31 @@ class _RecordingResultSheet extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(height: 8),
+                // Primary action: send to agent for naming, comments, and filing.
+                GestureDetector(
+                  onTap: onSendToAgent,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A4A8A),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 12),
+                      child: Text(
+                        'Send to agent — add name, comments & save file',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                // Secondary: plain clipboard copy.
                 GestureDetector(
                   onTap: () {
                     Clipboard.setData(ClipboardData(text: source));
@@ -4550,18 +4639,19 @@ class _RecordingResultSheet extends StatelessWidget {
                   },
                   child: DecoratedBox(
                     decoration: BoxDecoration(
-                      color: const Color(0xFF1A6B1A),
+                      color: const Color(0xFF2A2A2A),
                       borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: const Color(0xFF555555)),
                     ),
                     child: const Padding(
-                      padding: EdgeInsets.symmetric(vertical: 12),
+                      padding: EdgeInsets.symmetric(vertical: 10),
                       child: Text(
                         'Copy to clipboard & dismiss',
                         textAlign: TextAlign.center,
                         style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
+                          color: Color(0xFFCCCCCC),
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
                           decoration: TextDecoration.none,
                         ),
                       ),
