@@ -11,6 +11,7 @@ import 'package:flan_flutter/src/services/inspector_service.dart';
 import 'package:flan_flutter/src/services/error_interceptor.dart';
 import 'package:flan_flutter/src/services/github_issue_service.dart';
 import 'package:flan_flutter/src/services/log_collector.dart';
+import 'package:flan_flutter/src/services/macro_recorder_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/scroll_simulator.dart';
@@ -97,6 +98,7 @@ class FlanBinding extends WidgetsFlutterBinding {
   late final AnnotationService _annotationService;
   late final UserMessageService _userMessageService;
   late final ErrorInterceptor _errorInterceptor;
+  late final MacroRecorderService _macroRecorderService;
 
   @override
   void initInstances() {
@@ -119,6 +121,7 @@ class FlanBinding extends WidgetsFlutterBinding {
     _userMessageService.warmUp();
     _errorInterceptor = ErrorInterceptor();
     _errorInterceptor.install();
+    _macroRecorderService = MacroRecorderService();
 
     // Initialize log collection
     _logCollector.initialize();
@@ -133,6 +136,7 @@ class FlanBinding extends WidgetsFlutterBinding {
         userMessageService: _userMessageService,
         screenshotService: _screenshotService,
         errorInterceptor: _errorInterceptor,
+        macroRecorderService: _macroRecorderService,
         child: rootWidget,
       ),
     );

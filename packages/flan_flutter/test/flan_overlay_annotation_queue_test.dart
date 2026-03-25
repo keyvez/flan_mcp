@@ -2,6 +2,7 @@ import 'package:flan_flutter/src/overlay/flan_overlay_widget.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
 import 'package:flan_flutter/src/services/error_interceptor.dart';
 import 'package:flan_flutter/src/services/inspector_service.dart';
+import 'package:flan_flutter/src/services/macro_recorder_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
 import 'package:flutter/material.dart';
@@ -26,6 +27,7 @@ Widget _buildTestApp({
           userMessageService: userMessageService,
           screenshotService: screenshotService,
           errorInterceptor: errorInterceptor,
+          macroRecorderService: MacroRecorderService(),
           child: const ColoredBox(color: Colors.black),
         ),
       ),

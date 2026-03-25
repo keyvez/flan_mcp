@@ -15,6 +15,7 @@ import 'package:flan_flutter/src/services/drawing_service.dart';
 import 'package:flan_flutter/src/services/inspector_service.dart';
 import 'package:flan_flutter/src/services/error_interceptor.dart';
 import 'package:flan_flutter/src/services/github_issue_service.dart';
+import 'package:flan_flutter/src/services/macro_recorder_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
 
@@ -285,6 +286,7 @@ class FlanOverlayWidget extends StatefulWidget {
     required this.userMessageService,
     required this.screenshotService,
     required this.errorInterceptor,
+    required this.macroRecorderService,
     required this.child,
   });
 
@@ -293,6 +295,7 @@ class FlanOverlayWidget extends StatefulWidget {
   final UserMessageService userMessageService;
   final ScreenshotService screenshotService;
   final ErrorInterceptor errorInterceptor;
+  final MacroRecorderService macroRecorderService;
   final Widget child;
 
   @override
@@ -337,6 +340,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// Tracks the last time a Ctrl key was pressed for double-tap detection.
   DateTime? _lastCtrlPressTime;
 
+  /// Set to true right after stop_recording so we can show the "copy" sheet.
+  String? _lastGeneratedTest;
+
   @override
   void initState() {
     super.initState();
@@ -346,6 +352,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     widget.annotationService.addListener(_onAnnotationServiceChanged);
     widget.userMessageService.addListener(_onUserMessageServiceChanged);
     widget.errorInterceptor.addListener(_onServiceChanged);
+    widget.macroRecorderService.addListener(_onServiceChanged);
     HardwareKeyboard.instance.addHandler(_handleGlobalKey);
     _onAnnotationServiceChanged();
   }
@@ -357,6 +364,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     widget.annotationService.removeListener(_onAnnotationServiceChanged);
     widget.userMessageService.removeListener(_onUserMessageServiceChanged);
     widget.errorInterceptor.removeListener(_onServiceChanged);
+    widget.macroRecorderService.removeListener(_onServiceChanged);
     super.dispose();
   }
 
@@ -693,6 +701,12 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       return true;
     }
 
+    // Ctrl+Shift+R — toggle recording mode.
+    if (event.logicalKey == LogicalKeyboardKey.keyR) {
+      _toggleRecording();
+      return true;
+    }
+
     if (event.logicalKey == LogicalKeyboardKey.enter) {
       if (_showErrorPanel && widget.errorInterceptor.errors.isNotEmpty) {
         final errors = List<InterceptedError>.of(
@@ -709,6 +723,39 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     }
 
     return false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Recording mode
+  // ---------------------------------------------------------------------------
+
+  void _toggleRecording() {
+    final recorder = widget.macroRecorderService;
+    if (recorder.isRecording) {
+      final source = recorder.stopRecording();
+      // Print to the debug console so the developer can copy it from their IDE.
+      developer.log(
+        '\n// ── Flan recorded test ──────────────────────────────────────\n'
+        '$source'
+        '// ─────────────────────────────────────────────────────────────\n',
+        name: 'FlanRecorder',
+      );
+      setState(() => _lastGeneratedTest = source);
+    } else {
+      // Disable other overlay modes while recording.
+      if (widget.inspectorService.enabled) widget.inspectorService.disable();
+      if (widget.annotationService.enabled) widget.annotationService.disable();
+      recorder.startRecording();
+      setState(() => _lastGeneratedTest = null);
+    }
+  }
+
+  /// Called when the recording-mode gesture overlay captures a tap.
+  void _onRecordingTap(Offset position) {
+    widget.macroRecorderService.recordTap(
+      widget.inspectorService,
+      position,
+    );
   }
 
   void _openTextMessageOverlay() {
@@ -1298,6 +1345,21 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   ),
                 ),
               ),
+            ),
+          // Recording mode: transparent tap-capture layer + status badge.
+          if (widget.macroRecorderService.isRecording)
+            _RecordingOverlay(
+              onTap: _onRecordingTap,
+              stepCount: widget.macroRecorderService.stepCount,
+              badgeTop: badgeTop,
+              onStop: _toggleRecording,
+            ),
+          // After recording stops, show a sheet with the generated test.
+          if (!widget.macroRecorderService.isRecording &&
+              _lastGeneratedTest != null)
+            _RecordingResultSheet(
+              source: _lastGeneratedTest!,
+              onDismiss: () => setState(() => _lastGeneratedTest = null),
             ),
           // Error indicator dot (positioned to the left of the queue badge)
           if (widget.errorInterceptor.errors.isNotEmpty)
@@ -4250,6 +4312,264 @@ class _ErrorPanelButton extends StatelessWidget {
             fontSize: 10,
             fontWeight: FontWeight.w600,
             decoration: TextDecoration.none,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Recording overlay
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Transparent layer that intercepts taps during recording, plus a status
+/// badge showing the step count and a Stop button.
+class _RecordingOverlay extends StatelessWidget {
+  const _RecordingOverlay({
+    required this.onTap,
+    required this.stepCount,
+    required this.badgeTop,
+    required this.onStop,
+  });
+
+  final void Function(Offset) onTap;
+  final int stepCount;
+  final double badgeTop;
+  final VoidCallback onStop;
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: Stack(
+        children: [
+          // Transparent full-screen tap catcher.
+          Positioned.fill(
+            child: Listener(
+              behavior: HitTestBehavior.translucent,
+              onPointerUp: (e) => onTap(e.position),
+            ),
+          ),
+          // Top-centre status badge.
+          Positioned(
+            top: badgeTop,
+            left: 0,
+            right: 0,
+            child: IgnorePointer(
+              child: Align(
+                alignment: Alignment.topCenter,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: const Color(0xEE2A0000),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(color: const Color(0xFFFF3333)),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 6,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const _RecordingDot(),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Recording  •  $stepCount step${stepCount == 1 ? "" : "s"}  •  Ctrl+Shift+R to stop',
+                          style: const TextStyle(
+                            color: Color(0xFFFF9999),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            decoration: TextDecoration.none,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          // Stop button (bottom-right, tappable).
+          Positioned(
+            bottom: 32,
+            right: 16,
+            child: GestureDetector(
+              onTap: onStop,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: const Color(0xEECC0000),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  child: Text(
+                    '⏹  Stop recording',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                      decoration: TextDecoration.none,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Blinking red circle shown in the recording badge.
+class _RecordingDot extends StatefulWidget {
+  const _RecordingDot();
+
+  @override
+  State<_RecordingDot> createState() => _RecordingDotState();
+}
+
+class _RecordingDotState extends State<_RecordingDot>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _ctrl,
+      builder: (_, __) => Opacity(
+        opacity: 0.3 + 0.7 * _ctrl.value,
+        child: Container(
+          width: 10,
+          height: 10,
+          decoration: const BoxDecoration(
+            color: Color(0xFFFF3333),
+            shape: BoxShape.circle,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Result sheet shown after recording stops
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _RecordingResultSheet extends StatelessWidget {
+  const _RecordingResultSheet({
+    required this.source,
+    required this.onDismiss,
+  });
+
+  final String source;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: ColoredBox(
+        color: const Color(0xCC000000),
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        'Test generated — copy from IDE console\nor use the clipboard button below.',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                    GestureDetector(
+                      onTap: onDismiss,
+                      child: const Padding(
+                        padding: EdgeInsets.all(8),
+                        child: Text(
+                          '✕',
+                          style: TextStyle(
+                            color: Color(0xFFAAAAAA),
+                            fontSize: 18,
+                            decoration: TextDecoration.none,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A1A1A),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(12),
+                      child: Text(
+                        source,
+                        style: const TextStyle(
+                          color: Color(0xFFCCFFCC),
+                          fontSize: 11,
+                          fontFamily: 'monospace',
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                GestureDetector(
+                  onTap: () {
+                    Clipboard.setData(ClipboardData(text: source));
+                    onDismiss();
+                  },
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A6B1A),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 12),
+                      child: Text(
+                        'Copy to clipboard & dismiss',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
