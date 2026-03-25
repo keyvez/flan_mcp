@@ -753,6 +753,13 @@ fn build_flutter_lines(app: &App, idx: usize) -> Vec<(String, Style)> {
         Style::default().fg(TEXT2),
     ));
 
+    if fl.queue_count > 0 {
+        lines.push((
+            format!("{} queued", fl.queue_count),
+            Style::default().fg(ORANGE),
+        ));
+    }
+
     lines
 }
 
@@ -1187,6 +1194,11 @@ async fn main() -> io::Result<()> {
 
                                     let assoc = app.assoc_for_flutter(pid).cloned();
                                     if let Some(assoc) = assoc {
+                                        // Re-probe at flush time if not in cache — the
+                                        // discovery cycle may have missed the URI.
+                                        let vm_uri = vm_uri.or_else(|| {
+                                            tokio::task::block_in_place(|| probe_vm_service_uri(pid))
+                                        });
                                         let text = match &vm_uri {
                                             Some(uri) => format!("flan connect to {} and process queue once connected", uri),
                                             None => "process queue".to_string(),

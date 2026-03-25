@@ -99,14 +99,15 @@ Future<int> main(List<String> arguments) async {
     }
 
     // --- Best-effort cmux bridge ---
-    CmuxPaneBridge? cmuxBridge;
+    // Always create the bridge — it uses the flan server HTTP endpoint first
+    // regardless of whether the cmux socket is reachable. Only discard it if
+    // even the flan server is unreachable (handled inside sendProcessQueue).
+    final cmuxBridge = CmuxPaneBridge();
     try {
-      cmuxBridge = CmuxPaneBridge();
       await cmuxBridge.connect();
       logger.info('Connected to cmux socket');
     } catch (err) {
-      logger.warning('cmux socket not available (not running in cmux?): $err');
-      cmuxBridge = null;
+      logger.warning('cmux socket not available (will use flan server only): $err');
     }
 
     // --- Set up VmServiceContext (same as flan_mcp.dart) ---
@@ -120,25 +121,6 @@ Future<int> main(List<String> arguments) async {
           logger.info('Marked pane as connected in trm');
         } catch (err) {
           logger.fine('TrmPaneBridge markConnected failed: $err');
-        }
-      }());
-    };
-
-    // Hook into the onUserMessageQueued callback chain.
-    // We wrap the existing callback so both the standard notification
-    // and our bridge send happen.
-    final originalCallback = vmService.connector.onUserMessageQueued;
-
-    vmService.connector.onUserMessageQueued = () {
-      // Call the original callback first (set later by registerTools).
-      originalCallback?.call();
-
-      // Send process_queue to the Claude pane in trm.
-      unawaited(() async {
-        try {
-          await bridge.sendProcessQueue();
-        } catch (err) {
-          logger.fine('TrmPaneBridge send failed: $err');
         }
       }());
     };
@@ -170,86 +152,46 @@ Important: Elements are matched by their key (ValueKey<String>) or text content.
       ),
     );
 
-    // registerTools sets connector.onUserMessageQueued internally, but we
-    // already set our wrapper above. The wrapper calls originalCallback
-    // which was null at the time of capture. After registerTools runs,
-    // the connector's callback is our wrapper — registerTools will
-    // overwrite it with the internal one. We need to re-wrap.
     vmService.registerTools(server);
-
-    // Re-wrap: capture the callback that registerTools just set.
-    final registeredCallback = vmService.connector.onUserMessageQueued;
-    vmService.connector.onUserMessageQueued = () {
-      registeredCallback?.call();
-
-      // Send process_queue to the Claude pane in trm.
-      unawaited(() async {
-        try {
-          await bridge.sendProcessQueue();
-        } catch (err) {
-          logger.fine('TrmPaneBridge send failed: $err');
-        }
-      }());
-
-      // Send process queue <uri> to the Claude pane in cmux.
-      final cmux = cmuxBridge;
-      if (cmux != null) {
-        logger.info('Triggering cmux bridge (uri=${vmService.connector.connectedUri})');
-        unawaited(() async {
-          try {
-            await cmux.sendProcessQueue(
-              vmService.connector.connectedUri,
-            );
-          } catch (err) {
-            logger.warning('CmuxPaneBridge send failed: $err');
-          }
-        }());
-      } else {
-        logger.info('cmux bridge is null, skipping');
-      }
-    };
 
     // --- Auto-discover Flutter app and listen for flush events ---
     // This is a lightweight event-only connection, independent of the
     // flan tool connection. It listens for userMessageQueued events
     // and triggers the cmux bridge to send the process queue command.
-    if (cmuxBridge != null) {
-      final cmux = cmuxBridge;
-      unawaited(() async {
-        try {
-          final uris = await discoverVmServiceUris();
-          if (uris.isEmpty) {
-            logger.info('No Flutter apps discovered for event listener');
-            return;
-          }
-          final uri = uris.first;
-          logger.info('Connecting event listener to $uri');
-          final eventService = await vmServiceConnectUri(uri);
-          eventService.onExtensionEvent.listen((e) {
-            if (e.kind == EventKind.kExtension &&
-                e.extensionKind == 'flan.userMessageQueued') {
-              logger.info('Flush event received, triggering cmux bridge');
-              unawaited(() async {
-                try {
-                  await cmux.sendProcessQueue(uri);
-                } catch (err) {
-                  logger.warning('CmuxPaneBridge send failed: $err');
-                }
-              }());
-            }
-          });
-          await eventService.streamListen(EventStreams.kExtension);
-          logger.info('Event listener active on $uri');
-
-          // Reconnect if connection drops.
-          eventService.onDone.then((_) {
-            logger.info('Event listener connection lost');
-          });
-        } catch (err) {
-          logger.fine('Event listener setup failed: $err');
+    unawaited(() async {
+      try {
+        final uris = await discoverVmServiceUris();
+        if (uris.isEmpty) {
+          logger.info('No Flutter apps discovered for event listener');
+          return;
         }
-      }());
-    }
+        final uri = uris.first;
+        logger.info('Connecting event listener to $uri');
+        final eventService = await vmServiceConnectUri(uri);
+        eventService.onExtensionEvent.listen((e) {
+          if (e.kind == EventKind.kExtension &&
+              e.extensionKind == 'flan.userMessageQueued') {
+            logger.info('Flush event received, triggering cmux bridge');
+            unawaited(() async {
+              try {
+                await cmuxBridge.sendProcessQueue(uri);
+              } catch (err) {
+                logger.warning('CmuxPaneBridge send failed: $err');
+              }
+            }());
+          }
+        });
+        await eventService.streamListen(EventStreams.kExtension);
+        logger.info('Event listener active on $uri');
+
+        // Reconnect if connection drops.
+        eventService.onDone.then((_) {
+          logger.info('Event listener connection lost');
+        });
+      } catch (err) {
+        logger.fine('Event listener setup failed: $err');
+      }
+    }());
 
     if (ssePort != null) {
       return await runSseServer(server, ssePort, bridge, cmuxBridge);
@@ -300,7 +242,7 @@ String _formatTime(DateTime time) {
 }
 
 Future<int> runStdioServer(
-    McpServer server, TrmPaneBridge bridge, CmuxPaneBridge? cmuxBridge) async {
+    McpServer server, TrmPaneBridge bridge, CmuxPaneBridge cmuxBridge) async {
   final logger = logging.Logger('main');
 
   final transport = CopilotCompatStdioServerTransport();
@@ -333,7 +275,7 @@ Future<int> runStdioServer(
   ]);
 
   await bridge.close();
-  await cmuxBridge?.close();
+  await cmuxBridge.close();
   await server.close();
   await transport.close();
   logger.info('Stopped');
@@ -344,7 +286,7 @@ Future<int> runSseServer(
   McpServer server,
   int ssePort,
   TrmPaneBridge bridge,
-  CmuxPaneBridge? cmuxBridge,
+  CmuxPaneBridge cmuxBridge,
 ) async {
   final logger = logging.Logger('main');
   final sseServerManager = SseServerManager(server);
@@ -367,7 +309,7 @@ Future<int> runSseServer(
 
     logger.info('Stopping');
     await bridge.close();
-    await cmuxBridge?.close();
+    await cmuxBridge.close();
     await server.close();
   } catch (e, st) {
     logger.severe('Error when waiting for MCP client connection', e, st);

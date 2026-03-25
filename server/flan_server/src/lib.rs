@@ -29,6 +29,8 @@ pub struct FlutterApp {
     pub folder_name: String,
     pub vm_service_uri: Option<String>,
     pub device: Option<String>,
+    #[serde(default)]
+    pub queue_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +304,7 @@ mod server {
         State(state): State<Arc<SharedState>>,
         Json(body): Json<FlushRequest>,
     ) -> impl IntoResponse {
+        tracing::info!("handle_flush: pid={:?} vm_service_uri={:?}", body.flutter_pid, body.vm_service_uri);
         let surfaces: Vec<CmuxSurface> = tokio::task::spawn_blocking(cmux_surface_list)
             .await
             .unwrap_or_default();
@@ -386,7 +389,10 @@ mod server {
             "flan connect --mode desktop and process queue once connected".to_string()
         } else {
             let vm_uri = body.vm_service_uri.clone().or_else(|| {
-                let flutter_pid = assoc.as_ref().map(|a| a.flutter_pid)?;
+                // Use the association's pid, or fall back to the pid from the
+                // request body (for first-contact flushes with no association yet).
+                let flutter_pid = assoc.as_ref().map(|a| a.flutter_pid)
+                    .or(body.flutter_pid)?;
                 if let Ok(cache) = state.flutter_cache.try_read() {
                     if let Some((_, ref apps)) = *cache {
                         if let Some(app) = apps.iter().find(|a| a.pid == flutter_pid) {
@@ -797,12 +803,17 @@ pub fn discover_flutter_apps() -> Vec<FlutterApp> {
         let folder_name = cwd.rsplit('/').next().unwrap_or(&cwd).to_string();
         let vm_uri = probe_vm_service_uri(pid);
 
+        let queue_count = vm_uri
+            .as_deref()
+            .map(peek_flan_queue)
+            .unwrap_or(0);
         apps.push(FlutterApp {
             pid,
             cwd,
             folder_name,
             vm_service_uri: vm_uri,
             device: Some(device),
+            queue_count,
         });
     }
 
@@ -1012,6 +1023,82 @@ pub fn probe_port(port: u16) -> Option<String> {
     }
 
     None
+}
+
+/// Call ext.flutter.flan.peekUserMessages via the VM service WebSocket and
+/// return the queue count, or 0 if unreachable / extension not registered.
+pub fn peek_flan_queue(ws_uri: &str) -> usize {
+    use tungstenite::connect;
+    use tungstenite::Message;
+
+    // ws_uri looks like ws://127.0.0.1:PORT/TOKEN/ws
+    let (mut socket, _) = match connect(ws_uri) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+
+    let timeout = Duration::from_secs(3);
+
+    // 1. Get the isolate id.
+    let get_vm = serde_json::json!({
+        "jsonrpc": "2.0", "method": "getVM", "id": "1"
+    })
+    .to_string();
+    if socket.send(Message::Text(get_vm.into())).is_err() { return 0; }
+
+    let isolate_id = 'outer: {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if std::time::Instant::now() > deadline { break 'outer None; }
+            match socket.read() {
+                Ok(Message::Text(t)) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                        if let Some(id) = v["result"]["isolates"][0]["id"].as_str() {
+                            break 'outer Some(id.to_string());
+                        }
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => break 'outer None,
+            }
+        }
+    };
+
+    let isolate_id = match isolate_id {
+        Some(id) => id,
+        None => return 0,
+    };
+
+    // 2. Call peekUserMessages.
+    let peek = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "callServiceExtension",
+        "params": {
+            "isolateId": isolate_id,
+            "method": "ext.flutter.flan.peekUserMessages",
+        },
+        "id": "2"
+    })
+    .to_string();
+    if socket.send(Message::Text(peek.into())).is_err() { return 0; }
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::time::Instant::now() > deadline { return 0; }
+        match socket.read() {
+            Ok(Message::Text(t)) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
+                    if v["id"] == "2" {
+                        let count = v["result"]["count"].as_u64().unwrap_or(0) as usize;
+                        let _ = socket.close(None);
+                        return count;
+                    }
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => return 0,
+        }
+    }
 }
 
 // ── Discovery: trm Panes ────────────────────────────────────────────────

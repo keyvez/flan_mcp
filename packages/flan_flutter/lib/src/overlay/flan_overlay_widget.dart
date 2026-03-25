@@ -754,6 +754,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       'text': 'User message: $displayText',
       'data': data,
     });
+    unawaited(_flushToServer());
   }
 
   /// Packages up the current inspector selection and/or annotations
