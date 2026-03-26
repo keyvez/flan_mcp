@@ -137,7 +137,7 @@ impl SharedState {
 mod server {
     use super::*;
     use axum::{
-        extract::State,
+        extract::{Query, State},
         http::StatusCode,
         response::{Html, IntoResponse},
         routing::{delete, get, post},
@@ -325,7 +325,12 @@ mod server {
         }
 
         let assoc = if let Some(pid) = body.flutter_pid {
-            assocs.iter().find(|a| a.flutter_pid == pid).cloned()
+            // Prefer an exact pid match; fall back to any saved association so
+            // that a re-launched Flutter app (new pid) still routes to the
+            // linked Claude surface.
+            assocs.iter().find(|a| a.flutter_pid == pid)
+                .or_else(|| assocs.first())
+                .cloned()
         } else {
             assocs.first().cloned()
         };
@@ -561,11 +566,47 @@ mod server {
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     }
 
-    async fn get_status(State(state): State<Arc<SharedState>>) -> Json<serde_json::Value> {
+    async fn get_status(
+        State(state): State<Arc<SharedState>>,
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let flutter_pid: Option<u32> = params.get("pid").and_then(|s| s.parse().ok());
         let assocs = state.associations.read().await;
+
+        // Find the association for this flutter pid (exact match, then any).
+        let assoc = if let Some(pid) = flutter_pid {
+            assocs.iter().find(|a| a.flutter_pid == pid)
+                .or_else(|| assocs.first())
+                .cloned()
+        } else {
+            assocs.first().cloned()
+        };
+
+        // Derive a short label from the claude_surface_id.
+        // For trm panes, look up the surface's folder_name via discover_trm_panes.
+        let linked_label: Option<String> = assoc.as_ref().map(|a| {
+            let sid = &a.claude_surface_id;
+            if sid.starts_with("trm:") {
+                // Try to get the folder_name for this pane from live discovery.
+                if let Ok(idx) = sid["trm:".len()..].parse::<usize>() {
+                    let panes = discover_trm_panes();
+                    panes.iter()
+                        .find(|p| p.index == idx)
+                        .and_then(|p| p.folder_name.clone())
+                        .unwrap_or_else(|| sid.clone())
+                } else {
+                    sid.clone()
+                }
+            } else {
+                // For cmux surfaces, use the last component of the surface id.
+                sid[..8.min(sid.len())].to_string()
+            }
+        });
+
         Json(serde_json::json!({
-            "has_association": !assocs.is_empty(),
+            "has_association": assoc.is_some(),
             "association_count": assocs.len(),
+            "linked_label": linked_label,
         }))
     }
 
@@ -1107,11 +1148,11 @@ pub fn peek_flan_queue(ws_uri: &str) -> usize {
 // ── Discovery: trm Panes ────────────────────────────────────────────────
 
 pub fn discover_trm_panes() -> Vec<TrmPane> {
-    // Use surface.list as the single source of truth.
-    // surface_id  = used for surface.focus RPC
-    // pane_id     = used for the {"type":"send","pane":N} protocol
-    // has_claude  = true when Claude is actively running (title contains
-    //               "Claude" or looks like a task description with a spinner)
+    // surface.list gives us surface_id, pane_id, and title for has_claude detection.
+    // Cwds come from the ps process tree: trm → login → shell → (maybe claude).
+    // The i-th login child (sorted by pid) corresponds to the i-th surface (sorted
+    // by pane_id), because trm spawns login processes in pane order and pane IDs are
+    // monotonically increasing.
     let surfaces = trm_rpc("surface.list", serde_json::json!({}))
         .and_then(|r| r.get("result")?.get("surfaces")?.as_array().cloned())
         .unwrap_or_default();
@@ -1120,118 +1161,155 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         return Vec::new();
     }
 
-    let home = std::env::var("HOME").unwrap_or_default();
-
-    // Collect all claude process cwds so we can match them to surfaces by path.
-    // key: last two path components of cwd (e.g. "dev/flan_mcp"), value: full cwd
-    let claude_cwds: Vec<String> = {
-        let ps = match Command::new("ps").args(["-eo", "pid,comm"]).output() {
-            Ok(o) => o,
-            Err(_) => return Vec::new(),
-        };
-        String::from_utf8_lossy(&ps.stdout)
-            .lines()
-            .filter_map(|l| {
-                let mut it = l.split_whitespace();
-                let pid_s = it.next()?;
-                let comm = it.next()?;
-                if !comm.contains("claude") || comm.contains("flan") { return None; }
-                let pid: u32 = pid_s.parse().ok()?;
-                let cwd = get_process_cwd(pid);
-                if cwd.is_empty() { None } else { Some(cwd) }
-            })
-            .collect()
+    // Find trm process pid.
+    let Ok(ps_out) = Command::new("ps").args(["-eo", "pid,comm"]).output() else {
+        return Vec::new();
     };
+    let ps_str = String::from_utf8_lossy(&ps_out.stdout);
+    let trm_pid: u32 = ps_str
+        .lines()
+        .find(|l| {
+            let comm = l.split_whitespace().nth(1).unwrap_or("");
+            comm.ends_with("/trm") || comm == "trm"
+        })
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
-    let mut used_cwds: HashSet<String> = HashSet::new();
+    // Build pid→ppid→comm map for all processes.
+    let Ok(ps_all) = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output() else {
+        return Vec::new();
+    };
+    let ps_all_str = String::from_utf8_lossy(&ps_all.stdout);
+    // (pid, ppid, comm)
+    let all_procs: Vec<(u32, u32, String)> = ps_all_str
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid: u32 = it.next()?.parse().ok()?;
+            let ppid: u32 = it.next()?.parse().ok()?;
+            let comm = it.next()?.to_string();
+            Some((pid, ppid, comm))
+        })
+        .collect();
+
+    // Login children of trm, sorted by pid (creation order = pane order).
+    let mut login_pids: Vec<u32> = all_procs
+        .iter()
+        .filter(|(_, ppid, comm)| {
+            *ppid == trm_pid && (comm.contains("login") || comm.ends_with("login"))
+        })
+        .map(|(pid, _, _)| *pid)
+        .collect();
+    login_pids.sort();
+
+    // For each login, find its shell child and that shell's claude subprocess (if any).
+    // Returns (shell_cwd, has_claude_child, claude_cwd).
+    let pane_cwds: Vec<(String, bool, Option<String>)> = login_pids
+        .iter()
+        .map(|&login| {
+            // Direct shell child of login.
+            let shell_pid = all_procs
+                .iter()
+                .find(|(_, ppid, comm)| {
+                    *ppid == login
+                        && (comm.ends_with("zsh")
+                            || comm.ends_with("bash")
+                            || comm.ends_with("fish"))
+                })
+                .map(|(pid, _, _)| *pid)
+                .unwrap_or(0);
+
+            let shell_cwd = if shell_pid > 0 {
+                get_process_cwd(shell_pid)
+            } else {
+                String::new()
+            };
+
+            // Look for a claude subprocess under the shell.
+            let claude_pid = all_procs
+                .iter()
+                .find(|(_, ppid, comm)| {
+                    *ppid == shell_pid
+                        && comm.contains("claude")
+                        && !comm.contains("flan")
+                })
+                .map(|(pid, _, _)| *pid);
+
+            let (has_claude, claude_cwd) = if let Some(cpid) = claude_pid {
+                let cwd = get_process_cwd(cpid);
+                (true, if cwd.is_empty() { None } else { Some(cwd) })
+            } else {
+                (false, None)
+            };
+
+            (shell_cwd, has_claude, claude_cwd)
+        })
+        .collect();
+
+    // Sort surfaces by pane_id to align with sorted login_pids.
+    let mut sorted_surfaces = surfaces.clone();
+    sorted_surfaces.sort_by_key(|s| {
+        s.get("pane_id")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    });
+
     let mut panes: Vec<TrmPane> = Vec::new();
 
-    for s in surfaces {
+    for (i, s) in sorted_surfaces.iter().enumerate() {
         let surface_id = match s.get("surface_id").and_then(|v| v.as_str()) {
             Some(id) => id.to_string(),
             None => continue,
         };
-        let pane_id: usize = match s.get("pane_id").and_then(|v| v.as_str()).and_then(|v| v.parse().ok()) {
+        let pane_id: usize = match s
+            .get("pane_id")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse().ok())
+        {
             Some(id) => id,
             None => continue,
         };
-        let title = match s.get("title").and_then(|v| v.as_str()) {
-            Some(t) => t.to_string(),
-            None => continue,
+        let title = s.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // has_claude: prefer process-tree truth; fall back to title heuristic.
+        let (shell_cwd, proc_has_claude, claude_cwd) = pane_cwds
+            .get(i)
+            .cloned()
+            .unwrap_or_default();
+
+        // Title heuristic for has_claude (used when process tree doesn't cover this pane).
+        let title_has_claude = {
+            let starts_with_spinner = title.chars().next()
+                .map(|c| !c.is_ascii() && c != '~' && c != '/')
+                .unwrap_or(false);
+            let clean = title.trim_start_matches(|c: char| {
+                !c.is_alphanumeric() && c != '~' && c != '/'
+            }).trim();
+            title.contains("Claude")
+                || (starts_with_spinner
+                    && !clean.starts_with('~')
+                    && !clean.starts_with('/'))
         };
+        let has_claude = proc_has_claude || title_has_claude;
 
-        // Strip leading status/spinner characters (✳ ⠂ ⠐ etc.).
-        let clean = title
-            .trim_start_matches(|c: char| {
-                !c.is_alphanumeric() && c != '~' && c != '/' && c != '\u{2026}'
-            })
-            .trim();
+        // Use claude cwd if available, otherwise shell cwd.
+        let best_cwd = claude_cwd.or_else(|| {
+            if shell_cwd.is_empty() { None } else { Some(shell_cwd) }
+        });
 
-        // Determine has_claude:
-        //   1. Title explicitly contains "Claude" (idle: "✳ Claude Code")
-        //   2. Title starts with a non-ASCII spinner/status char and the rest
-        //      is NOT a path (active task: "⠂ Add feature…").
-        //      Shell panes show paths (~/…, /…, …) or plain commands without
-        //      leading non-ASCII characters.
-        let starts_with_spinner = title.chars().next()
-            .map(|c| !c.is_ascii() && c != '~' && c != '/' && c != '\u{2026}')
-            .unwrap_or(false);
-        let has_claude = title.contains("Claude")
-            || (starts_with_spinner
-                && !clean.starts_with('~')
-                && !clean.starts_with('/')
-                && !clean.starts_with('\u{2026}'));
-
-        let (folder_name, cwd) = if clean.starts_with('~')
-            || clean.starts_with('/')
-            || clean.starts_with('\u{2026}')
-        {
-            // Path visible in title — expand ~ and shorten to last 2 parts.
-            let expanded = if clean.starts_with('~') && !home.is_empty() {
-                format!("{}{}", home, &clean[1..])
-            } else {
-                clean.to_string()
-            };
-            let parts: Vec<&str> =
-                expanded.trim_end_matches('/').rsplitn(3, '/').collect();
+        let (folder_name, cwd) = if let Some(ref c) = best_cwd {
+            let parts: Vec<&str> = c.trim_end_matches('/').rsplitn(3, '/').collect();
             let short = match parts.len() {
-                0 => expanded.clone(),
+                0 => c.clone(),
                 1 => parts[0].to_string(),
                 _ => format!("{}/{}", parts[1], parts[0]),
             };
-            let abs = if expanded.starts_with('/') { Some(expanded) } else { None };
-            (Some(short), abs)
-        } else if has_claude {
-            // No path in title. Try to match a claude process cwd by last path
-            // component appearing in the title. Do NOT fall back to first cwd —
-            // that would assign the same cwd to every active-task pane and break
-            // pairing in the TUI.
-            let matched_cwd = claude_cwds.iter()
-                .filter(|c| !used_cwds.contains(*c))
-                .find(|cwd| {
-                    let last = cwd.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-                    !last.is_empty() && title.contains(last)
-                })
-                .cloned();
-
-            if let Some(ref cwd) = matched_cwd {
-                used_cwds.insert(cwd.clone());
-            }
-
-            if let Some(cwd) = matched_cwd {
-                let parts: Vec<&str> =
-                    cwd.trim_end_matches('/').rsplitn(3, '/').collect();
-                let short = match parts.len() {
-                    0 => cwd.clone(),
-                    1 => parts[0].to_string(),
-                    _ => format!("{}/{}", parts[1], parts[0]),
-                };
-                (Some(short), Some(cwd))
-            } else {
-                (Some(clean.to_string()), None)
-            }
+            (Some(short), Some(c.clone()))
         } else {
-            (Some(clean.to_string()), None)
+            (None, None)
         };
 
         panes.push(TrmPane {

@@ -1,6 +1,7 @@
 import 'dart:developer' as developer;
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show pid;
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
@@ -45,6 +46,7 @@ class UserMessageService extends ChangeNotifier {
   Timer? _completionClearTimer;
 
   bool _hasServerAssociation = false;
+  String? _linkedLabel;
   Timer? _serverPollTimer;
 
   /// Safety timeout: auto-clear working state if the agent never calls
@@ -166,6 +168,10 @@ class UserMessageService extends ChangeNotifier {
   /// Claude Code to connect; this reflects post-connection state, not a
   /// prerequisite for flushing.
   bool get hasServerAssociation => _hasServerAssociation;
+
+  /// Short label identifying the linked Claude surface (e.g. "dev/flan_mcp").
+  /// Null when not linked.
+  String? get linkedLabel => _linkedLabel;
 
   /// Monotonic counter incremented whenever queued messages are consumed
   /// through the MCP consume path.
@@ -525,13 +531,15 @@ class UserMessageService extends ChangeNotifier {
   Future<void> pollServerStatus() async {
     try {
       final response = await _httpClient
-          .get(Uri.parse('http://localhost:4050/api/status'))
+          .get(Uri.parse('http://localhost:4050/api/status?pid=$pid'))
           .timeout(const Duration(seconds: 3));
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         final has = data['has_association'] == true;
-        if (_hasServerAssociation != has) {
+        final label = has ? data['linked_label'] as String? : null;
+        if (_hasServerAssociation != has || _linkedLabel != label) {
           _hasServerAssociation = has;
+          _linkedLabel = label;
           notifyListeners();
         }
       } else {
@@ -543,8 +551,9 @@ class UserMessageService extends ChangeNotifier {
   }
 
   void _setServerAssociation(bool value) {
-    if (_hasServerAssociation != value) {
+    if (_hasServerAssociation != value || (value == false && _linkedLabel != null)) {
       _hasServerAssociation = value;
+      if (!value) _linkedLabel = null;
       notifyListeners();
     }
   }

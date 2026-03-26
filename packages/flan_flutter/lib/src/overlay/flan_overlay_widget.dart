@@ -1370,29 +1370,68 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               top: badgeTop,
               left: 0,
               right: 0,
-              child: IgnorePointer(
-                child: Align(
-                  alignment: Alignment.topCenter,
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      color: const Color(0xE6201410),
-                      borderRadius: BorderRadius.circular(999),
-                      border: Border.all(
-                        color: const Color(0xFFFF6600),
-                        width: 1,
-                      ),
+              child: Align(
+                alignment: Alignment.topCenter,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: const Color(0xE6201410),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(
+                      color: const Color(0xFFFF6600),
+                      width: 1,
                     ),
-                    child: const Padding(
-                      padding:
-                          EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                      child: Text(
-                        'Annotation mode ON  •  Drag to draw, Enter to save',
-                        style: TextStyle(
-                          color: Color(0xFFFFC8A0),
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
+                  ),
+                  child: Padding(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text(
+                          'Annotation mode ON  •  Drag to draw, Enter to save',
+                          style: TextStyle(
+                            color: Color(0xFFFFC8A0),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
-                      ),
+                        const SizedBox(width: 10),
+                        GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () {
+                            widget.annotationService.disable();
+                            _toggleRecording();
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFFF3B30).withValues(alpha: 0.2),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.fiber_manual_record,
+                                  size: 10,
+                                  color: Color(0xFFFF6060),
+                                ),
+                                SizedBox(width: 3),
+                                Text(
+                                  'Record',
+                                  style: TextStyle(
+                                    color: Color(0xFFFF6060),
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w600,
+                                    decoration: TextDecoration.none,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -1517,6 +1556,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                     widget.userMessageService.isPushCapableHostConnected,
                 serverLinked:
                     widget.userMessageService.hasServerAssociation,
+                linkedLabel:
+                    widget.userMessageService.linkedLabel,
               ),
             ),
           ),
@@ -2927,75 +2968,108 @@ class _QueuedMessagesBadge extends StatelessWidget {
     required this.count,
     required this.pushConnected,
     this.serverLinked = false,
+    this.linkedLabel,
   });
 
   final int count;
   final bool? pushConnected;
   final bool serverLinked;
+  final String? linkedLabel;
 
   @override
   Widget build(BuildContext context) {
     final text = count > 99 ? '99+' : '$count';
-    return Stack(
-      clipBehavior: Clip.none,
+    // Show a label pill when linked and a label is available.
+    final showLabel = serverLinked && linkedLabel != null && linkedLabel!.isNotEmpty;
+    // Use just the last path component for a compact label.
+    final labelText = linkedLabel?.split('/').where((s) => s.isNotEmpty).last ?? '';
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        Container(
-          width: 28,
-          height: 28,
-          decoration: BoxDecoration(
-            color: const Color(0xFF005FCC),
-            borderRadius: BorderRadius.circular(999),
-            border: Border.all(
-              color: (pushConnected ?? false)
-                  ? const Color(0xFF38D76A)
-                  : serverLinked
-                      ? const Color(0xFFFF9500)
-                      : const Color(0xFFFFFFFF),
-              width: 2,
-            ),
-            boxShadow: const [
-              BoxShadow(
-                color: Color(0xAA000000),
-                blurRadius: 12,
-                offset: Offset(0, 4),
-              ),
-            ],
-          ),
-          child: const Center(
-            child: Text(
-              'Q',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                color: Color(0xFFFFFFFF),
-                fontSize: 12,
-                fontWeight: FontWeight.w800,
-                decoration: TextDecoration.none,
-              ),
-            ),
-          ),
-        ),
-        Positioned(
-          right: -8,
-          top: -8,
-          child: Container(
-            constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
-            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+        if (showLabel) ...[
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
             decoration: BoxDecoration(
-              color: const Color(0xFFE53935),
+              color: const Color(0xFFFF9500).withValues(alpha: 0.15),
               borderRadius: BorderRadius.circular(999),
-              border: Border.all(color: const Color(0xFFFFFFFF), width: 1.5),
+              border: Border.all(color: const Color(0xFFFF9500), width: 1),
             ),
             child: Text(
-              text,
-              textAlign: TextAlign.center,
+              labelText,
               style: const TextStyle(
-                color: Color(0xFFFFFFFF),
-                fontSize: 9,
-                fontWeight: FontWeight.w700,
+                color: Color(0xFFFF9500),
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
                 decoration: TextDecoration.none,
               ),
             ),
           ),
+          const SizedBox(width: 4),
+        ],
+        Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Container(
+              width: 28,
+              height: 28,
+              decoration: BoxDecoration(
+                color: const Color(0xFF005FCC),
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(
+                  color: (pushConnected ?? false)
+                      ? const Color(0xFF38D76A)
+                      : serverLinked
+                          ? const Color(0xFFFF9500)
+                          : const Color(0xFFFFFFFF),
+                  width: 2,
+                ),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Color(0xAA000000),
+                    blurRadius: 12,
+                    offset: Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: const Center(
+                child: Text(
+                  'Q',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Color(0xFFFFFFFF),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                    decoration: TextDecoration.none,
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              right: -8,
+              top: -8,
+              child: Container(
+                constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE53935),
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(color: const Color(0xFFFFFFFF), width: 1.5),
+                ),
+                child: Text(
+                  text,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Color(0xFFFFFFFF),
+                    fontSize: 9,
+                    fontWeight: FontWeight.w700,
+                    decoration: TextDecoration.none,
+                  ),
+                ),
+              ),
+            ),
+          ],
         ),
       ],
     );
