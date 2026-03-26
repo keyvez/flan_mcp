@@ -297,7 +297,9 @@ impl App {
             .map(ClaudeEntry::Cmux)
             .collect();
         for pane in &self.trm_panes {
-            entries.push(ClaudeEntry::Trm(pane.clone()));
+            if pane.has_claude {
+                entries.push(ClaudeEntry::Trm(pane.clone()));
+            }
         }
         entries
     }
@@ -804,6 +806,8 @@ fn build_entry_lines(app: &App, entry: &ClaudeEntry) -> Vec<(String, Style)> {
             ));
             if let Some(ref cwd) = pane.cwd {
                 lines.push((shorten_path(cwd), Style::default().fg(TEXT2)));
+            } else if let Some(ref folder) = pane.folder_name {
+                lines.push((folder.clone(), Style::default().fg(TEXT2)));
             } else {
                 lines.push(("(empty pane)".into(), Style::default().fg(TEXT2)));
             }
@@ -1144,8 +1148,21 @@ async fn main() -> io::Result<()> {
                                                 app.set_toast(if ok { "Focused pane" } else { "Focus failed".into() });
                                             }
                                             Some(ClaudeEntry::Trm(pane)) => {
-                                                let label = pane.folder_name.clone().unwrap_or_else(|| format!("trm:{}", pane.index));
-                                                app.set_toast(format!("trm pane {} has no focus RPC", label));
+                                                let idx = pane.index;
+                                                let sid = pane.surface_id.clone();
+                                                let label = sid.clone().unwrap_or_else(|| format!("trm:{}", pane.index));
+                                                let ok = tokio::task::spawn_blocking(move || {
+                                                    if let Some(sid) = sid {
+                                                        trm_focus_pane_by_surface(&sid)
+                                                    } else {
+                                                        trm_focus_pane(idx)
+                                                    }
+                                                })
+                                                    .await
+                                                    .unwrap_or(false);
+                                                app.log("out", format!("Focus trm:{}…", label), None, ok).await;
+                                                app.sync_log_snapshot().await;
+                                                app.set_toast(if ok { format!("Focused {}", label) } else { format!("Failed {}", label) });
                                             }
                                             None => {
                                                 app.set_toast("No surface to focus");

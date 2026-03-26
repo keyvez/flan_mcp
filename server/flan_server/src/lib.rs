@@ -54,6 +54,9 @@ pub struct TrmPane {
     pub cwd: Option<String>,
     /// Whether a claude process is running in this pane.
     pub has_claude: bool,
+    /// Surface ID from trm's RPC (e.g. "surface-13"), used for surface.focus.
+    #[serde(default)]
+    pub surface_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1104,131 +1107,143 @@ pub fn peek_flan_queue(ws_uri: &str) -> usize {
 // ── Discovery: trm Panes ────────────────────────────────────────────────
 
 pub fn discover_trm_panes() -> Vec<TrmPane> {
-    // Find the trm process.
-    let Ok(ps_out) = Command::new("ps").args(["-eo", "pid,comm"]).output() else {
-        return Vec::new();
-    };
-    let ps_str = String::from_utf8_lossy(&ps_out.stdout);
-    let trm_pid: u32 = ps_str
-        .lines()
-        .find(|l| l.contains("/trm") || l.trim().ends_with(" trm"))
-        .and_then(|l| l.trim().split_whitespace().next())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if trm_pid == 0 {
+    // Use surface.list as the single source of truth.
+    // surface_id  = used for surface.focus RPC
+    // pane_id     = used for the {"type":"send","pane":N} protocol
+    // has_claude  = true when Claude is actively running (title contains
+    //               "Claude" or looks like a task description with a spinner)
+    let surfaces = trm_rpc("surface.list", serde_json::json!({}))
+        .and_then(|r| r.get("result")?.get("surfaces")?.as_array().cloned())
+        .unwrap_or_default();
+
+    if surfaces.is_empty() {
         return Vec::new();
     }
 
-    // Get trm's direct children that are login/shell processes — one per pane.
-    // Use `ps -eo pid,ppid,comm` instead of `pgrep -P` because pgrep truncates
-    // output at ~10 results on macOS, silently missing panes.
-    let Ok(ps_all) = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output() else {
-        return Vec::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    // Collect all claude process cwds so we can match them to surfaces by path.
+    // key: last two path components of cwd (e.g. "dev/flan_mcp"), value: full cwd
+    let claude_cwds: Vec<String> = {
+        let ps = match Command::new("ps").args(["-eo", "pid,comm"]).output() {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+        String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let pid_s = it.next()?;
+                let comm = it.next()?;
+                if !comm.contains("claude") || comm.contains("flan") { return None; }
+                let pid: u32 = pid_s.parse().ok()?;
+                let cwd = get_process_cwd(pid);
+                if cwd.is_empty() { None } else { Some(cwd) }
+            })
+            .collect()
     };
-    let mut children: Vec<u32> = String::from_utf8_lossy(&ps_all.stdout)
-        .lines()
-        .skip(1)
-        .filter_map(|l| {
-            let mut parts = l.trim().splitn(3, char::is_whitespace);
-            let pid: u32 = parts.next()?.trim().parse().ok()?;
-            let ppid: u32 = parts.next()?.trim().parse().ok()?;
-            let comm = parts.next()?.trim();
-            if ppid == trm_pid
-                && (comm.contains("login")
-                    || comm.ends_with("zsh")
-                    || comm.ends_with("bash")
-                    || comm.ends_with("fish"))
-            {
-                Some(pid)
-            } else {
-                None
-            }
-        })
-        .collect();
-    children.sort();
 
-    if children.is_empty() {
-        return Vec::new();
-    }
+    let mut used_cwds: HashSet<String> = HashSet::new();
+    let mut panes: Vec<TrmPane> = Vec::new();
 
-    let mut panes = Vec::new();
-    for (idx, &child_pid) in children.iter().enumerate() {
-        let (cwd, has_claude) = trm_pane_info(child_pid);
-        let folder_name = cwd.as_deref().map(|p| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let shortened = if !home.is_empty() && p.starts_with(&home) {
-                format!("~{}", &p[home.len()..])
+    for s in surfaces {
+        let surface_id = match s.get("surface_id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let pane_id: usize = match s.get("pane_id").and_then(|v| v.as_str()).and_then(|v| v.parse().ok()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let title = match s.get("title").and_then(|v| v.as_str()) {
+            Some(t) => t.to_string(),
+            None => continue,
+        };
+
+        // Strip leading status/spinner characters (✳ ⠂ ⠐ etc.).
+        let clean = title
+            .trim_start_matches(|c: char| {
+                !c.is_alphanumeric() && c != '~' && c != '/' && c != '\u{2026}'
+            })
+            .trim();
+
+        // Determine has_claude:
+        //   1. Title explicitly contains "Claude" (idle: "✳ Claude Code")
+        //   2. Title starts with a non-ASCII spinner/status char and the rest
+        //      is NOT a path (active task: "⠂ Add feature…").
+        //      Shell panes show paths (~/…, /…, …) or plain commands without
+        //      leading non-ASCII characters.
+        let starts_with_spinner = title.chars().next()
+            .map(|c| !c.is_ascii() && c != '~' && c != '/' && c != '\u{2026}')
+            .unwrap_or(false);
+        let has_claude = title.contains("Claude")
+            || (starts_with_spinner
+                && !clean.starts_with('~')
+                && !clean.starts_with('/')
+                && !clean.starts_with('\u{2026}'));
+
+        let (folder_name, cwd) = if clean.starts_with('~')
+            || clean.starts_with('/')
+            || clean.starts_with('\u{2026}')
+        {
+            // Path visible in title — expand ~ and shorten to last 2 parts.
+            let expanded = if clean.starts_with('~') && !home.is_empty() {
+                format!("{}{}", home, &clean[1..])
             } else {
-                p.to_string()
+                clean.to_string()
             };
-            // Take last two path components for readability.
-            let parts: Vec<&str> = shortened.trim_end_matches('/').rsplitn(3, '/').collect();
-            match parts.len() {
-                0 => shortened.clone(),
+            let parts: Vec<&str> =
+                expanded.trim_end_matches('/').rsplitn(3, '/').collect();
+            let short = match parts.len() {
+                0 => expanded.clone(),
                 1 => parts[0].to_string(),
                 _ => format!("{}/{}", parts[1], parts[0]),
+            };
+            let abs = if expanded.starts_with('/') { Some(expanded) } else { None };
+            (Some(short), abs)
+        } else if has_claude {
+            // No path in title. Try to match a claude process cwd by last path
+            // component appearing in the title. Do NOT fall back to first cwd —
+            // that would assign the same cwd to every active-task pane and break
+            // pairing in the TUI.
+            let matched_cwd = claude_cwds.iter()
+                .filter(|c| !used_cwds.contains(*c))
+                .find(|cwd| {
+                    let last = cwd.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                    !last.is_empty() && title.contains(last)
+                })
+                .cloned();
+
+            if let Some(ref cwd) = matched_cwd {
+                used_cwds.insert(cwd.clone());
             }
+
+            if let Some(cwd) = matched_cwd {
+                let parts: Vec<&str> =
+                    cwd.trim_end_matches('/').rsplitn(3, '/').collect();
+                let short = match parts.len() {
+                    0 => cwd.clone(),
+                    1 => parts[0].to_string(),
+                    _ => format!("{}/{}", parts[1], parts[0]),
+                };
+                (Some(short), Some(cwd))
+            } else {
+                (Some(clean.to_string()), None)
+            }
+        } else {
+            (Some(clean.to_string()), None)
+        };
+
+        panes.push(TrmPane {
+            index: pane_id,
+            folder_name,
+            cwd,
+            has_claude,
+            surface_id: Some(surface_id),
         });
-        panes.push(TrmPane { index: idx, folder_name, cwd, has_claude });
     }
 
     panes
-}
-
-/// Walk the process subtree rooted at `root_pid`, find the deepest claude
-/// process or the leaf shell, and return its (cwd, has_claude).
-fn trm_pane_info(root_pid: u32) -> (Option<String>, bool) {
-    // Collect all descendants up to depth 6.
-    let mut descendants = vec![root_pid];
-    let mut frontier = vec![root_pid];
-    for _ in 0..6 {
-        let mut next = Vec::new();
-        for &pid in &frontier {
-            let Ok(out) = Command::new("pgrep").args(["-P", &pid.to_string()]).output() else {
-                continue;
-            };
-            for child in String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|l| l.trim().parse::<u32>().ok())
-            {
-                descendants.push(child);
-                next.push(child);
-            }
-        }
-        if next.is_empty() { break; }
-        frontier = next;
-    }
-
-    // Among all descendants, find a claude process first.
-    let Ok(ps_out) = Command::new("ps")
-        .args(["-eo", "pid,comm"])
-        .output() else {
-        return (None, false);
-    };
-    let ps_str = String::from_utf8_lossy(&ps_out.stdout);
-
-    // Build pid→comm map for our descendants.
-    let mut claude_pid: Option<u32> = None;
-    let mut leaf_pid: Option<u32> = None;
-    for line in ps_str.lines() {
-        let parts: Vec<&str> = line.trim().splitn(2, char::is_whitespace).collect();
-        if parts.len() < 2 { continue; }
-        let Ok(pid) = parts[0].trim().parse::<u32>() else { continue; };
-        if !descendants.contains(&pid) { continue; }
-        let comm = parts[1].trim();
-        if comm.contains("claude") && !comm.contains("flan") {
-            claude_pid = Some(pid);
-        }
-        // Track any non-login shell as a fallback leaf.
-        if comm.ends_with("zsh") || comm.ends_with("bash") || comm.ends_with("fish") {
-            leaf_pid = Some(pid);
-        }
-    }
-
-    let target = claude_pid.or(leaf_pid).unwrap_or(root_pid);
-    let has_claude = claude_pid.is_some();
-    let cwd = get_process_cwd(target);
-    (if cwd.is_empty() { None } else { Some(cwd) }, has_claude)
 }
 
 // ── Discovery: Floss Desktop ──────────────────────────────────────────
@@ -1259,7 +1274,49 @@ pub fn discover_desktop_target() -> DesktopTarget {
     }
 }
 
-// ── cmux ────────────────────────────────────────────────────────────────
+// ── trm ──────────────────────────────────────────────────────────────────
+
+/// Returns the active trm socket path.
+/// Prefers `/tmp/trm.sock` (release build); falls back to `/tmp/trm-debug.sock`.
+fn trm_socket_path() -> String {
+    let release = "/tmp/trm.sock";
+    if std::path::Path::new(release).exists() {
+        release.to_string()
+    } else {
+        "/tmp/trm-debug.sock".to_string()
+    }
+}
+
+/// Same protocol as cmux_rpc but targets the trm socket.
+pub fn trm_rpc(method: &str, params: serde_json::Value) -> Option<serde_json::Value> {
+    use std::os::unix::net::UnixStream;
+
+    let socket = std::env::var("TRM_SOCKET_PATH").unwrap_or_else(|_| trm_socket_path());
+    let mut stream = UnixStream::connect(&socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+
+    let password =
+        std::env::var("CMUX_SOCKET_PASSWORD").unwrap_or_else(|_| "flan".to_string());
+    let request = serde_json::json!({
+        "id": method,
+        "method": method,
+        "params": params,
+        "password": password,
+    });
+    let mut msg = serde_json::to_string(&request).ok()?;
+    msg.push('\n');
+    stream.write_all(msg.as_bytes()).ok()?;
+    stream.flush().ok()?;
+    stream.shutdown(std::net::Shutdown::Write).ok()?;
+
+    let reader = BufReader::new(&stream);
+    let line = reader.lines().next()?.ok()?;
+
+    if line.starts_with("ERROR") {
+        return None;
+    }
+    serde_json::from_str(&line).ok()
+}
 
 pub fn cmux_rpc(method: &str, params: serde_json::Value) -> Option<serde_json::Value> {
     use std::os::unix::net::UnixStream;
@@ -1391,6 +1448,34 @@ pub fn cmux_send_text(surface_id: &str, text: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Focus a specific trm pane by its surface ID, then bring trm to the front.
+///
+/// trm speaks the same RPC protocol as cmux on `/tmp/trm.sock`, so we call
+/// `surface.focus` there, then activate the app via osascript.
+pub fn trm_focus_pane_by_surface(surface_id: &str) -> bool {
+    let focused = trm_rpc(
+        "surface.focus",
+        serde_json::json!({ "surface_id": surface_id }),
+    )
+    .and_then(|r| r.get("ok")?.as_bool())
+    .unwrap_or(false);
+
+    // Always bring trm to the foreground regardless of the RPC result.
+    let _ = Command::new("osascript")
+        .args(["-e", "tell application \"trm\" to activate"])
+        .output();
+
+    focused
+}
+
+pub fn trm_focus_pane(_index: usize) -> bool {
+    // Fallback used when no surface_id is available — just bring trm forward.
+    Command::new("osascript")
+        .args(["-e", "tell application \"trm\" to activate"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 pub fn cmux_focus_surface(surface_id: &str) -> bool {
     cmux_rpc(
         "surface.focus",
@@ -1409,7 +1494,7 @@ pub fn trm_send_to_pane(index: usize, text: &str) -> bool {
     use std::time::Duration;
 
     let socket_path = std::env::var("TRM_SOCKET_PATH")
-        .unwrap_or_else(|_| "/tmp/trm.sock".into());
+        .unwrap_or_else(|_| trm_socket_path());
     (|| {
         let mut stream = UnixStream::connect(&socket_path).ok()?;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;

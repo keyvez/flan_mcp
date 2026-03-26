@@ -4890,58 +4890,63 @@ void main() {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
-      await _runAsyncAndSettle(tester, () async {
-        await userMessageService.ensureHydrated();
+      await userMessageService.ensureHydrated();
 
-        // Manually craft a message with rich annotation data including
-        // widget info, bounds, and text — this covers _formatAnnotationLine
-        userMessageService.sendMessage({
-          'type': 'user_feedback',
-          'text': 'Selected widget: Text at App > Text\n'
-              '1 annotation(s):\n'
-              '  - "label" at (10, 20) 100x50\n'
-              '    Widget: Text at MyApp > Text\n'
-              '    Source: lib/main.dart:10\n'
-              '    Text: "hello"',
-          'data': {
-            'inspectorSelection': {
-              'widgetType': 'Text',
-              'widgetPath': 'App > Text',
-              'sourceLocation': 'lib/main.dart:42',
-            },
-            'annotations': [
-              {
-                'id': 'ann-1',
-                'text': 'label',
-                'bounds': {'x': 10, 'y': 20, 'width': 100, 'height': 50},
-                'widget': {
-                  'widgetType': 'Text',
-                  'widgetPath': 'MyApp > Text',
-                  'sourceLocation': 'lib/main.dart:10',
-                  'text': 'hello',
-                },
-              },
-              {
-                'id': 'ann-2',
-                'text': 'second',
-                'bounds': {'x': 200, 'y': 20, 'width': 80, 'height': 40},
-              },
-            ],
-            'userMessage': 'Please fix this',
+      // Manually craft a message with rich annotation data including
+      // widget info, bounds, and text — this covers _formatAnnotationLine
+      userMessageService.sendMessage({
+        'type': 'user_feedback',
+        'text': 'Selected widget: Text at App > Text\n'
+            '1 annotation(s):\n'
+            '  - "label" at (10, 20) 100x50\n'
+            '    Widget: Text at MyApp > Text\n'
+            '    Source: lib/main.dart:10\n'
+            '    Text: "hello"',
+        'data': {
+          'inspectorSelection': {
+            'widgetType': 'Text',
+            'widgetPath': 'App > Text',
+            'sourceLocation': 'lib/main.dart:42',
           },
-        });
+          'annotations': [
+            {
+              'id': 'ann-1',
+              'text': 'label',
+              'bounds': {'x': 10, 'y': 20, 'width': 100, 'height': 50},
+              'widget': {
+                'widgetType': 'Text',
+                'widgetPath': 'MyApp > Text',
+                'sourceLocation': 'lib/main.dart:10',
+                'text': 'hello',
+              },
+            },
+            {
+              'id': 'ann-2',
+              'text': 'second',
+              'bounds': {'x': 200, 'y': 20, 'width': 80, 'height': 40},
+            },
+          ],
+          'userMessage': 'Please fix this',
+        },
       });
 
-      // Open queue panel
-      await tester.tap(find.text('Q'));
+      // Let the overlay rebuild with the new pending message.
+      await tester.pump();
       await tester.pumpAndSettle();
 
-      // Verify the message is in the queue
+      // Verify the message is queued before trying to open the panel.
       final messages = userMessageService.peekMessages();
       expect(messages, isNotEmpty);
 
-      // The annotation chips should be visible
-      expect(find.byIcon(Icons.edit_outlined), findsAtLeastNWidgets(1));
+      // Open queue panel — tap the Q badge text.
+      await tester.tap(find.text('Q'));
+      await tester.pumpAndSettle();
+
+      // The annotation rows show delete icons (one per annotation) and the
+      // annotation text labels.
+      expect(find.byIcon(Icons.delete_outline), findsAtLeastNWidgets(1));
+      expect(find.text('label'), findsOneWidget);
+      expect(find.text('second'), findsOneWidget);
     });
   });
 

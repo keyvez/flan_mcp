@@ -1528,6 +1528,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 messages: _queuedMessagesSnapshot,
                 onDeleteMessage: _removeQueuedMessage,
                 onClearAll: _clearQueuedMessages,
+                onStartRecording: () {
+                  setState(() {
+                    _showQueuedMessagesPanel = false;
+                    _queuedMessagesSnapshot = const [];
+                  });
+                  _toggleRecording();
+                },
                 onSend: () {
                   widget.userMessageService.promoteDrafts();
                   widget.userMessageService.notifyPending();
@@ -3007,12 +3014,14 @@ class _QueuedMessagesPanel extends StatefulWidget {
     this.onCreateIssue,
     this.onExitAnnotationMode,
     this.isAnnotationModeActive = false,
+    this.onStartRecording,
   });
 
   final List<Map<String, dynamic>> messages;
   final void Function(int queueId) onDeleteMessage;
   final VoidCallback onClearAll;
   final VoidCallback onSend;
+  final VoidCallback? onStartRecording;
   final void Function(
     int queueId,
     String annotationId,
@@ -3295,6 +3304,41 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                             'Done',
                             style: TextStyle(
                               color: Color(0xFFFFCC44),
+                              fontSize: 10,
+                              fontWeight: FontWeight.w600,
+                              decoration: TextDecoration.none,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                ],
+                if (widget.onStartRecording != null) ...[
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: widget.onStartRecording,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFF3B30).withValues(alpha: 0.2),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.fiber_manual_record,
+                            size: 10,
+                            color: Color(0xFFFF6060),
+                          ),
+                          SizedBox(width: 3),
+                          Text(
+                            'Record',
+                            style: TextStyle(
+                              color: Color(0xFFFF6060),
                               fontSize: 10,
                               fontWeight: FontWeight.w600,
                               decoration: TextDecoration.none,
