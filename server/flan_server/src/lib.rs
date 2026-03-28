@@ -8,6 +8,67 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+/// Strip ANSI/VT escape sequences and ASCII control characters from a string,
+/// leaving only printable text suitable for TUI display.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\x1b' {
+            // ESC — consume the escape sequence
+            i += 1;
+            if i < bytes.len() {
+                match bytes[i] {
+                    // CSI: ESC [ ... final-byte (0x40–0x7E)
+                    b'[' => {
+                        i += 1;
+                        while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                            i += 1;
+                        }
+                        i += 1; // consume final byte
+                    }
+                    // OSC: ESC ] ... ST (BEL or ESC \)
+                    b']' => {
+                        i += 1;
+                        while i < bytes.len() {
+                            if bytes[i] == b'\x07' {
+                                i += 1;
+                                break;
+                            }
+                            if bytes[i] == b'\x1b' && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                    // Other two-char sequences: ESC <byte>
+                    _ => { i += 1; }
+                }
+            }
+        } else if bytes[i] < 0x20 || bytes[i] == 0x7f {
+            // Skip other control characters (DEL, non-printable ASCII)
+            i += 1;
+        } else {
+            // Find the end of this UTF-8 character and push it
+            let ch_len = utf8_char_len(bytes[i]);
+            if i + ch_len <= bytes.len() {
+                out.push_str(&s[i..i + ch_len]);
+            }
+            i += ch_len;
+        }
+    }
+    out
+}
+
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 { 1 }
+    else if b < 0xe0 { 2 }
+    else if b < 0xf0 { 3 }
+    else { 4 }
+}
 use tokio::sync::RwLock;
 
 pub mod desktop_bridge;
@@ -57,6 +118,9 @@ pub struct TrmPane {
     /// Surface ID from trm's RPC (e.g. "surface-13"), used for surface.focus.
     #[serde(default)]
     pub surface_id: Option<String>,
+    /// Raw title from trm's surface.list, used as fallback display when cwd is unknown.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -762,7 +826,7 @@ pub fn get_process_cwd(pid: u32) -> String {
     for line in stdout.lines() {
         if let Some(path) = line.strip_prefix('n') {
             if path.starts_with('/') {
-                return path.to_string();
+                return strip_ansi(path);
             }
         }
     }
@@ -1148,11 +1212,8 @@ pub fn peek_flan_queue(ws_uri: &str) -> usize {
 // ── Discovery: trm Panes ────────────────────────────────────────────────
 
 pub fn discover_trm_panes() -> Vec<TrmPane> {
-    // surface.list gives us surface_id, pane_id, and title for has_claude detection.
-    // Cwds come from the ps process tree: trm → login → shell → (maybe claude).
-    // The i-th login child (sorted by pid) corresponds to the i-th surface (sorted
-    // by pane_id), because trm spawns login processes in pane order and pane IDs are
-    // monotonically increasing.
+    // surface.list returns surface_id, pane_id, title, focused, and pid (shell child pid).
+    // We use the pid directly to look up cwd and claude subprocess — no positional pairing needed.
     let surfaces = trm_rpc("surface.list", serde_json::json!({}))
         .and_then(|r| r.get("result")?.get("surfaces")?.as_array().cloned())
         .unwrap_or_default();
@@ -1161,27 +1222,11 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         return Vec::new();
     }
 
-    // Find trm process pid.
-    let Ok(ps_out) = Command::new("ps").args(["-eo", "pid,comm"]).output() else {
-        return Vec::new();
-    };
-    let ps_str = String::from_utf8_lossy(&ps_out.stdout);
-    let trm_pid: u32 = ps_str
-        .lines()
-        .find(|l| {
-            let comm = l.split_whitespace().nth(1).unwrap_or("");
-            comm.ends_with("/trm") || comm == "trm"
-        })
-        .and_then(|l| l.split_whitespace().next())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    // Build pid→ppid→comm map for all processes.
+    // Build pid→ppid→comm map for all processes (used to find claude children of the shell).
     let Ok(ps_all) = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output() else {
         return Vec::new();
     };
     let ps_all_str = String::from_utf8_lossy(&ps_all.stdout);
-    // (pid, ppid, comm)
     let all_procs: Vec<(u32, u32, String)> = ps_all_str
         .lines()
         .skip(1)
@@ -1194,114 +1239,124 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         })
         .collect();
 
-    // Login children of trm, sorted by pid (creation order = pane order).
-    let mut login_pids: Vec<u32> = all_procs
+    // Collect all live claude process cwds via lsof (trm pid=0 always, so we enumerate ourselves).
+    let home = std::env::var("HOME").unwrap_or_default();
+    let claude_cwds: std::collections::HashSet<String> = all_procs
         .iter()
-        .filter(|(_, ppid, comm)| {
-            *ppid == trm_pid && (comm.contains("login") || comm.ends_with("login"))
-        })
-        .map(|(pid, _, _)| *pid)
-        .collect();
-    login_pids.sort();
-
-    // For each login, find its shell child and that shell's claude subprocess (if any).
-    // Returns (shell_cwd, has_claude_child, claude_cwd).
-    let pane_cwds: Vec<(String, bool, Option<String>)> = login_pids
-        .iter()
-        .map(|&login| {
-            // Direct shell child of login.
-            let shell_pid = all_procs
-                .iter()
-                .find(|(_, ppid, comm)| {
-                    *ppid == login
-                        && (comm.ends_with("zsh")
-                            || comm.ends_with("bash")
-                            || comm.ends_with("fish"))
-                })
-                .map(|(pid, _, _)| *pid)
-                .unwrap_or(0);
-
-            let shell_cwd = if shell_pid > 0 {
-                get_process_cwd(shell_pid)
-            } else {
-                String::new()
-            };
-
-            // Look for a claude subprocess under the shell.
-            let claude_pid = all_procs
-                .iter()
-                .find(|(_, ppid, comm)| {
-                    *ppid == shell_pid
-                        && comm.contains("claude")
-                        && !comm.contains("flan")
-                })
-                .map(|(pid, _, _)| *pid);
-
-            let (has_claude, claude_cwd) = if let Some(cpid) = claude_pid {
-                let cwd = get_process_cwd(cpid);
-                (true, if cwd.is_empty() { None } else { Some(cwd) })
-            } else {
-                (false, None)
-            };
-
-            (shell_cwd, has_claude, claude_cwd)
+        .filter(|(_, _, comm)| comm.contains("claude") && !comm.contains("flan"))
+        .filter_map(|(pid, _, _)| {
+            let cwd = get_process_cwd(*pid);
+            if cwd.is_empty() { None } else { Some(cwd) }
         })
         .collect();
 
-    // Sort surfaces by pane_id to align with sorted login_pids.
-    let mut sorted_surfaces = surfaces.clone();
-    sorted_surfaces.sort_by_key(|s| {
-        s.get("pane_id")
-            .and_then(|v| v.as_str())
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(usize::MAX)
-    });
+    // Build a map of (window_id, pane_id) → title for adjacency lookups.
+    let pane_titles: std::collections::HashMap<(String, usize), String> = surfaces.iter()
+        .filter_map(|s| {
+            let window_id = s.get("window_id").and_then(|v| v.as_str())?.to_string();
+            let pane_id: usize = s.get("pane_id").and_then(|v| v.as_str())?.parse().ok()?;
+            let title = strip_ansi(s.get("title").and_then(|v| v.as_str()).unwrap_or(""));
+            Some(((window_id, pane_id), title))
+        })
+        .collect();
+
+    // Expand a trm title token to a full absolute path where possible.
+    let expand_title_path = |t: &str| -> Option<String> {
+        let tok = t.split_whitespace()
+            .find(|tok| tok.starts_with('/') || tok.starts_with('~') || tok.starts_with('…'))?;
+        if tok.starts_with('~') && !home.is_empty() {
+            Some(format!("{}{}", home, &tok[1..]))
+        } else {
+            Some(tok.to_string())
+        }
+    };
+
+    // Check if a resolved cwd (which may be absolute or "…"-prefixed) matches a claude cwd.
+    // "…/dev/foo" matches "/Users/x/dev/foo" because the suffix agrees.
+    let cwd_has_claude = |cwd: &str| -> bool {
+        if cwd.starts_with('…') {
+            let suffix = &cwd[cwd.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1)..];
+            claude_cwds.iter().any(|c| c.ends_with(suffix))
+        } else {
+            claude_cwds.contains(cwd)
+        }
+    };
+
+    // --- Pass 1: classify each surface and resolve own-title cwds ---
+    struct RawPane {
+        surface_id: String,
+        pane_id: usize,
+        window_id: String,
+        title: String,
+        has_claude: bool,
+        own_cwd: Option<String>,
+    }
+    let raw: Vec<RawPane> = surfaces.iter().filter_map(|s| {
+        let surface_id = s.get("surface_id").and_then(|v| v.as_str())?.to_string();
+        let pane_id: usize = s.get("pane_id").and_then(|v| v.as_str())?.parse().ok()?;
+        let window_id = s.get("window_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let title = strip_ansi(s.get("title").and_then(|v| v.as_str()).unwrap_or(""));
+        let starts_with_spinner = title.chars().next()
+            .map(|c| !c.is_ascii() && c != '~' && c != '/' && c != '…')
+            .unwrap_or(false);
+        let clean = title.trim_start_matches(|c: char| {
+            !c.is_alphanumeric() && c != '~' && c != '/'
+        }).trim();
+        let has_claude = title.contains("Claude")
+            || (starts_with_spinner && !clean.starts_with('~') && !clean.starts_with('/'));
+        let own_cwd = expand_title_path(&title);
+        Some(RawPane { surface_id, pane_id, window_id, title, has_claude, own_cwd })
+    }).collect();
+
+    // --- Pass 2: for Claude panes without own_cwd, find nearest unclaimed path-pane neighbor ---
+    // Sort Claude panes by distance to their nearest path neighbor so closer ones get priority.
+    let mut claimed_path_panes: std::collections::HashSet<(String, usize)> = Default::default();
+
+    // Pre-mark path panes that have own-cwd Claude panes (they don't need to borrow).
+    // Also pre-mark path pane keys whose Claude pane already has own_cwd (no borrowing needed).
+
+    // Build the borrowed_cwd for each raw pane index, processing Claude panes in order of
+    // their nearest available neighbor distance (closest-first globally).
+    let mut borrowed_cwds: Vec<Option<String>> = vec![None; raw.len()];
+
+    // Collect (distance, claude_idx, neighbor_pane_id, window_id, path) candidates.
+    let mut candidates: Vec<(usize, usize, usize, String, String)> = Vec::new();
+    for (i, rp) in raw.iter().enumerate() {
+        if !rp.has_claude || rp.own_cwd.is_some() {
+            continue;
+        }
+        for delta in 1usize..=3 {
+            for neighbor_id in [rp.pane_id + delta, rp.pane_id.saturating_sub(delta)] {
+                if neighbor_id == rp.pane_id { continue; }
+                let key = (rp.window_id.clone(), neighbor_id);
+                if let Some(t) = pane_titles.get(&key) {
+                    if let Some(p) = expand_title_path(t) {
+                        candidates.push((delta, i, neighbor_id, rp.window_id.clone(), p));
+                    }
+                }
+            }
+        }
+    }
+    // Sort by distance so closer neighbors are assigned first.
+    candidates.sort_by_key(|(dist, _, _, _, _)| *dist);
+    for (_, claude_idx, neighbor_id, window_id, path) in candidates {
+        let key = (window_id, neighbor_id);
+        if claimed_path_panes.contains(&key) || borrowed_cwds[claude_idx].is_some() {
+            continue;
+        }
+        claimed_path_panes.insert(key);
+        borrowed_cwds[claude_idx] = Some(path);
+    }
 
     let mut panes: Vec<TrmPane> = Vec::new();
 
-    for (i, s) in sorted_surfaces.iter().enumerate() {
-        let surface_id = match s.get("surface_id").and_then(|v| v.as_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
-        let pane_id: usize = match s
-            .get("pane_id")
-            .and_then(|v| v.as_str())
-            .and_then(|v| v.parse().ok())
-        {
-            Some(id) => id,
-            None => continue,
-        };
-        let title = s.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    for (i, rp) in raw.into_iter().enumerate() {
+        let RawPane { surface_id, pane_id, title, has_claude, own_cwd, .. } = rp;
+        let resolved_cwd = own_cwd.or_else(|| borrowed_cwds[i].clone());
 
-        // has_claude: prefer process-tree truth; fall back to title heuristic.
-        let (shell_cwd, proc_has_claude, claude_cwd) = pane_cwds
-            .get(i)
-            .cloned()
-            .unwrap_or_default();
-
-        // Title heuristic for has_claude (used when process tree doesn't cover this pane).
-        let title_has_claude = {
-            let starts_with_spinner = title.chars().next()
-                .map(|c| !c.is_ascii() && c != '~' && c != '/')
-                .unwrap_or(false);
-            let clean = title.trim_start_matches(|c: char| {
-                !c.is_alphanumeric() && c != '~' && c != '/'
-            }).trim();
-            title.contains("Claude")
-                || (starts_with_spinner
-                    && !clean.starts_with('~')
-                    && !clean.starts_with('/'))
-        };
-        let has_claude = proc_has_claude || title_has_claude;
-
-        // Use claude cwd if available, otherwise shell cwd.
-        let best_cwd = claude_cwd.or_else(|| {
-            if shell_cwd.is_empty() { None } else { Some(shell_cwd) }
-        });
-
-        let (folder_name, cwd) = if let Some(ref c) = best_cwd {
-            let parts: Vec<&str> = c.trim_end_matches('/').rsplitn(3, '/').collect();
+        let (folder_name, cwd) = if let Some(ref c) = resolved_cwd {
+            let clean = c.trim_end_matches('/');
+            let parts: Vec<&str> = clean.rsplitn(3, '/').collect();
             let short = match parts.len() {
                 0 => c.clone(),
                 1 => parts[0].to_string(),
@@ -1312,12 +1367,22 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             (None, None)
         };
 
+        tracing::debug!(
+            surface_id = %surface_id,
+            pane_id = pane_id,
+            title = %title,
+            has_claude = has_claude,
+            cwd = ?cwd,
+            "discover_trm_panes: pane"
+        );
+
         panes.push(TrmPane {
             index: pane_id,
             folder_name,
             cwd,
             has_claude,
             surface_id: Some(surface_id),
+            title: if title.is_empty() { None } else { Some(title) },
         });
     }
 
@@ -1448,7 +1513,7 @@ pub fn cmux_surface_list() -> Vec<CmuxSurface> {
         .filter_map(|s| {
             Some(CmuxSurface {
                 id: s.get("id")?.as_str()?.to_string(),
-                title: s.get("title")?.as_str()?.to_string(),
+                title: strip_ansi(s.get("title")?.as_str()?),
                 pane_id: s.get("pane_id")?.as_str()?.to_string(),
                 focused: s.get("focused")?.as_bool()?,
                 cwd: None,

@@ -3,6 +3,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use std::fs::OpenOptions;
 use flan_server::*;
 use futures::StreamExt;
 use ratatui::{
@@ -808,6 +809,15 @@ fn build_entry_lines(app: &App, entry: &ClaudeEntry) -> Vec<(String, Style)> {
                 lines.push((shorten_path(cwd), Style::default().fg(TEXT2)));
             } else if let Some(ref folder) = pane.folder_name {
                 lines.push((folder.clone(), Style::default().fg(TEXT2)));
+            } else if let Some(ref t) = pane.title {
+                // Only use the title if it looks like a path, not a status string.
+                let path_token = t.split_whitespace()
+                    .find(|tok| tok.starts_with('/') || tok.starts_with('~'));
+                if let Some(p) = path_token {
+                    lines.push((shorten_path(p), Style::default().fg(TEXT2)));
+                } else {
+                    lines.push(("(unknown path)".into(), Style::default().fg(TEXT2)));
+                }
             } else {
                 lines.push(("(empty pane)".into(), Style::default().fg(TEXT2)));
             }
@@ -817,11 +827,12 @@ fn build_entry_lines(app: &App, entry: &ClaudeEntry) -> Vec<(String, Style)> {
 }
 
 fn shorten_path(path: &str) -> String {
+    let path = flan_server::strip_ansi(path);
     let home = std::env::var("HOME").unwrap_or_default();
     if !home.is_empty() && path.starts_with(&home) {
         format!("~{}", &path[home.len()..])
     } else {
-        path.to_string()
+        path
     }
 }
 
@@ -990,17 +1001,21 @@ async fn main() -> io::Result<()> {
         axum::serve(listener, router).await.ok();
     });
 
-    // Terminal setup
+    // Terminal setup — open /dev/tty directly so raw mode works even when
+    // launched inside trm or another terminal emulator in debug mode.
+    let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut tty_out = tty;
+    execute!(tty_out, EnterAlternateScreen)?;
+    let backend = ratatui::backend::CrosstermBackend::new(tty_out);
     let mut terminal = Terminal::new(backend)?;
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        if let Ok(mut t) = OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = execute!(t, LeaveAlternateScreen);
+        }
         original_hook(info);
     }));
 
