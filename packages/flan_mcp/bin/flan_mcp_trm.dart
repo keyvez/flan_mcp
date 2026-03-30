@@ -19,10 +19,7 @@ import 'package:flan_mcp/src/compat/copilot_stdio_server_transport.dart';
 import 'package:flan_mcp/src/trm_pane_bridge.dart';
 import 'package:flan_mcp/src/version.g.dart';
 import 'package:flan_mcp/src/vm_service/vm_service_context.dart';
-import 'package:flan_mcp/src/vm_service/vm_service_discovery.dart';
 import 'package:mcp_dart/mcp_dart.dart';
-import 'package:vm_service/vm_service.dart';
-import 'package:vm_service/vm_service_io.dart';
 
 ArgParser buildParser() {
   return ArgParser()
@@ -153,45 +150,6 @@ Important: Elements are matched by their key (ValueKey<String>) or text content.
     );
 
     vmService.registerTools(server);
-
-    // --- Auto-discover Flutter app and listen for flush events ---
-    // This is a lightweight event-only connection, independent of the
-    // flan tool connection. It listens for userMessageQueued events
-    // and triggers the cmux bridge to send the process queue command.
-    unawaited(() async {
-      try {
-        final uris = await discoverVmServiceUris();
-        if (uris.isEmpty) {
-          logger.info('No Flutter apps discovered for event listener');
-          return;
-        }
-        final uri = uris.first;
-        logger.info('Connecting event listener to $uri');
-        final eventService = await vmServiceConnectUri(uri);
-        eventService.onExtensionEvent.listen((e) {
-          if (e.kind == EventKind.kExtension &&
-              e.extensionKind == 'flan.userMessageQueued') {
-            logger.info('Flush event received, triggering cmux bridge');
-            unawaited(() async {
-              try {
-                await cmuxBridge.sendProcessQueue(uri);
-              } catch (err) {
-                logger.warning('CmuxPaneBridge send failed: $err');
-              }
-            }());
-          }
-        });
-        await eventService.streamListen(EventStreams.kExtension);
-        logger.info('Event listener active on $uri');
-
-        // Reconnect if connection drops.
-        eventService.onDone.then((_) {
-          logger.info('Event listener connection lost');
-        });
-      } catch (err) {
-        logger.fine('Event listener setup failed: $err');
-      }
-    }());
 
     if (ssePort != null) {
       return await runSseServer(server, ssePort, bridge, cmuxBridge);

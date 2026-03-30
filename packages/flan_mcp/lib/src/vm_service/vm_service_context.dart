@@ -37,7 +37,6 @@ final class VmServiceContext {
   DateTime? _lastMessageReceivedAt;
   int _lastKnownAppPendingCount = 0;
   int _drainGeneration = 0;
-  DateTime? _lastSamplingPushAt;
 
   /// Cleans up all state: cancels timers, clears buffers, disconnects VM service.
   Future<void> dispose() async {
@@ -94,24 +93,8 @@ final class VmServiceContext {
         _messageArrived!.complete();
       }
 
-      // Only send logging/resource notifications when the peek is still
-      // fresh (no drain consumed the messages while the peek was in flight)
-      // and process_queue is NOT active.
       if (_drainGeneration == generationBefore) {
-        if (!_isProcessingQueue && pendingCount > 0) {
-          await _server!.sendLoggingMessage(
-            LoggingMessageNotification(
-              level: LoggingLevel.info,
-              logger: 'flan-user',
-              data:
-                  '$pendingCount pending message(s) from the Flutter app user. '
-                  'Call process_queue, get_user_message, or read flan://messages/pending.',
-            ),
-          );
-        }
-
         await _notifyPendingMessagesResourceUpdated();
-        _maybeTriggerSamplingPushForPendingCount(pendingCount);
       }
     } catch (err, st) {
       _logger.warning('Failed to refresh pending queue ($origin)', err, st);
@@ -160,7 +143,6 @@ final class VmServiceContext {
       }
 
       await _notifyPendingMessagesResourceUpdated();
-      _maybeTriggerSamplingPush(allAddedMessages);
     } catch (err, st) {
       _logger.warning('Failed to drain user messages ($origin)', err, st);
     } finally {
@@ -180,114 +162,6 @@ final class VmServiceContext {
       // Clients that do not support/subscribe to resources can ignore this.
       _logger.fine('Skipping resource update notification: $err');
     }
-  }
-
-  void _maybeTriggerSamplingPush(List<Map<String, dynamic>> newMessages) {
-    if (_isProcessingQueue) {
-      return;
-    }
-
-    final server = _server;
-    if (server == null || !server.isConnected) {
-      return;
-    }
-
-    final capabilities = server.server.getClientCapabilities();
-    if (capabilities?.sampling == null) {
-      return;
-    }
-
-    final now = DateTime.now().toUtc();
-    final lastPushAt = _lastSamplingPushAt;
-    if (lastPushAt != null &&
-        now.difference(lastPushAt) < const Duration(milliseconds: 500)) {
-      return;
-    }
-    _lastSamplingPushAt = now;
-
-    final preview = newMessages
-        .take(3)
-        .map((m) => '- ${m['text'] as String? ?? '(no text)'}')
-        .join('\n');
-
-    unawaited(() async {
-      try {
-        final result = await server.server.createMessage(
-          CreateMessageRequest(
-            messages: [
-              SamplingMessage(
-                role: SamplingMessageRole.user,
-                content: SamplingTextContent(
-                  text:
-                      'A Flutter app user sent new message(s) to Flan.\n'
-                      'Call get_user_message (or read flan://messages/pending) '
-                      'to consume them now.\n'
-                      'Preview:\n$preview',
-                ),
-              ),
-            ],
-            maxTokens: 160,
-          ),
-          RequestOptions(timeout: const Duration(seconds: 3)),
-        );
-        _logger.fine(
-          'Triggered sampling push for ${newMessages.length} message(s), model: ${result.model}',
-        );
-      } catch (err) {
-        _logger.warning('Sampling push trigger failed', err);
-      }
-    }());
-  }
-
-  void _maybeTriggerSamplingPushForPendingCount(int pendingCount) {
-    if (_isProcessingQueue || pendingCount <= 0) {
-      return;
-    }
-
-    final server = _server;
-    if (server == null || !server.isConnected) {
-      return;
-    }
-
-    final capabilities = server.server.getClientCapabilities();
-    if (capabilities?.sampling == null) {
-      return;
-    }
-
-    final now = DateTime.now().toUtc();
-    final lastPushAt = _lastSamplingPushAt;
-    if (lastPushAt != null &&
-        now.difference(lastPushAt) < const Duration(milliseconds: 500)) {
-      return;
-    }
-    _lastSamplingPushAt = now;
-
-    unawaited(() async {
-      try {
-        final result = await server.server.createMessage(
-          CreateMessageRequest(
-            messages: [
-              SamplingMessage(
-                role: SamplingMessageRole.user,
-                content: SamplingTextContent(
-                  text:
-                      'A Flutter app user sent new message(s) to Flan.\n'
-                      'There are currently $pendingCount pending message(s).\n'
-                      'Call process_queue (or get_user_message) to consume them.',
-                ),
-              ),
-            ],
-            maxTokens: 120,
-          ),
-          RequestOptions(timeout: const Duration(seconds: 3)),
-        );
-        _logger.fine(
-          'Triggered sampling push for pending queue ($pendingCount), model: ${result.model}',
-        );
-      } catch (err) {
-        _logger.warning('Sampling push trigger failed', err);
-      }
-    }());
   }
 
   int get debugBufferedMessageCount => _bufferedMessages.length;
@@ -319,7 +193,7 @@ final class VmServiceContext {
     _drainRequested = false;
     _isProcessingQueue = false;
     _lastKnownAppPendingCount = 0;
-    _lastSamplingPushAt = null;
+
     unawaited(() async {
       try {
         await connector.setHostConnectionState(
@@ -450,7 +324,7 @@ final class VmServiceContext {
             _drainRequested = false;
             _isProcessingQueue = false;
             _lastKnownAppPendingCount = 0;
-            _lastSamplingPushAt = null;
+        
             if (_messageArrived != null && !_messageArrived!.isCompleted) {
               _messageArrived!.complete();
             }
