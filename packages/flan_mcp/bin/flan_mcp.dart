@@ -3,9 +3,7 @@ import 'dart:io';
 
 import 'package:args/args.dart';
 import 'package:logging/logging.dart' as logging;
-import 'package:flan_mcp/src/cmux_pane_bridge.dart';
 import 'package:flan_mcp/src/compat/copilot_stdio_server_transport.dart';
-import 'package:flan_mcp/src/trm_pane_bridge.dart';
 import 'package:flan_mcp/src/version.g.dart';
 import 'package:flan_mcp/src/vm_service/vm_service_context.dart';
 import 'package:mcp_dart/mcp_dart.dart';
@@ -68,11 +66,7 @@ void printUsage(ArgParser argParser) {
 
 /// Creates a fresh McpServer + VmServiceContext pair.
 /// Each call returns an independent session.
-({McpServer server, VmServiceContext vmService}) createSession({
-  TrmPaneBridge? bridge,
-  CmuxPaneBridge? cmuxBridge,
-}) {
-  final logger = logging.Logger('main');
+({McpServer server, VmServiceContext vmService}) createSession() {
   final vmService = VmServiceContext();
 
   final server = McpServer(
@@ -91,33 +85,6 @@ void printUsage(ArgParser argParser) {
   );
 
   vmService.registerTools(server);
-
-  if (bridge != null || cmuxBridge != null) {
-    final registeredCallback = vmService.connector.onUserMessageQueued;
-    vmService.connector.onUserMessageQueued = () {
-      registeredCallback?.call();
-      if (bridge != null) {
-        unawaited(() async {
-          try {
-            await bridge.sendProcessQueue();
-          } catch (err) {
-            logger.fine('TrmPaneBridge send failed: $err');
-          }
-        }());
-      }
-      if (cmuxBridge != null) {
-        unawaited(() async {
-          try {
-            await cmuxBridge.sendProcessQueue(
-              vmService.connector.connectedUri,
-            );
-          } catch (err) {
-            logger.fine('CmuxPaneBridge send failed: $err');
-          }
-        }());
-      }
-    };
-  }
 
   return (server: server, vmService: vmService);
 }
@@ -145,38 +112,14 @@ Future<int> main(List<String> arguments) async {
 
     setupLogging(logLevelName, logFile);
 
-    final logger = logging.Logger('main');
-
-    // --- Best-effort trm Text Tap bridge ---
-    TrmPaneBridge? bridge;
-    try {
-      bridge = TrmPaneBridge();
-      await bridge.connect();
-      logger.info('Connected to trm Text Tap socket');
-    } catch (err) {
-      logger.fine('trm socket not available (not running in trm?): $err');
-      bridge = null;
-    }
-
-    // --- Best-effort cmux bridge ---
-    CmuxPaneBridge? cmuxBridge;
-    try {
-      cmuxBridge = CmuxPaneBridge();
-      await cmuxBridge.connect();
-      logger.info('Connected to cmux socket');
-    } catch (err) {
-      logger.fine('cmux socket not available (not running in cmux?): $err');
-      cmuxBridge = null;
-    }
-
     if (port != null) {
-      return await runStreamableServer(port, bridge, cmuxBridge);
+      return await runStreamableServer(port);
     } else if (ssePort != null) {
-      final session = createSession(bridge: bridge, cmuxBridge: cmuxBridge);
-      return await runSseServer(session.server, ssePort, bridge, cmuxBridge);
+      final session = createSession();
+      return await runSseServer(session.server, ssePort);
     } else {
-      final session = createSession(bridge: bridge, cmuxBridge: cmuxBridge);
-      return await runStdioServer(session.server, bridge, cmuxBridge);
+      final session = createSession();
+      return await runStdioServer(session.server);
     }
   } on FormatException catch (e) {
     stderr
@@ -221,8 +164,7 @@ String _formatTime(DateTime time) {
       '${time.second.toString().padLeft(2, '0')}';
 }
 
-Future<int> runStdioServer(
-    McpServer server, TrmPaneBridge? bridge, CmuxPaneBridge? cmuxBridge) async {
+Future<int> runStdioServer(McpServer server) async {
   final logger = logging.Logger('main');
 
   final transport = CopilotCompatStdioServerTransport();
@@ -239,20 +181,13 @@ Future<int> runStdioServer(
   final signal = await _ExitSignal().wait;
   logger.info('Received ${signal.name}, stopping');
 
-  await bridge?.close();
-  await cmuxBridge?.close();
   await server.close();
   await transport.close();
   logger.info('Stopped');
   return 0;
 }
 
-Future<int> runSseServer(
-  McpServer server,
-  int ssePort,
-  TrmPaneBridge? bridge,
-  CmuxPaneBridge? cmuxBridge,
-) async {
+Future<int> runSseServer(McpServer server, int ssePort) async {
   final logger = logging.Logger('main');
   final sseServerManager = SseServerManager(server);
   try {
@@ -273,8 +208,6 @@ Future<int> runSseServer(
     }
 
     logger.info('Stopping');
-    await bridge?.close();
-    await cmuxBridge?.close();
     await server.close();
   } catch (e, st) {
     logger.severe('Error when waiting for MCP client connection', e, st);
@@ -285,15 +218,14 @@ Future<int> runSseServer(
   return 0;
 }
 
-Future<int> runStreamableServer(
-    int port, TrmPaneBridge? bridge, CmuxPaneBridge? cmuxBridge) async {
+Future<int> runStreamableServer(int port) async {
   final logger = logging.Logger('main');
   final sessions = <String, VmServiceContext>{};
 
   final streamableServer = StreamableMcpServer(
     serverFactory: (sessionId) {
       logger.info('Creating session $sessionId');
-      final session = createSession(bridge: bridge, cmuxBridge: cmuxBridge);
+      final session = createSession();
       sessions[sessionId] = session.vmService;
 
       // Clean up VM service connection when the session closes.
@@ -333,8 +265,6 @@ Future<int> runStreamableServer(
   sessions.clear();
 
   await streamableServer.stop();
-  await bridge?.close();
-  await cmuxBridge?.close();
   logger.info('Stopped');
   return 0;
 }

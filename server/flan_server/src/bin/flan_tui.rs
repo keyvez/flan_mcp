@@ -1231,10 +1231,11 @@ async fn main() -> io::Result<()> {
                                         let vm_uri = vm_uri.or_else(|| {
                                             tokio::task::block_in_place(|| probe_vm_service_uri(pid))
                                         });
-                                        let text = match &vm_uri {
-                                            Some(uri) => format!("flan connect to {} and process queue once connected", uri),
-                                            None => "process queue".to_string(),
+                                        let Some(uri) = vm_uri else {
+                                            app.set_toast("Flush failed: VM service URI not yet resolved");
+                                            continue;
                                         };
+                                        let text = format!("flan connect to {} and process queue once connected", uri);
                                         let sid = assoc.claude_surface_id.clone();
                                         let t = text.clone();
                                         let label = sid[..8.min(sid.len())].to_string();
