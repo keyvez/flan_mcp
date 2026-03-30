@@ -988,14 +988,16 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   }
 
   void _sendErrorToAgent(InterceptedError error) {
+    final truncated = error.details.length > 200
+        ? '${error.details.substring(0, 200)}…'
+        : error.details;
     widget.userMessageService.sendMessage({
       'type': 'app_error',
-      'text':
-          'App error intercepted — please investigate:\n${error.details}',
+      'text': 'App error intercepted — please investigate:\n$truncated',
       'data': <String, dynamic>{
         'kind': 'app_error',
         'summary': error.summary,
-        'details': error.details,
+        'details': truncated,
         'timestamp': error.timestamp.toIso8601String(),
       },
     });
