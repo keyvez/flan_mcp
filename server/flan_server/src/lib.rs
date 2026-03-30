@@ -475,12 +475,21 @@ mod server {
                 probe_vm_service_uri(flutter_pid)
             });
 
-            match &vm_uri {
-                Some(uri) => {
-                    format!("flan connect to {} and process queue once connected", uri)
-                }
-                None => "process queue".to_string(),
-            }
+            let Some(uri) = vm_uri else {
+                state
+                    .log(
+                        "in",
+                        "Flush failed: could not resolve VM service URI for Flutter app".into(),
+                        None,
+                        false,
+                    )
+                    .await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Could not resolve VM service URI — is the Flutter app running in debug mode?"})),
+                );
+            };
+            format!("flan connect to {} and process queue once connected", uri)
         };
 
         let t = text.clone();
@@ -1377,7 +1386,7 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         );
 
         panes.push(TrmPane {
-            index: pane_id,
+            index: i,
             folder_name,
             cwd,
             has_claude,
