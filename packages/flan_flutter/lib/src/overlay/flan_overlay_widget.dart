@@ -989,8 +989,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
   void _sendErrorToAgent(InterceptedError error) {
     final lines = error.details.split('\n');
-    final truncated = lines.length > 50
-        ? '${lines.take(50).join('\n')}…'
+    final truncated = lines.length > 20
+        ? '${lines.take(20).join('\n')}…'
         : error.details;
     widget.userMessageService.sendMessage({
       'type': 'app_error',
