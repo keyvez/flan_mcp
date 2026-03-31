@@ -1,8 +1,10 @@
 /// Entry point for flan_mcp with trm Text Tap integration.
 ///
-/// Wraps the standard flan_mcp server but additionally creates a
-/// [TrmPaneBridge] that auto-sends `process_queue` to the Claude Code
-/// pane in trm whenever a user message is queued from the Flutter app.
+/// Wraps the standard flan_mcp server and additionally creates a
+/// [TrmPaneBridge] that marks the Claude pane as connected when a
+/// Flutter app connects. Message delivery is handled entirely by
+/// the flan-tui server's /api/flush endpoint — this entry point
+/// does not send process_queue autonomously.
 ///
 /// Usage:
 ///   dart run packages/flan_mcp/bin/flan_mcp_trm.dart [options]

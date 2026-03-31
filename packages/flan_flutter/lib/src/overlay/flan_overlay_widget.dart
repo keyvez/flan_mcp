@@ -340,6 +340,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// Tracks the last time a Ctrl key was pressed for double-tap detection.
   DateTime? _lastCtrlPressTime;
 
+  /// Drag offset for the queue badge button. null = default (top-right) position.
+  Offset? _badgeDragOffset;
+  bool _isDraggingBadge = false;
+  Offset? _badgeDragStartOffset; // value of _badgeDragOffset when long press started
+
   /// Set after stop_recording so we can show the result sheet.
   String? _lastGeneratedTest;
   List<String> _lastRecordedStepLabels = const [];
@@ -1341,8 +1346,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     final pendingCount = pendingMessages.length;
     final displayCount = pendingCount;
     final viewPadding = MediaQuery.paddingOf(context);
-    final badgeTop = viewPadding.top + 16;
-    final badgeRight = viewPadding.right + 16;
+    final badgeTop = viewPadding.top + 16 + (_badgeDragOffset?.dy ?? 0);
+    final badgeRight = viewPadding.right + 16 - (_badgeDragOffset?.dx ?? 0);
 
     return Directionality(
       textDirection: TextDirection.ltr,
@@ -1539,7 +1544,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
             right: badgeRight,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTap: () {
+              onTap: _isDraggingBadge ? null : () {
                 setState(() {
                   _showErrorPanel = false;
                   if (_showQueuedMessagesPanel) {
@@ -1561,6 +1566,43 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                       List<Map<String, dynamic>>.from(pendingMessages);
                   _showQueuedMessagesPanel = _queuedMessagesSnapshot.isNotEmpty;
                 });
+              },
+              onLongPressStart: (_) {
+                setState(() {
+                  _isDraggingBadge = true;
+                  _badgeDragStartOffset = _badgeDragOffset ?? Offset.zero;
+                });
+              },
+              onLongPressMoveUpdate: (details) {
+                // offsetFromOrigin is the total displacement from the long-press
+                // start point, so we add it to the offset we had at drag start.
+                setState(() {
+                  _badgeDragOffset = (_badgeDragStartOffset ?? Offset.zero) +
+                      details.offsetFromOrigin;
+                });
+              },
+              onLongPressEnd: (_) {
+                setState(() => _isDraggingBadge = false);
+              },
+              // Cmd+drag to move on web/desktop.
+              onPanStart: (details) {
+                if (!HardwareKeyboard.instance.isMetaPressed) return;
+                setState(() {
+                  _isDraggingBadge = true;
+                  _badgeDragStartOffset = _badgeDragOffset ?? Offset.zero;
+                });
+              },
+              onPanUpdate: (details) {
+                if (!_isDraggingBadge) return;
+                setState(() {
+                  _badgeDragOffset = (_badgeDragOffset ?? Offset.zero) +
+                      details.delta;
+                });
+              },
+              onPanEnd: (_) {
+                if (_isDraggingBadge) {
+                  setState(() => _isDraggingBadge = false);
+                }
               },
               child: _QueuedMessagesBadge(
                 count: displayCount,
