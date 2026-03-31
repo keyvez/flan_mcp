@@ -944,24 +944,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       );
     }
 
-    final previewBounds = _resolveQueuePreviewBounds(
-      selection: selection,
-      annotations: annotations,
-    );
-
-    // Capture a screenshot to include with the message.
-    try {
-      await _attachScreenshotAndQueueThumbnail(
-        context: context,
-        screenshotService: widget.screenshotService,
-        data: data,
-        previewBounds: previewBounds,
-        boundaryKey: _appContentKey,
-      );
-    } catch (_) {
-      // Screenshot capture is best-effort; don't block sending the message.
-    }
-
     // Sync the signature to the current annotations so the listener
     // doesn't recreate a draft from the same data on the next change.
     _lastQueuedAnnotationsSignature =
@@ -971,12 +953,39 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     // the new message (e.g. drafts from earlier annotation sessions).
     widget.userMessageService.promoteDrafts();
 
+    // Enqueue immediately so the item appears in the queue without delay.
     widget.userMessageService.sendMessage({
       'type': 'user_feedback',
       'text': parts.join('\n'),
       'data': data,
     });
+    final queueId = widget.userMessageService.lastQueueId;
     _isSendingToAgent = false;
+
+    // Capture screenshot and patch it into the queued message asynchronously.
+    final previewBounds = _resolveQueuePreviewBounds(
+      selection: selection,
+      annotations: annotations,
+    );
+    unawaited(() async {
+      try {
+        final screenshotData = <String, dynamic>{};
+        await _attachScreenshotAndQueueThumbnail(
+          context: context,
+          screenshotService: widget.screenshotService,
+          data: screenshotData,
+          previewBounds: previewBounds,
+          boundaryKey: _appContentKey,
+        );
+        if (screenshotData.isNotEmpty) {
+          widget.userMessageService.patchMessage(queueId, {
+            'data': {...data, ...screenshotData},
+          });
+        }
+      } catch (_) {
+        // Screenshot capture is best-effort.
+      }
+    }());
   }
 
   /// Packages annotations into a real queue item and immediately sends

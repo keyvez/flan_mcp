@@ -258,6 +258,9 @@ class UserMessageService extends ChangeNotifier {
     return _hydrationFuture ??= _hydrateFromStorage();
   }
 
+  /// The queue id assigned to the most recently enqueued message.
+  int get lastQueueId => _nextQueueId - 1;
+
   /// Enqueues a message to be sent to the agent.
   void sendMessage(Map<String, dynamic> message) {
     warmUp();
@@ -309,6 +312,18 @@ class UserMessageService extends ChangeNotifier {
 
   /// No-op. Retained for API compatibility.
   void promoteDrafts() {}
+
+  /// Merges [patch] into an existing queued message by queue id.
+  /// Returns true if the message was found and updated.
+  bool patchMessage(int queueId, Map<String, dynamic> patch) {
+    warmUp();
+    final index = _pendingMessages.indexWhere((m) => m['queueId'] == queueId);
+    if (index == -1) return false;
+    _pendingMessages[index] = {..._pendingMessages[index], ...patch};
+    unawaited(_persistQueueState());
+    notifyListeners();
+    return true;
+  }
 
   /// Removes a single queued message by queue id.
   /// Returns true if a message was found and removed.
