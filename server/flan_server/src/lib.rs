@@ -1353,21 +1353,144 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         Some(RawPane { surface_id, pane_id, window_id, title, has_claude, own_cwd })
     }).collect();
 
-    // --- Pass 2: for Claude panes without own_cwd, find nearest unclaimed path-pane neighbor ---
-    // Sort Claude panes by distance to their nearest path neighbor so closer ones get priority.
+    // --- Pass 2a: resolve cwds for Claude panes via login→shell→cwd ---
+    //
+    // Each trm surface is spawned by trm → login → shell.  For Claude panes
+    // whose title doesn't contain a path (own_cwd is None), we match by
+    // finding which trm login has a shell that is an ancestor of a `claude`
+    // process whose cwd matches a known claude_cwd.
+    //
+    // We then correlate surfaces ↔ logins by matching title-derived paths
+    // from path-bearing surfaces against login shell cwds.  Unmatched Claude
+    // surfaces get the remaining Claude-bearing logins' cwds.
+    let mut login_resolved_cwds: Vec<Option<String>> = vec![None; raw.len()];
+    {
+        // Find the trm process PID.
+        let trm_pid = all_procs.iter()
+            .find(|(_, _, c)| c.contains("trm.app") || c.ends_with("/trm") || c.ends_with("trm"))
+            .map(|(p, _, _)| *p);
+
+        if let Some(trm_pid) = trm_pid {
+            // Get all login children of trm and their shell cwds.
+            let logins: Vec<u32> = all_procs.iter()
+                .filter(|(_, pp, c)| *pp == trm_pid && c.contains("login"))
+                .map(|(p, _, _)| *p)
+                .collect();
+
+            // For each login, find its shell child and get the cwd.
+            // Also check if the shell has a claude descendant.
+            let shell_pids: Vec<(u32, u32)> = logins.iter()
+                .filter_map(|&lp| {
+                    all_procs.iter()
+                        .find(|(_, pp, c)| *pp == lp && (c.contains("zsh") || c.contains("bash") || c.contains("fish")))
+                        .map(|(sp, _, _)| (lp, *sp))
+                })
+                .collect();
+
+            // Batch lsof for all shells.
+            let pid_arg = shell_pids.iter().map(|(_, sp)| sp.to_string()).collect::<Vec<_>>().join(",");
+            let shell_cwds_map: HashMap<u32, String> = if pid_arg.is_empty() {
+                HashMap::new()
+            } else {
+                Command::new("lsof")
+                    .args(["-d", "cwd", "-a", "-Fn", "-a", "-p", &pid_arg])
+                    .output()
+                    .map(|o| {
+                        let mut map = HashMap::new();
+                        let out = String::from_utf8_lossy(&o.stdout);
+                        let mut cur_pid: Option<u32> = None;
+                        for line in out.lines() {
+                            if let Some(p) = line.strip_prefix('p') {
+                                cur_pid = p.parse().ok();
+                            } else if let Some(path) = line.strip_prefix('n') {
+                                if path.starts_with('/') {
+                                    if let Some(pid) = cur_pid {
+                                        map.insert(pid, path.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        map
+                    })
+                    .unwrap_or_default()
+            };
+
+            struct LoginInfo {
+                login_pid: u32,
+                shell_cwd: String,
+                has_claude_child: bool,
+            }
+
+            let login_infos: Vec<LoginInfo> = shell_pids.iter()
+                .filter_map(|(lp, sp)| {
+                    let cwd = shell_cwds_map.get(sp)?.clone();
+                    // Check if this shell has a claude descendant.
+                    let has_claude = all_procs.iter().any(|(_, pp, c)| {
+                        *pp == *sp && c.contains("claude") && !c.contains("flan")
+                    });
+                    Some(LoginInfo { login_pid: *lp, shell_cwd: cwd, has_claude_child: has_claude })
+                })
+                .collect();
+
+            // Match path-bearing surfaces to logins by title↔cwd.
+            let mut claimed_logins: HashSet<u32> = HashSet::new();
+            let mut surface_to_login: HashMap<usize, usize> = HashMap::new(); // raw_idx → login_info idx
+
+            for (raw_idx, rp) in raw.iter().enumerate() {
+                if let Some(ref tp) = rp.own_cwd {
+                    let tp_clean = tp.trim_end_matches('/');
+                    let matched = login_infos.iter().enumerate().find(|(_, li)| {
+                        if claimed_logins.contains(&li.login_pid) { return false; }
+                        let cwd_clean = li.shell_cwd.trim_end_matches('/');
+                        if tp_clean.starts_with('…') {
+                            let suffix = &tp_clean[tp_clean.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1)..];
+                            cwd_clean.ends_with(suffix)
+                        } else {
+                            cwd_clean == tp_clean
+                                || cwd_clean.starts_with(&format!("{}/", tp_clean))
+                        }
+                    });
+                    if let Some((li_idx, li)) = matched {
+                        claimed_logins.insert(li.login_pid);
+                        surface_to_login.insert(raw_idx, li_idx);
+                    }
+                }
+            }
+
+            // Assign unclaimed Claude-bearing logins to Claude panes without own_cwd.
+            let unclaimed_claude_logins: Vec<usize> = login_infos.iter().enumerate()
+                .filter(|(_, li)| li.has_claude_child && !claimed_logins.contains(&li.login_pid))
+                .map(|(i, _)| i)
+                .collect();
+
+            let unresolved_claude_panes: Vec<usize> = raw.iter().enumerate()
+                .filter(|(i, rp)| rp.has_claude && rp.own_cwd.is_none() && !surface_to_login.contains_key(i))
+                .map(|(i, _)| i)
+                .collect();
+
+            // If we can match 1:1 by cwd against claude_cwds, do it.
+            // Otherwise, assign in order (best effort).
+            for (&raw_idx, li_idx) in unclaimed_claude_logins.iter()
+                .zip(unresolved_claude_panes.iter())
+            {
+                // raw_idx is login info index, li_idx is pane index — swap naming
+                let li = &login_infos[raw_idx];
+                login_resolved_cwds[*li_idx] = Some(li.shell_cwd.clone());
+                tracing::debug!(
+                    "discover_trm_panes: resolved cwd for pane {} via login {} → {}",
+                    *li_idx, li.login_pid, li.shell_cwd
+                );
+            }
+        }
+    }
+
+    // --- Pass 2b: for remaining Claude panes without cwd, try neighbor borrowing ---
     let mut claimed_path_panes: std::collections::HashSet<(String, usize)> = Default::default();
-
-    // Pre-mark path panes that have own-cwd Claude panes (they don't need to borrow).
-    // Also pre-mark path pane keys whose Claude pane already has own_cwd (no borrowing needed).
-
-    // Build the borrowed_cwd for each raw pane index, processing Claude panes in order of
-    // their nearest available neighbor distance (closest-first globally).
     let mut borrowed_cwds: Vec<Option<String>> = vec![None; raw.len()];
 
-    // Collect (distance, claude_idx, neighbor_pane_id, window_id, path) candidates.
     let mut candidates: Vec<(usize, usize, usize, String, String)> = Vec::new();
     for (i, rp) in raw.iter().enumerate() {
-        if !rp.has_claude || rp.own_cwd.is_some() {
+        if !rp.has_claude || rp.own_cwd.is_some() || login_resolved_cwds[i].is_some() {
             continue;
         }
         for delta in 1usize..=3 {
@@ -1382,7 +1505,6 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             }
         }
     }
-    // Sort by distance so closer neighbors are assigned first.
     candidates.sort_by_key(|(dist, _, _, _, _)| *dist);
     for (_, claude_idx, neighbor_id, window_id, path) in candidates {
         let key = (window_id, neighbor_id);
@@ -1397,7 +1519,11 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
 
     for (i, rp) in raw.into_iter().enumerate() {
         let RawPane { surface_id, pane_id, title, has_claude, own_cwd, .. } = rp;
-        let resolved_cwd = own_cwd.or_else(|| borrowed_cwds[i].clone());
+        // Prefer login-resolved cwd (ground truth), then own_cwd (from title),
+        // then borrowed cwd (from neighbor).
+        let resolved_cwd = login_resolved_cwds[i].take()
+            .or(own_cwd)
+            .or_else(|| borrowed_cwds[i].clone());
 
         let (folder_name, cwd) = if let Some(ref c) = resolved_cwd {
             let clean = c.trim_end_matches('/');
