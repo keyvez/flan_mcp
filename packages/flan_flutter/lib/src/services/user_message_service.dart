@@ -28,6 +28,11 @@ class UserMessageService extends ChangeNotifier {
   final http.Client _httpClient;
   final List<Map<String, dynamic>> _pendingMessages = [];
   int _nextQueueId = 1;
+
+  /// When true, VM service extension events (`postEvent`) are suppressed.
+  /// Set this when a flan-channel is handling message delivery so the
+  /// flan MCP server doesn't trigger redundant `process_queue` calls.
+  bool suppressVmEvents = false;
   Future<void>? _hydrationFuture;
   bool _isPersisting = false;
   bool _persistRequested = false;
@@ -271,10 +276,12 @@ class UserMessageService extends ChangeNotifier {
       'timestamp': timestamp,
     });
 
-    developer.postEvent(userMessageQueuedEventKind, {
-      'pendingCount': _pendingMessages.length,
-      'timestamp': timestamp,
-    });
+    if (!suppressVmEvents) {
+      developer.postEvent(userMessageQueuedEventKind, {
+        'pendingCount': _pendingMessages.length,
+        'timestamp': timestamp,
+      });
+    }
 
     unawaited(_persistQueueState());
     notifyListeners();
@@ -361,7 +368,7 @@ class UserMessageService extends ChangeNotifier {
   /// Call this to nudge the agent to consume queued messages.
   void notifyPending() {
     warmUp();
-    if (_pendingMessages.isEmpty) return;
+    if (_pendingMessages.isEmpty || suppressVmEvents) return;
     developer.postEvent(userMessageQueuedEventKind, {
       'pendingCount': _pendingMessages.length,
       'timestamp': DateTime.now().toIso8601String(),

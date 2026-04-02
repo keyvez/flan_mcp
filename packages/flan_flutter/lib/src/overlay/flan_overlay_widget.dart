@@ -500,6 +500,29 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       return;
     }
 
+    // Check if there's already a message with annotations — adopt it as the
+    // draft instead of creating a duplicate.
+    final existingMessages = widget.userMessageService.peekMessages();
+    final existingAnnotationIdx = existingMessages.indexWhere((m) {
+      final d = m['data'];
+      if (d is! Map) return false;
+      final a = d['annotations'];
+      return a is List && a.isNotEmpty;
+    });
+    if (existingAnnotationIdx != -1) {
+      final existingQueueId = _queueIdOf(existingMessages[existingAnnotationIdx]);
+      if (existingQueueId != null) {
+        _annotationDraftQueueId = existingQueueId;
+        widget.userMessageService.updateMessageByQueueId(existingQueueId, {
+          'type': 'user_feedback',
+          'text': text,
+          'data': data,
+        });
+        _attachDraftThumbnail(existingQueueId, enrichedAnnotations);
+        return;
+      }
+    }
+
     widget.userMessageService.sendMessage({
       'type': 'user_feedback',
       'text': text,
@@ -826,7 +849,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       'data': data,
     });
 
-    widget.userMessageService.notifyPending();
     unawaited(_flushToServer());
     setState(() {
       _lastGeneratedTest = null;
@@ -1016,7 +1038,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// to the agent via flan server flush.
   Future<void> _sendToAgentAndFlush() async {
     await _sendToAgent();
-    widget.userMessageService.notifyPending();
     unawaited(_flushToServer());
   }
 
@@ -1221,6 +1242,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
       debugPrint('[flan] resolved vm_service_uri=$wsUri channelPort=$channelPort');
 
+      var channelOk = false;
       try {
         final channelBody = jsonEncode(<String, dynamic>{
           if (wsUri != null) 'vm_service_uri': wsUri,
@@ -1232,8 +1254,17 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           body: channelBody,
         );
         debugPrint('[flan] channel response: ${res.statusCode} ${res.body}');
+        channelOk = res.statusCode == 200;
       } catch (e) {
         debugPrint('[flan] channel not available: $e');
+      }
+
+      if (channelOk) {
+        // Channel is active — suppress all VM service events so the
+        // flan MCP server doesn't trigger redundant process_queue calls.
+        widget.userMessageService.suppressVmEvents = true;
+      } else {
+        widget.userMessageService.notifyPending();
       }
     }());
   }
@@ -1387,6 +1418,12 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     }
     if (!changed) return;
 
+    // If all annotations were removed, delete the entire message.
+    if (remove && updatedAnnotations.isEmpty) {
+      _removeQueuedMessage(queueId);
+      return;
+    }
+
     data['annotations'] = updatedAnnotations;
     final updatedMessage = Map<String, dynamic>.from(originalMessage);
     updatedMessage['data'] = data;
@@ -1425,39 +1462,44 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           RepaintBoundary(key: _appContentKey, child: widget.child),
           // Inspector overlay — always in tree to preserve stable widget
           // indices and avoid disrupting the Navigator's restoration scope.
-          Visibility(
-            visible: widget.inspectorService.enabled,
-            maintainState: true,
-            maintainAnimation: true,
-            maintainSize: false,
-            maintainInteractivity: false,
-            child: _InspectorOverlay(
-              service: widget.inspectorService,
-              userMessageService: widget.userMessageService,
-              screenshotService: widget.screenshotService,
-              onMessageSent: () => unawaited(_flushToServer()),
+          // Wrapped in Positioned.fill so the Visibility/Offstage layer
+          // doesn't break the Stack → Positioned parent-data contract.
+          Positioned.fill(
+            child: Visibility(
+              visible: widget.inspectorService.enabled,
+              maintainState: true,
+              maintainAnimation: true,
+              maintainSize: false,
+              maintainInteractivity: false,
+              child: _InspectorOverlay(
+                service: widget.inspectorService,
+                userMessageService: widget.userMessageService,
+                screenshotService: widget.screenshotService,
+                onMessageSent: () => unawaited(_flushToServer()),
+              ),
             ),
           ),
           // Annotation overlay — always in tree for the same reason.
-          Visibility(
-            visible: widget.annotationService.enabled,
-            maintainState: true,
-            maintainAnimation: true,
-            maintainSize: false,
-            maintainInteractivity: false,
-            child: _AnnotationOverlay(
-              service: widget.annotationService,
-              userMessageService: widget.userMessageService,
-              onAnnotationSubmitted: () {
-                _sendToAgent();
-              },
-              onAnnotationSubmittedAndSent: () {
-                _sendToAgentAndFlush();
-              },
-              onFlushRequested: () {
-                widget.userMessageService.notifyPending();
-                unawaited(_flushToServer());
-              },
+          Positioned.fill(
+            child: Visibility(
+              visible: widget.annotationService.enabled,
+              maintainState: true,
+              maintainAnimation: true,
+              maintainSize: false,
+              maintainInteractivity: false,
+              child: _AnnotationOverlay(
+                service: widget.annotationService,
+                userMessageService: widget.userMessageService,
+                onAnnotationSubmitted: () {
+                  _sendToAgent();
+                },
+                onAnnotationSubmittedAndSent: () {
+                  _sendToAgentAndFlush();
+                },
+                onFlushRequested: () {
+                  unawaited(_flushToServer());
+                },
+              ),
             ),
           ),
           // Annotation status badge
@@ -1729,11 +1771,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 onSend: () {
                   debugPrint('[flan] send button pressed');
                   widget.userMessageService.promoteDrafts();
-                  widget.userMessageService.notifyPending();
-                  // Flush notifies the channel server (preview) and the TUI.
-                  // Messages stay in the app queue so process_queue can
-                  // consume them with full data (images, etc.) over the VM
-                  // service — the channel notification is just a signal.
+                  // Flush sends messages via the flan-channel if available.
+                  // notifyPending is deferred into _flushToServer and only
+                  // fired when no channel is available, to avoid duplicate
+                  // delivery (channel + process_queue).
                   if (widget.annotationService.enabled) {
                     widget.annotationService.disable();
                   }
@@ -1989,7 +2030,6 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
       'text': parts.join('\n'),
       'data': data,
     });
-    widget.userMessageService.notifyPending();
     widget.onMessageSent?.call();
 
     _textController.clear();
@@ -1998,50 +2038,48 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
 
   @override
   Widget build(BuildContext context) {
-    return Positioned.fill(
-      child: Stack(
-        children: [
-          // Gesture layer
-          Positioned.fill(
-            child: KeyboardListener(
-              focusNode: _focusNode,
-              autofocus: !widget.service.locked,
-              onKeyEvent: _handleKeyEvent,
-              child: Listener(
-                behavior: HitTestBehavior.opaque,
-                onPointerDown: (event) {
-                  // If locked, unlock previous selection first.
-                  if (widget.service.locked) {
-                    widget.service.selectCurrentElement(); // toggles unlock
-                  }
-                  // Find elements at the tap position, then lock selection
-                  widget.service.handlePointerHover(event.position);
-                  widget.service.selectCurrentElement();
-                  // Focus the text field after locking
-                  if (widget.service.locked) {
-                    _textController.clear();
-                    WidgetsBinding.instance.addPostFrameCallback((_) {
-                      _textFocusNode.requestFocus();
-                    });
-                  }
-                },
-                child: const SizedBox.expand(),
-              ),
+    return Stack(
+      children: [
+        // Gesture layer
+        Positioned.fill(
+          child: KeyboardListener(
+            focusNode: _focusNode,
+            autofocus: !widget.service.locked,
+            onKeyEvent: _handleKeyEvent,
+            child: Listener(
+              behavior: HitTestBehavior.opaque,
+              onPointerDown: (event) {
+                // If locked, unlock previous selection first.
+                if (widget.service.locked) {
+                  widget.service.selectCurrentElement(); // toggles unlock
+                }
+                // Find elements at the tap position, then lock selection
+                widget.service.handlePointerHover(event.position);
+                widget.service.selectCurrentElement();
+                // Focus the text field after locking
+                if (widget.service.locked) {
+                  _textController.clear();
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    _textFocusNode.requestFocus();
+                  });
+                }
+              },
+              child: const SizedBox.expand(),
             ),
           ),
-          // Text input when selection is locked
-          if (widget.service.locked && widget.service.lastSelection != null)
-            Builder(
-              builder: (context) {
-                final screenSize = MediaQuery.of(context).size;
-                return _buildTextField(
-                  widget.service.lastSelection!.bounds,
-                  screenSize,
-                );
-              },
-            ),
-        ],
-      ),
+        ),
+        // Text input when selection is locked
+        if (widget.service.locked && widget.service.lastSelection != null)
+          Builder(
+            builder: (context) {
+              final screenSize = MediaQuery.of(context).size;
+              return _buildTextField(
+                widget.service.lastSelection!.bounds,
+                screenSize,
+              );
+            },
+          ),
+      ],
     );
   }
 
@@ -2196,99 +2234,97 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
 
   @override
   Widget build(BuildContext context) {
-    return Positioned.fill(
-      child: Stack(
-        children: [
-          // Gesture layer for drawing — use Listener for reliable
-          // pointer tracking on all platforms including web
-          Positioned.fill(
-            child: Listener(
-              behavior: HitTestBehavior.opaque,
-              onPointerDown: (event) {
-                // If currently editing, re-focus the text field instead of
-                // starting a new drawing.
-                if (widget.service.drawState == AnnotationDrawState.editing ||
-                    widget.service.drawState ==
-                        AnnotationDrawState.editingExisting) {
-                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                    _textFocusNode.requestFocus();
-                  });
-                  return;
-                }
-                final tappedExisting =
-                    widget.service.startDrawing(event.position);
-                if (tappedExisting) {
-                  final idx = widget.service.editingIndex;
-                  if (idx != null &&
-                      idx >= 0 &&
-                      idx < widget.service.annotations.length) {
-                    _textController.text = widget.service.annotations[idx].text;
-                    _textController.selection = TextSelection(
-                      baseOffset: 0,
-                      extentOffset: _textController.text.length,
-                    );
-                    WidgetsBinding.instance.addPostFrameCallback((_) {
-                      _textFocusNode.requestFocus();
-                    });
-                  }
-                }
-              },
-              onPointerMove: (event) {
-                widget.service.updateDrawing(event.position);
-              },
-              onPointerUp: (_) {
-                widget.service.finishDrawing();
-                if (widget.service.drawState == AnnotationDrawState.editing) {
-                  _textController.clear();
+    return Stack(
+      children: [
+        // Gesture layer for drawing — use Listener for reliable
+        // pointer tracking on all platforms including web
+        Positioned.fill(
+          child: Listener(
+            behavior: HitTestBehavior.opaque,
+            onPointerDown: (event) {
+              // If currently editing, re-focus the text field instead of
+              // starting a new drawing.
+              if (widget.service.drawState == AnnotationDrawState.editing ||
+                  widget.service.drawState ==
+                      AnnotationDrawState.editingExisting) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  _textFocusNode.requestFocus();
+                });
+                return;
+              }
+              final tappedExisting =
+                  widget.service.startDrawing(event.position);
+              if (tappedExisting) {
+                final idx = widget.service.editingIndex;
+                if (idx != null &&
+                    idx >= 0 &&
+                    idx < widget.service.annotations.length) {
+                  _textController.text = widget.service.annotations[idx].text;
+                  _textController.selection = TextSelection(
+                    baseOffset: 0,
+                    extentOffset: _textController.text.length,
+                  );
                   WidgetsBinding.instance.addPostFrameCallback((_) {
                     _textFocusNode.requestFocus();
                   });
                 }
-              },
-              child: CustomPaint(
-                painter: AnnotationPainter(
-                  annotations: widget.service.annotations,
-                  dragStart: widget.service.dragStart,
-                  dragCurrent: widget.service.dragCurrent,
-                  pendingRect: widget.service.pendingRect,
-                  drawState: widget.service.drawState,
-                  editingIndex: widget.service.editingIndex,
-                ),
-                size: Size.infinite,
+              }
+            },
+            onPointerMove: (event) {
+              widget.service.updateDrawing(event.position);
+            },
+            onPointerUp: (_) {
+              widget.service.finishDrawing();
+              if (widget.service.drawState == AnnotationDrawState.editing) {
+                _textController.clear();
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  _textFocusNode.requestFocus();
+                });
+              }
+            },
+            child: CustomPaint(
+              painter: AnnotationPainter(
+                annotations: widget.service.annotations,
+                dragStart: widget.service.dragStart,
+                dragCurrent: widget.service.dragCurrent,
+                pendingRect: widget.service.pendingRect,
+                drawState: widget.service.drawState,
+                editingIndex: widget.service.editingIndex,
               ),
+              size: Size.infinite,
             ),
           ),
-          // Text input field when creating a new annotation
-          if (widget.service.drawState == AnnotationDrawState.editing &&
-              widget.service.pendingRect != null)
-            Builder(
-              builder: (context) {
-                final screenSize = MediaQuery.of(context).size;
-                return _buildTextField(
-                  widget.service.pendingRect!,
-                  screenSize,
-                );
-              },
-            ),
-          // Text input field when editing an existing annotation
-          if (widget.service.drawState == AnnotationDrawState.editingExisting &&
-              widget.service.editingIndex != null &&
-              widget.service.editingIndex! >= 0 &&
-              widget.service.editingIndex! < widget.service.annotations.length)
-            Builder(
-              builder: (context) {
-                final screenSize = MediaQuery.of(context).size;
-                final annotation =
-                    widget.service.annotations[widget.service.editingIndex!];
-                return _buildEditTextField(
-                  annotation.bounds,
-                  screenSize,
-                  annotation.id,
-                );
-              },
-            ),
-        ],
-      ),
+        ),
+        // Text input field when creating a new annotation
+        if (widget.service.drawState == AnnotationDrawState.editing &&
+            widget.service.pendingRect != null)
+          Builder(
+            builder: (context) {
+              final screenSize = MediaQuery.of(context).size;
+              return _buildTextField(
+                widget.service.pendingRect!,
+                screenSize,
+              );
+            },
+          ),
+        // Text input field when editing an existing annotation
+        if (widget.service.drawState == AnnotationDrawState.editingExisting &&
+            widget.service.editingIndex != null &&
+            widget.service.editingIndex! >= 0 &&
+            widget.service.editingIndex! < widget.service.annotations.length)
+          Builder(
+            builder: (context) {
+              final screenSize = MediaQuery.of(context).size;
+              final annotation =
+                  widget.service.annotations[widget.service.editingIndex!];
+              return _buildEditTextField(
+                annotation.bounds,
+                screenSize,
+                annotation.id,
+              );
+            },
+          ),
+      ],
     );
   }
 
@@ -3815,8 +3851,9 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
         const SizedBox(width: 4),
         GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onTap: () {
+          onTapDown: (_) {
             if (annotationId.isEmpty) return;
+            _commitEdit();
             widget.onDeleteAnnotation(queueId, annotationId);
           },
           child: const Padding(
@@ -3878,7 +3915,12 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
           const SizedBox(width: 6),
           GestureDetector(
             behavior: HitTestBehavior.opaque,
-            onTap: () => widget.onDeleteMessage(queueId),
+            onTapDown: (_) {
+              // Commit any pending edit first so the focus-loss rebuild
+              // doesn't swallow the delete tap.
+              _commitEdit();
+              widget.onDeleteMessage(queueId);
+            },
             child: const Padding(
               padding: EdgeInsets.all(2),
               child: Icon(
