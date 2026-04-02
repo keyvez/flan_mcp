@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Read, Write as IoWrite},
     net::TcpStream,
     path::PathBuf,
@@ -121,6 +121,9 @@ pub struct TrmPane {
     /// Raw title from trm's surface.list, used as fallback display when cwd is unknown.
     #[serde(default)]
     pub title: Option<String>,
+    /// Channel port for the flan-channel MCP server running in this pane, if registered.
+    #[serde(default)]
+    pub channel_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +161,12 @@ pub struct SharedState {
     pub flutter_cache: RwLock<Option<(Instant, Vec<FlutterApp>)>>,
     pub desktop_cache: RwLock<Option<(Instant, DesktopTarget)>>,
     pub activity_log: RwLock<VecDeque<LogEntry>>,
+    /// Registered flan-channel ports by surface id (e.g. "trm:0" → 4051).
+    pub channel_ports: RwLock<HashMap<String, u16>>,
+    /// Registered flan-channel ports by shell cwd (ground truth from lsof).
+    /// Used when surface_id resolution isn't possible; the TUI matches
+    /// registered shell cwds against claude process cwds at display time.
+    pub channel_ports_by_cwd: RwLock<HashMap<String, u16>>,
 }
 
 impl SharedState {
@@ -171,6 +180,8 @@ impl SharedState {
             flutter_cache: RwLock::new(None),
             desktop_cache: RwLock::new(None),
             activity_log: RwLock::new(VecDeque::new()),
+            channel_ports: RwLock::new(HashMap::new()),
+            channel_ports_by_cwd: RwLock::new(HashMap::new()),
         }
     }
 
@@ -238,6 +249,18 @@ mod server {
     #[derive(Debug, Deserialize)]
     struct FocusAppRequest {
         device: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RegisterChannelRequest {
+        surface_id: Option<String>,
+        port: u16,
+        /// PID of the channel process — used to resolve its trm pane when
+        /// `surface_id` is not provided.
+        pid: Option<u32>,
+        /// Working directory of the channel process — used as a fallback
+        /// when PID-based resolution fails.
+        cwd: Option<String>,
     }
 
     async fn get_claude_processes(
@@ -485,9 +508,15 @@ mod server {
             )
             .await;
 
+        let channel_port = state.channel_ports.read().await
+            .get(&surface_id).copied();
+
         let mut resp = serde_json::json!({"ok": true, "surface_id": surface_id});
         if let Some(ref uri) = resolved_vm_uri {
             resp["vm_service_uri"] = serde_json::Value::String(uri.clone());
+        }
+        if let Some(port) = channel_port {
+            resp["channel_port"] = serde_json::Value::Number(port.into());
         }
 
         (StatusCode::OK, Json(resp))
@@ -556,6 +585,64 @@ mod server {
                 Json(serde_json::json!({"error": "Failed to send test text"})),
             )
         }
+    }
+
+    async fn handle_register_channel(
+        State(state): State<Arc<SharedState>>,
+        Json(body): Json<RegisterChannelRequest>,
+    ) -> impl IntoResponse {
+        // Resolve surface_id: use the explicit value, or look up which trm pane
+        // the given PID belongs to.
+        let surface_id = if let Some(sid) = body.surface_id {
+            Some(sid)
+        } else if let Some(channel_pid) = body.pid {
+            let cwd_hint = body.cwd.clone();
+            tokio::task::spawn_blocking(move || resolve_trm_pane_for_pid(channel_pid, cwd_hint.as_deref()))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        let port = body.port;
+
+        if let Some(ref sid) = surface_id {
+            tracing::info!("Channel registered: surface_id={} port={}", sid, port);
+            state.channel_ports.write().await.insert(sid.clone(), port);
+        }
+
+        // Also register by shell cwd (ground truth) — the TUI matches this
+        // against claude process cwds at display time.
+        if let Some(channel_pid) = body.pid {
+            let shell_cwd = tokio::task::spawn_blocking(move || {
+                // Find the login ancestor, then get its shell's cwd.
+                let login = find_login_pid(channel_pid)?;
+                let ps_out = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output().ok()?;
+                let ps_str = String::from_utf8_lossy(&ps_out.stdout);
+                let shell_pid: u32 = ps_str.lines().skip(1).find_map(|l| {
+                    let mut it = l.split_whitespace();
+                    let pid: u32 = it.next()?.parse().ok()?;
+                    let ppid: u32 = it.next()?.parse().ok()?;
+                    let comm = it.collect::<Vec<_>>().join(" ");
+                    if ppid == login && (comm.contains("zsh") || comm.contains("bash") || comm.contains("fish")) {
+                        Some(pid)
+                    } else {
+                        None
+                    }
+                })?;
+                let cwd = get_process_cwd(shell_pid);
+                if cwd.is_empty() { None } else { Some(cwd) }
+            }).await.ok().flatten();
+
+            if let Some(cwd) = shell_cwd {
+                tracing::info!("Channel registered by cwd: {} → port {}", cwd, port);
+                state.channel_ports_by_cwd.write().await.insert(cwd, port);
+            }
+        }
+
+        let sid_str = surface_id.as_deref().unwrap_or("(unresolved)");
+        (StatusCode::OK, Json(serde_json::json!({"ok": true, "surface_id": sid_str})))
     }
 
     async fn handle_focus_app(
@@ -666,6 +753,7 @@ mod server {
             .route("/api/focus-surface", post(handle_focus_surface))
             .route("/api/focus-app", post(handle_focus_app))
             .route("/api/test-send", post(handle_test_send))
+            .route("/api/register-channel", post(handle_register_channel))
             .route("/api/rescan", post(handle_rescan))
             .route("/api/status", get(get_status))
             .route("/api/logs", get(get_activity_log))
@@ -1324,6 +1412,12 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             (None, None)
         };
 
+        // Upgrade has_claude if the resolved cwd matches a live claude process cwd.
+        // This catches panes running Claude Code with --dangerously-load-development-channels
+        // where the title shows the task description instead of "Claude Code".
+        let has_claude = has_claude
+            || cwd.as_deref().map(|c| cwd_has_claude(c)).unwrap_or(false);
+
         tracing::debug!(
             surface_id = %surface_id,
             pane_id = pane_id,
@@ -1340,10 +1434,236 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             has_claude,
             surface_id: Some(surface_id),
             title: if title.is_empty() { None } else { Some(title) },
+            channel_port: None,
         });
     }
 
     panes
+}
+
+/// Resolve a PID to its `trm:N` surface ID.
+///
+/// Walks the target PID's ancestor chain to find its `login` ancestor under
+/// trm, then maps that login to a surface by correlating each login's shell
+/// cwd with surface titles (which contain path information).
+/// Find the login PID that is the ancestor of `target_pid` under the trm process.
+pub fn find_login_pid(target_pid: u32) -> Option<u32> {
+    let Ok(ps_out) = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output() else {
+        return None;
+    };
+    let ps_str = String::from_utf8_lossy(&ps_out.stdout);
+    let procs: Vec<(u32, u32, String)> = ps_str
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid: u32 = it.next()?.parse().ok()?;
+            let ppid: u32 = it.next()?.parse().ok()?;
+            let comm = it.collect::<Vec<_>>().join(" ");
+            Some((pid, ppid, comm))
+        })
+        .collect();
+
+    let trm_pid = procs.iter()
+        .find(|(_, _, c)| c.contains("trm.app") || c.ends_with("/trm"))
+        .map(|(p, _, _)| *p)?;
+
+    let mut cur = target_pid;
+    let mut visited = HashSet::new();
+    for _ in 0..50 {
+        if !visited.insert(cur) { break; }
+        if let Some((_, pp, _)) = procs.iter().find(|(p, _, _)| *p == cur) {
+            if *pp == trm_pid {
+                return Some(cur);
+            }
+            if *pp <= 1 { break; }
+            cur = *pp;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+pub fn resolve_trm_pane_for_pid(target_pid: u32, cwd_hint: Option<&str>) -> Option<String> {
+    let Ok(ps_out) = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output() else {
+        return None;
+    };
+    let ps_str = String::from_utf8_lossy(&ps_out.stdout);
+    let procs: Vec<(u32, u32, String)> = ps_str
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let pid: u32 = it.next()?.parse().ok()?;
+            let ppid: u32 = it.next()?.parse().ok()?;
+            let comm = it.collect::<Vec<_>>().join(" ");
+            Some((pid, ppid, comm))
+        })
+        .collect();
+
+    // Find the trm process.
+    let trm_pid = procs.iter()
+        .find(|(_, _, c)| c.contains("trm.app") || c.ends_with("/trm"))
+        .map(|(p, _, _)| *p)?;
+
+    // Walk the target PID's ancestor chain to find the login child of trm.
+    let mut cur = target_pid;
+    let mut visited = HashSet::new();
+    let mut target_login: Option<u32> = None;
+    for _ in 0..50 {
+        if !visited.insert(cur) { break; }
+        // Check if `cur` is a direct child of trm
+        if let Some((_, pp, _)) = procs.iter().find(|(p, _, _)| *p == cur) {
+            if *pp == trm_pid {
+                target_login = Some(cur);
+                break;
+            }
+            if *pp <= 1 { break; }
+            cur = *pp;
+        } else {
+            break;
+        }
+    }
+
+    let target_login = target_login?;
+
+    // Get the target login's shell cwd — this is the ground truth.
+    let target_shell_cwd = procs.iter()
+        .find(|(_, pp, c)| *pp == target_login && (c.contains("zsh") || c.contains("bash") || c.contains("fish")))
+        .map(|(p, _, _)| get_process_cwd(*p))
+        .unwrap_or_default();
+
+    // Use cwd_hint as fallback if shell cwd lookup failed.
+    let effective_cwd = if !target_shell_cwd.is_empty() {
+        target_shell_cwd.as_str()
+    } else if let Some(hint) = cwd_hint {
+        hint
+    } else {
+        tracing::warn!("resolve_trm_pane_for_pid: pid {} — found login {} but no cwd", target_pid, target_login);
+        return None;
+    };
+
+    // Get all trm logins and their shell cwds.
+    let all_logins: Vec<u32> = procs.iter()
+        .filter(|(_, pp, c)| *pp == trm_pid && c.contains("login"))
+        .map(|(p, _, _)| *p)
+        .collect();
+
+    let shell_pids: Vec<(u32, u32)> = all_logins.iter()
+        .filter_map(|&lp| {
+            procs.iter()
+                .find(|(_, pp, c)| *pp == lp && (c.contains("zsh") || c.contains("bash") || c.contains("fish")))
+                .map(|(sp, _, _)| (lp, *sp))
+        })
+        .collect();
+
+    let pid_arg = shell_pids.iter().map(|(_, sp)| sp.to_string()).collect::<Vec<_>>().join(",");
+    let shell_cwds: HashMap<u32, String> = if pid_arg.is_empty() {
+        HashMap::new()
+    } else {
+        Command::new("lsof")
+            .args(["-d", "cwd", "-a", "-Fn", "-a", "-p", &pid_arg])
+            .output()
+            .map(|o| {
+                let mut map = HashMap::new();
+                let out = String::from_utf8_lossy(&o.stdout);
+                let mut cur_pid: Option<u32> = None;
+                for line in out.lines() {
+                    if let Some(p) = line.strip_prefix('p') {
+                        cur_pid = p.parse().ok();
+                    } else if let Some(path) = line.strip_prefix('n') {
+                        if path.starts_with('/') {
+                            if let Some(pid) = cur_pid {
+                                map.insert(pid, path.to_string());
+                            }
+                        }
+                    }
+                }
+                map
+            })
+            .unwrap_or_default()
+    };
+
+    let login_cwds: HashMap<u32, String> = shell_pids.iter()
+        .filter_map(|(lp, sp)| {
+            shell_cwds.get(sp).map(|cwd| (*lp, cwd.clone()))
+        })
+        .collect();
+
+    // Get surfaces from trm.
+    let surfaces = trm_rpc("surface.list", serde_json::json!({}))
+        .and_then(|r| r.get("result")?.get("surfaces")?.as_array().cloned())
+        .unwrap_or_default();
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let expand = |t: &str| -> Option<String> {
+        let tok = t.split_whitespace()
+            .find(|tok| tok.starts_with('/') || tok.starts_with('~') || tok.starts_with('…'))?;
+        if tok.starts_with('~') && !home.is_empty() {
+            Some(format!("{}{}", home, &tok[1..]))
+        } else {
+            Some(tok.to_string())
+        }
+    };
+
+    // Match each surface to a login by comparing title-derived path ↔ login shell cwd.
+    let mut claimed_logins: HashSet<u32> = HashSet::new();
+    let mut surface_to_login: HashMap<usize, u32> = HashMap::new(); // raw index → login
+
+    for (raw_idx, s) in surfaces.iter().enumerate() {
+        let title = strip_ansi(s.get("title").and_then(|v| v.as_str()).unwrap_or(""));
+        let Some(tp) = expand(&title) else { continue };
+        let tp_clean = tp.trim_end_matches('/');
+
+        let matched = login_cwds.iter().find(|(lp, cwd)| {
+            if claimed_logins.contains(lp) { return false; }
+            let cwd_clean = cwd.trim_end_matches('/');
+            if tp_clean.starts_with('…') {
+                let suffix = &tp_clean[tp_clean.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1)..];
+                cwd_clean.ends_with(suffix)
+            } else {
+                cwd_clean == tp_clean
+                    || cwd_clean.starts_with(&format!("{}/", tp_clean))
+            }
+        });
+        if let Some((lp, _)) = matched {
+            claimed_logins.insert(*lp);
+            surface_to_login.insert(raw_idx, *lp);
+        }
+    }
+
+    // Use discover_trm_panes for consistent index mapping.
+    let panes = discover_trm_panes();
+
+    // If target_login was matched to a surface, return it.
+    if let Some((&raw_idx, _)) = surface_to_login.iter().find(|(_, &lp)| lp == target_login) {
+        if let Some(pane) = panes.get(raw_idx) {
+            let sid = format!("trm:{}", pane.index);
+            tracing::info!("resolve_trm_pane_for_pid: pid {} → {} (title↔cwd)", target_pid, sid);
+            return Some(sid);
+        }
+    }
+
+    // target_login wasn't matched via title. Try matching by cwd against
+    // discover_trm_panes results (which includes neighbor-derived cwds).
+    let effective_clean = effective_cwd.trim_end_matches('/');
+    // Exact match
+    if let Some(pane) = panes.iter().find(|p| {
+        p.has_claude && p.cwd.as_deref()
+            .map(|c| c.trim_end_matches('/') == effective_clean)
+            .unwrap_or(false)
+    }) {
+        let sid = format!("trm:{}", pane.index);
+        tracing::info!("resolve_trm_pane_for_pid: pid {} → {} (pane cwd exact)", target_pid, sid);
+        return Some(sid);
+    }
+
+    tracing::warn!(
+        "resolve_trm_pane_for_pid: pid {} — no match (login={}, cwd={}, claimed={:?})",
+        target_pid, target_login, effective_cwd, claimed_logins
+    );
+    None
 }
 
 // ── Discovery: Floss Desktop ──────────────────────────────────────────

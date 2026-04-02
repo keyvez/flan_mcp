@@ -367,9 +367,49 @@ impl App {
         // Attach registered channel ports to trm panes.
         {
             let ports = self.shared.channel_ports.read().await;
+            let cwd_ports = self.shared.channel_ports_by_cwd.read().await;
+            let mut used_cwds: std::collections::HashSet<String> = std::collections::HashSet::new();
+
             for pane in &mut trm {
+                // Try direct surface_id match first.
                 let key = format!("trm:{}", pane.index);
                 pane.channel_port = ports.get(&key).copied();
+
+                // Try matching by cwd (ground truth shell cwd from registration).
+                if pane.channel_port.is_none() && pane.has_claude && !cwd_ports.is_empty() {
+                    if let Some(ref pane_cwd) = pane.cwd {
+                        let pane_clean = pane_cwd.trim_end_matches('/');
+                        for (reg_cwd, &port) in cwd_ports.iter() {
+                            if used_cwds.contains(reg_cwd) { continue; }
+                            let reg_clean = reg_cwd.trim_end_matches('/');
+                            if reg_clean == pane_clean
+                                || reg_clean.starts_with(&format!("{}/", pane_clean))
+                                || pane_clean.starts_with(&format!("{}/", reg_clean))
+                            {
+                                pane.channel_port = Some(port);
+                                used_cwds.insert(reg_cwd.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Last resort: unmatched registrations assigned to Claude panes
+            // with no cwd and no channel_port yet.
+            if !cwd_ports.is_empty() {
+                let unmatched_ports: Vec<u16> = cwd_ports.iter()
+                    .filter(|(cwd, _)| !used_cwds.contains(*cwd))
+                    .map(|(_, &port)| port)
+                    .collect();
+                let mut port_iter = unmatched_ports.iter();
+                for pane in &mut trm {
+                    if pane.has_claude && pane.channel_port.is_none() && pane.cwd.is_none() {
+                        if let Some(&port) = port_iter.next() {
+                            pane.channel_port = Some(port);
+                        }
+                    }
+                }
             }
         }
         self.trm_panes = trm;
@@ -663,6 +703,28 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
     let conn_area = cols[1];
     let right_area = cols[2];
 
+    // Pre-compute per-row line heights (max of both sides) so the two
+    // columns stay vertically aligned even though they scroll independently.
+    let row_heights: Vec<usize> = rows
+        .iter()
+        .map(|row| {
+            let fl = row
+                .flutter
+                .map(|fi| build_flutter_lines(app, fi).len())
+                .unwrap_or(0)
+                .max(1);
+            let cl = row
+                .surface
+                .map(|si| {
+                    let entries = app.claude_entries();
+                    build_entry_lines(app, &entries[si]).len()
+                })
+                .unwrap_or(0)
+                .max(1);
+            fl.max(cl)
+        })
+        .collect();
+
     // ── Flutter column (left) ────────────────────────────────────────
     let left_w = left_area.width.saturating_sub(2) as usize; // account for border
     let flutter_items: Vec<ListItem> = rows
@@ -681,7 +743,7 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
                 .map(|fi| build_flutter_lines(app, fi))
                 .unwrap_or_default();
 
-            let max_lines = if content_lines.is_empty() { 1 } else { content_lines.len() };
+            let max_lines = row_heights[row_idx];
             let mut lines = Vec::new();
 
             for line_idx in 0..max_lines {
@@ -735,32 +797,13 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
         let conn_w = conn_area.width as usize;
         let inner_height = conn_area.height.saturating_sub(2) as usize; // top+bottom border
 
-        // Compute each row's line-height so we can map visible lines to connectors.
-        let row_heights: Vec<usize> = rows
-            .iter()
-            .map(|row| {
-                let fl = row
-                    .flutter
-                    .map(|fi| build_flutter_lines(app, fi).len())
-                    .unwrap_or(0)
-                    .max(1);
-                let cl = row.surface.map(|si| {
-                    let entries = app.claude_entries();
-                    build_entry_lines(app, &entries[si]).len()
-                }).unwrap_or(0).max(1);
-                fl.max(cl) + 1 // +1 for separator line
-            })
-            .collect();
-
         // Use the flutter column's scroll offset as reference for connectors
         let scroll_offset = app.flutter_list_state.offset();
-        let mut _lines_skipped = 0usize;
         let mut visible_lines: Vec<Line> = Vec::new();
 
         for (row_idx, row) in rows.iter().enumerate() {
-            let h = row_heights[row_idx];
+            let h = row_heights[row_idx] + 1; // +1 for separator line
             if row_idx < scroll_offset {
-                _lines_skipped += h;
                 continue;
             }
             if visible_lines.len() >= inner_height {
@@ -818,7 +861,7 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
                 build_entry_lines(app, &entries[si])
             }).unwrap_or_default();
 
-            let max_lines = if content_lines.is_empty() { 1 } else { content_lines.len() };
+            let max_lines = row_heights[row_idx];
             let mut lines = Vec::new();
 
             for line_idx in 0..max_lines {
@@ -1314,7 +1357,11 @@ async fn main() -> io::Result<()> {
                             KeyCode::Char('t') => {
                                 // Send test via channel — use the selected pane's
                                 // registered channel port, or fall back to 4051.
-                                let channel_port: u16 = app.selected_entry()
+                                let selected = app.selected_entry();
+                                let target_label = selected.as_ref()
+                                    .map(|e| e.id())
+                                    .unwrap_or_else(|| format!("none (claude_row={:?})", app.claude_row));
+                                let channel_port: u16 = selected
                                     .and_then(|e| match e {
                                         ClaudeEntry::Trm(p) => p.channel_port,
                                         _ => None,
@@ -1360,7 +1407,7 @@ async fn main() -> io::Result<()> {
                                 };
                                 app.log("out", format!("Test channel → :{}", channel_port), Some(detail.clone()), ok).await;
                                 app.sync_log_snapshot().await;
-                                app.set_toast(if ok { "Test sent via channel" } else { &detail });
+                                app.set_toast(if ok { format!("Test → {} :{}", target_label, channel_port) } else { detail.clone() });
                             }
 
                             KeyCode::Char('x') => {

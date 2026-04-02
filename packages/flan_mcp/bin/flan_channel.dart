@@ -99,6 +99,11 @@ class FlanChannel {
   final McpServer mcpServer;
   final int listenPort;
 
+  /// The port the HTTP server actually bound to (may differ from [listenPort]
+  /// if that port was already in use).
+  int get boundPort => _boundPort;
+  int _boundPort = 0;
+
   final _logger = logging.Logger('FlanChannel');
   HttpServer? _httpServer;
 
@@ -106,10 +111,48 @@ class FlanChannel {
   /// for retrieval via the `get_flushed_images` tool.
   final List<Map<String, dynamic>> _pendingImages = [];
 
+  /// Maximum number of ports to try when the preferred port is taken.
+  static const _maxPortAttempts = 10;
+
   Future<void> start() async {
-    _httpServer = await HttpServer.bind(InternetAddress.loopbackIPv4, listenPort);
-    _logger.info('Listening for flush events on http://127.0.0.1:$listenPort');
-    unawaited(_serveRequests());
+    // Try the preferred port first, then increment up to _maxPortAttempts.
+    for (var attempt = 0; attempt < _maxPortAttempts; attempt++) {
+      final port = listenPort + attempt;
+      try {
+        _httpServer = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
+        _boundPort = port;
+        _logger.info('Listening for flush events on http://127.0.0.1:$port');
+        unawaited(_serveRequests());
+        unawaited(_registerWithTui());
+        return;
+      } on SocketException catch (e) {
+        if (attempt == _maxPortAttempts - 1) rethrow;
+        _logger.fine('Port $port in use ($e), trying ${port + 1}');
+      }
+    }
+  }
+
+  /// Register our bound port with the flan TUI server.  We send our PID and
+  /// let the server resolve which trm pane we belong to (it uses trm's own
+  /// `surface.list` RPC, so the index is guaranteed to match).
+  Future<void> _registerWithTui() async {
+    try {
+      final resp = await HttpClient()
+          .postUrl(Uri.parse('http://127.0.0.1:4050/api/register-channel'))
+          .then((req) {
+        req.headers.contentType = ContentType.json;
+        req.write(jsonEncode({
+          'pid': pid,
+          'port': _boundPort,
+          'cwd': Directory.current.path,
+        }));
+        return req.close();
+      });
+      final body = await resp.transform(utf8.decoder).join();
+      _logger.info('Registered channel (pid=$pid) → port $_boundPort: ${resp.statusCode} $body');
+    } catch (e) {
+      _logger.warning('Could not register channel port with TUI: $e');
+    }
   }
 
   void registerTools() {
