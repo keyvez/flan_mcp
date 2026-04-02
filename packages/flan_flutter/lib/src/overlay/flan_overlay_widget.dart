@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
-import 'dart:io' show pid;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart' hide InspectorSelection;
@@ -18,6 +17,7 @@ import 'package:flan_flutter/src/services/github_issue_service.dart';
 import 'package:flan_flutter/src/services/macro_recorder_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void _noopAnnotationSubmittedCallback() {}
 
@@ -345,6 +345,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   bool _isDraggingBadge = false;
   Offset? _badgeDragStartOffset; // value of _badgeDragOffset when long press started
 
+  static const _badgeDxKey = 'flan.badge_offset_dx';
+  static const _badgeDyKey = 'flan.badge_offset_dy';
+
   /// Set after stop_recording so we can show the result sheet.
   String? _lastGeneratedTest;
   List<String> _lastRecordedStepLabels = const [];
@@ -361,6 +364,22 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     widget.macroRecorderService.addListener(_onServiceChanged);
     HardwareKeyboard.instance.addHandler(_handleGlobalKey);
     _onAnnotationServiceChanged();
+    _loadBadgeOffset();
+  }
+
+  Future<void> _loadBadgeOffset() async {
+    final prefs = await SharedPreferences.getInstance();
+    final dx = prefs.getDouble(_badgeDxKey);
+    final dy = prefs.getDouble(_badgeDyKey);
+    if (dx != null && dy != null && mounted) {
+      setState(() => _badgeDragOffset = Offset(dx, dy));
+    }
+  }
+
+  Future<void> _saveBadgeOffset(Offset offset) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_badgeDxKey, offset.dx);
+    await prefs.setDouble(_badgeDyKey, offset.dy);
   }
 
   @override
@@ -1137,38 +1156,82 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     });
   }
 
-  Future<void> _flushToServer() async {
+  Future<void> _flushToServer({
+    List<Map<String, dynamic>>? messages,
+  }) async {
+    String? wsUri;
     try {
-      String? wsUri;
-      try {
-        final info = await developer.Service.getInfo();
-        if (info.serverUri != null) {
-          var uri = info.serverUri
-              .toString()
-              .replaceFirst('http://', 'ws://');
-          if (uri.endsWith('/')) {
-            uri = '${uri}ws';
-          } else {
-            uri = '$uri/ws';
-          }
-          wsUri = uri;
+      final info = await developer.Service.getInfo();
+      if (info.serverUri != null) {
+        var uri = info.serverUri
+            .toString()
+            .replaceFirst('http://', 'ws://');
+        if (uri.endsWith('/')) {
+          uri = '${uri}ws';
+        } else {
+          uri = '$uri/ws';
         }
-      } catch (e) {
-        debugPrint('[flan] failed to get VM service URI: $e');
+        wsUri = uri;
       }
-      debugPrint('[flan] flushing to server, vm_service_uri=$wsUri');
-      final res = await http.post(
-        Uri.parse('http://127.0.0.1:4050/api/flush'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(<String, dynamic>{
-          'flutter_pid': pid,
-          if (wsUri != null) 'vm_service_uri': wsUri,
-        }),
-      );
-      debugPrint('[flan] flush response: ${res.statusCode} ${res.body}');
     } catch (e) {
-      debugPrint('[flan] flush error: $e');
+      debugPrint('[flan] failed to get VM service URI: $e');
     }
+
+    // Use provided messages or peek from the queue.
+    final msgs = messages ?? widget.userMessageService.peekMessages();
+    debugPrint('[flan] flushing ${msgs.length} message(s), vm_service_uri=$wsUri');
+
+    if (msgs.isEmpty) return;
+
+    // Fire-and-forget: ask TUI for the VM URI (it can resolve it even on
+    // web where dart:developer is unavailable), then forward messages + URI
+    // to the channel server.
+    unawaited(() async {
+      // If we don't have the URI yet, ask the TUI.
+      if (wsUri == null) {
+        try {
+          final tuiRes = await http.post(
+            Uri.parse('http://127.0.0.1:4050/api/flush'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(<String, dynamic>{}),
+          );
+          if (tuiRes.statusCode == 200) {
+            final tuiData = jsonDecode(tuiRes.body) as Map<String, dynamic>;
+            wsUri = tuiData['vm_service_uri'] as String?;
+          }
+        } catch (_) {}
+      } else {
+        // Still notify TUI for association tracking.
+        unawaited(() async {
+          try {
+            await http.post(
+              Uri.parse('http://127.0.0.1:4050/api/flush'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode(<String, dynamic>{
+                'vm_service_uri': wsUri,
+              }),
+            );
+          } catch (_) {}
+        }());
+      }
+
+      debugPrint('[flan] resolved vm_service_uri=$wsUri');
+
+      try {
+        final channelBody = jsonEncode(<String, dynamic>{
+          if (wsUri != null) 'vm_service_uri': wsUri,
+          'messages': msgs,
+        });
+        final res = await http.post(
+          Uri.parse('http://127.0.0.1:4051/flush'),
+          headers: {'Content-Type': 'application/json'},
+          body: channelBody,
+        );
+        debugPrint('[flan] channel response: ${res.statusCode} ${res.body}');
+      } catch (e) {
+        debugPrint('[flan] channel not available: $e');
+      }
+    }());
   }
 
   void _saveQueuedMessageText(int queueId, String newText) {
@@ -1448,6 +1511,19 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                             ),
                           ),
                         ),
+                        const SizedBox(width: 6),
+                        GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => widget.annotationService.disable(),
+                          child: const Padding(
+                            padding: EdgeInsets.all(4),
+                            child: Icon(
+                              Icons.close,
+                              size: 14,
+                              color: Color(0xFFAAAAAA),
+                            ),
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -1544,7 +1620,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
             right: badgeRight,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTap: _isDraggingBadge ? null : () {
+              onTap: () {
                 setState(() {
                   _showErrorPanel = false;
                   if (_showQueuedMessagesPanel) {
@@ -1574,8 +1650,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 });
               },
               onLongPressMoveUpdate: (details) {
-                // offsetFromOrigin is the total displacement from the long-press
-                // start point, so we add it to the offset we had at drag start.
                 setState(() {
                   _badgeDragOffset = (_badgeDragStartOffset ?? Offset.zero) +
                       details.offsetFromOrigin;
@@ -1583,6 +1657,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               },
               onLongPressEnd: (_) {
                 setState(() => _isDraggingBadge = false);
+                if (_badgeDragOffset != null) {
+                  unawaited(_saveBadgeOffset(_badgeDragOffset!));
+                }
               },
               // Cmd+drag to move on web/desktop.
               onPanStart: (details) {
@@ -1602,6 +1679,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               onPanEnd: (_) {
                 if (_isDraggingBadge) {
                   setState(() => _isDraggingBadge = false);
+                  if (_badgeDragOffset != null) {
+                    unawaited(_saveBadgeOffset(_badgeDragOffset!));
+                  }
                 }
               },
               child: _QueuedMessagesBadge(
@@ -1631,18 +1711,21 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   _toggleRecording();
                 },
                 onSend: () {
+                  debugPrint('[flan] send button pressed');
                   widget.userMessageService.promoteDrafts();
                   widget.userMessageService.notifyPending();
-                  // Ask flan server to send `flan connect to <uri> and
-                  // process queue once connected` to a Claude Code surface
-                  // via cmux. No pre-existing association is required — the
-                  // server discovers a Claude Code surface directly if needed.
-                  // This is typically the first contact that triggers
-                  // connection.
+                  // Flush notifies the channel server (preview) and the TUI.
+                  // Messages stay in the app queue so process_queue can
+                  // consume them with full data (images, etc.) over the VM
+                  // service — the channel notification is just a signal.
+                  if (widget.annotationService.enabled) {
+                    widget.annotationService.disable();
+                  }
                   unawaited(_flushToServer());
                   setState(() {
                     _showQueuedMessagesPanel = false;
                     _queuedMessagesSnapshot = const [];
+                    _annotationDraftQueueId = null;
                   });
                 },
                 onSaveAnnotation: _applyQueuedAnnotationEdit,
@@ -3529,7 +3612,10 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                   const SizedBox(width: 4),
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onTap: widget.onSend,
+                    onTap: () {
+                      debugPrint('[flan] Send button tapped (inside panel)');
+                      widget.onSend();
+                    },
                     child: Container(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 6, vertical: 2),

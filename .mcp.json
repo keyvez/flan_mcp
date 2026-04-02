@@ -9,6 +9,16 @@
         "FINEST"
       ],
       "cwd": "/Users/gaurav/dev/flan_mcp"
+    },
+    "flan-channel": {
+      "command": "dart",
+      "args": [
+        "run",
+        "/Users/gaurav/dev/flan_mcp/packages/flan_mcp/bin/flan_channel.dart",
+        "-l",
+        "INFO"
+      ],
+      "cwd": "/Users/gaurav/dev/flan_mcp"
     }
   }
 }

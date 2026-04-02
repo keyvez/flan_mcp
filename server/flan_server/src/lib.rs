@@ -457,12 +457,12 @@ mod server {
                 && body.vm_service_uri.is_none()
                 && desktop_bridge::floss_is_alive());
 
-        let text = if is_desktop {
-            "flan connect --mode desktop and process queue once connected".to_string()
+        // Resolve the VM service URI from the request body, association, or
+        // by probing the Flutter process.
+        let resolved_vm_uri = if is_desktop {
+            None
         } else {
-            let vm_uri = body.vm_service_uri.clone().or_else(|| {
-                // Use the association's pid, or fall back to the pid from the
-                // request body (for first-contact flushes with no association yet).
+            body.vm_service_uri.clone().or_else(|| {
                 let flutter_pid = assoc.as_ref().map(|a| a.flutter_pid)
                     .or(body.flutter_pid)?;
                 if let Ok(cache) = state.flutter_cache.try_read() {
@@ -473,76 +473,24 @@ mod server {
                     }
                 }
                 probe_vm_service_uri(flutter_pid)
-            });
-
-            let Some(uri) = vm_uri else {
-                state
-                    .log(
-                        "in",
-                        "Flush failed: could not resolve VM service URI for Flutter app".into(),
-                        None,
-                        false,
-                    )
-                    .await;
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "Could not resolve VM service URI — is the Flutter app running in debug mode?"})),
-                );
-            };
-            format!("flan connect to {} and process queue once connected", uri)
+            })
         };
 
-        let t = text.clone();
-        let sid = surface_id.clone();
-
-        let ok = tokio::task::spawn_blocking(move || {
-            if sid.starts_with("trm:") {
-                if let Ok(idx) = sid["trm:".len()..].parse::<usize>() {
-                    trm_send_to_pane(idx, &t)
-                } else {
-                    false
-                }
-            } else if cmux_send_text(&sid, &t) {
-                cmux_send_text(&sid, "\n")
-            } else {
-                false
-            }
-        })
-        .await
-        .unwrap_or(false);
-
-        if ok {
-            let pruned_note = if pruned > 0 {
-                format!(" (pruned {} stale)", pruned)
-            } else {
-                String::new()
-            };
-            state
-                .log(
-                    "out",
-                    format!("Flush → surface {}…{}", &surface_id[..8.min(surface_id.len())], pruned_note),
-                    Some(format!("sent: {}", text)),
-                    true,
-                )
-                .await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "surface_id": surface_id})),
+        state
+            .log(
+                "in",
+                format!("Flush (channel) from surface {}…", &surface_id[..8.min(surface_id.len())]),
+                resolved_vm_uri.as_ref().map(|u| format!("vm_uri: {}", u)),
+                true,
             )
-        } else {
-            state
-                .log(
-                    "out",
-                    format!("Flush failed → surface {}…", &surface_id[..8.min(surface_id.len())]),
-                    Some("cmux send_text returned false".into()),
-                    false,
-                )
-                .await;
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Failed to send to cmux"})),
-            )
+            .await;
+
+        let mut resp = serde_json::json!({"ok": true, "surface_id": surface_id});
+        if let Some(ref uri) = resolved_vm_uri {
+            resp["vm_service_uri"] = serde_json::Value::String(uri.clone());
         }
+
+        (StatusCode::OK, Json(resp))
     }
 
     async fn handle_focus_surface(

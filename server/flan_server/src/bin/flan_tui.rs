@@ -1188,35 +1188,48 @@ async fn main() -> io::Result<()> {
                             }
 
                             KeyCode::Char('t') => {
-                                match app.selected_entry() {
-                                    Some(ClaudeEntry::Cmux(surface)) => {
-                                        let sid = surface.id.clone();
-                                        let ok = tokio::task::spawn_blocking(move || {
-                                            cmux_send_text(&sid, "TEST MESSAGE FROM FLAN")
-                                                && cmux_send_text(&sid, "\n")
-                                        })
-                                        .await
-                                        .unwrap_or(false);
-                                        let short = surface.id[..8.min(surface.id.len())].to_string();
-                                        app.log("out", format!("Test send → {}…", short), Some("text: TEST MESSAGE FROM FLAN".into()), ok).await;
-                                        app.sync_log_snapshot().await;
-                                        app.set_toast(if ok { "Test sent" } else { "Test send failed" });
+                                // Send test via channel (port 4051).
+                                let channel_port: u16 = std::env::var("FLAN_CHANNEL_PORT")
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(4051);
+                                let payload = serde_json::json!({
+                                    "messages": [{
+                                        "type": "test",
+                                        "text": "TEST MESSAGE FROM FLAN",
+                                    }]
+                                });
+                                let body_str = payload.to_string();
+                                let req = format!(
+                                    "POST /flush HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    channel_port, body_str.len(), body_str
+                                );
+                                let (ok, detail) = match tokio::net::TcpStream::connect(
+                                    format!("127.0.0.1:{}", channel_port)
+                                ).await {
+                                    Ok(mut stream) => {
+                                        match tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes()).await {
+                                            Ok(_) => {
+                                                // Try to read response
+                                                let mut buf = vec![0u8; 4096];
+                                                let resp = match tokio::time::timeout(
+                                                    std::time::Duration::from_secs(2),
+                                                    tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+                                                ).await {
+                                                    Ok(Ok(n)) => String::from_utf8_lossy(&buf[..n]).to_string(),
+                                                    Ok(Err(e)) => format!("read err: {}", e),
+                                                    Err(_) => "read timeout".into(),
+                                                };
+                                                (true, format!("sent ok, response: {}", resp))
+                                            }
+                                            Err(e) => (false, format!("write err: {}", e)),
+                                        }
                                     }
-                                    Some(ClaudeEntry::Trm(pane)) => {
-                                        let idx = pane.index;
-                                        let ok = tokio::task::spawn_blocking(move || {
-                                            trm_send_to_pane(idx, "TEST MESSAGE FROM FLAN")
-                                        })
-                                        .await
-                                        .unwrap_or(false);
-                                        app.log("out", format!("Test send → trm:{}", pane.index), Some("text: TEST MESSAGE FROM FLAN".into()), ok).await;
-                                        app.sync_log_snapshot().await;
-                                        app.set_toast(if ok { "Test sent" } else { "Test send failed" });
-                                    }
-                                    None => {
-                                        app.set_toast("Select a Claude surface first");
-                                    }
-                                }
+                                    Err(e) => (false, format!("connect err: {}", e)),
+                                };
+                                app.log("out", format!("Test channel → :{}", channel_port), Some(detail.clone()), ok).await;
+                                app.sync_log_snapshot().await;
+                                app.set_toast(if ok { "Test sent via channel" } else { &detail });
                             }
 
                             KeyCode::Char('x') => {
