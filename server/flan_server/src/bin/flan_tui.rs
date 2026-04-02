@@ -965,8 +965,7 @@ fn build_entry_lines(app: &App, entry: &ClaudeEntry) -> Vec<(String, Style)> {
         ClaudeEntry::Trm(pane) => {
             let mut lines = Vec::new();
             let status = if pane.has_claude {
-                pane.title.as_deref()
-                    .and_then(agent_name_from_title)
+                pane.agent_name.as_deref()
                     .unwrap_or("agent")
             } else {
                 "(shell)"

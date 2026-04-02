@@ -158,8 +158,12 @@ pub struct TrmPane {
     pub folder_name: Option<String>,
     /// Full cwd path, if known.
     pub cwd: Option<String>,
-    /// Whether a claude process is running in this pane.
+    /// Whether a coding agent process is running in this pane.
     pub has_claude: bool,
+    /// Display name of the detected agent (e.g. "Claude", "Forge"), derived
+    /// from the actual running process when possible, falling back to the title.
+    #[serde(default)]
+    pub agent_name: Option<String>,
     /// Surface ID from trm's RPC (e.g. "surface-13"), used for surface.focus.
     #[serde(default)]
     pub surface_id: Option<String>,
@@ -1329,16 +1333,18 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         })
         .collect();
 
-    // Collect all live claude process cwds via lsof (trm pid=0 always, so we enumerate ourselves).
+    // Collect all live agent process cwds via lsof, mapping cwd → agent display name.
     let home = std::env::var("HOME").unwrap_or_default();
-    let claude_cwds: std::collections::HashSet<String> = all_procs
+    let agent_cwd_map: HashMap<String, &'static str> = all_procs
         .iter()
         .filter(|(_, _, comm)| is_agent_process(comm))
-        .filter_map(|(pid, _, _)| {
+        .filter_map(|(pid, _, comm)| {
             let cwd = get_process_cwd(*pid);
-            if cwd.is_empty() { None } else { Some(cwd) }
+            let name = agent_name_from_comm(comm)?;
+            if cwd.is_empty() { None } else { Some((cwd, name)) }
         })
         .collect();
+    let claude_cwds: std::collections::HashSet<String> = agent_cwd_map.keys().cloned().collect();
 
     // Build a map of (window_id, pane_id) → title for adjacency lookups.
     let pane_titles: std::collections::HashMap<(String, usize), String> = surfaces.iter()
@@ -1369,6 +1375,18 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             claude_cwds.iter().any(|c| c.ends_with(suffix))
         } else {
             claude_cwds.contains(cwd)
+        }
+    };
+
+    // Look up the agent display name for a cwd that matches a live agent process.
+    let agent_name_for_cwd = |cwd: &str| -> Option<&'static str> {
+        if cwd.starts_with('…') {
+            let suffix = &cwd[cwd.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1)..];
+            agent_cwd_map.iter()
+                .find(|(c, _)| c.ends_with(suffix))
+                .map(|(_, name)| *name)
+        } else {
+            agent_cwd_map.get(cwd).copied()
         }
     };
 
@@ -1409,6 +1427,7 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
     // from path-bearing surfaces against login shell cwds.  Unmatched Claude
     // surfaces get the remaining Claude-bearing logins' cwds.
     let mut login_resolved_cwds: Vec<Option<String>> = vec![None; raw.len()];
+    let mut login_resolved_agents: Vec<Option<&str>> = vec![None; raw.len()];
     {
         // Find the trm process PID.
         let trm_pid = all_procs.iter()
@@ -1464,16 +1483,23 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                 login_pid: u32,
                 shell_cwd: String,
                 has_claude_child: bool,
+                /// Display name of the agent child (e.g. "Claude", "Forge"), if any.
+                agent_child_name: Option<&'static str>,
             }
 
             let login_infos: Vec<LoginInfo> = shell_pids.iter()
                 .filter_map(|(lp, sp)| {
                     let cwd = shell_cwds_map.get(sp)?.clone();
-                    // Check if this shell has a coding agent descendant.
-                    let has_claude = all_procs.iter().any(|(_, pp, c)| {
-                        *pp == *sp && is_agent_process(c)
-                    });
-                    Some(LoginInfo { login_pid: *lp, shell_cwd: cwd, has_claude_child: has_claude })
+                    // Check if this shell has a coding agent descendant and which one.
+                    let agent_child = all_procs.iter()
+                        .find(|(_, pp, c)| *pp == *sp && is_agent_process(c))
+                        .and_then(|(_, _, c)| agent_name_from_comm(c));
+                    Some(LoginInfo {
+                        login_pid: *lp,
+                        shell_cwd: cwd,
+                        has_claude_child: agent_child.is_some(),
+                        agent_child_name: agent_child,
+                    })
                 })
                 .collect();
 
@@ -1498,6 +1524,9 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                     if let Some((li_idx, li)) = matched {
                         claimed_logins.insert(li.login_pid);
                         surface_to_login.insert(raw_idx, li_idx);
+                        if let Some(name) = li.agent_child_name {
+                            login_resolved_agents[raw_idx] = Some(name);
+                        }
                     }
                 }
             }
@@ -1521,9 +1550,12 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                 // raw_idx is login info index, li_idx is pane index — swap naming
                 let li = &login_infos[raw_idx];
                 login_resolved_cwds[*li_idx] = Some(li.shell_cwd.clone());
+                if let Some(name) = li.agent_child_name {
+                    login_resolved_agents[*li_idx] = Some(name);
+                }
                 tracing::debug!(
-                    "discover_trm_panes: resolved cwd for pane {} via login {} → {}",
-                    *li_idx, li.login_pid, li.shell_cwd
+                    "discover_trm_panes: resolved cwd for pane {} via login {} → {} (agent: {:?})",
+                    *li_idx, li.login_pid, li.shell_cwd, li.agent_child_name
                 );
             }
         }
@@ -1589,11 +1621,20 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         let has_claude = has_claude
             || cwd.as_deref().map(|c| cwd_has_claude(c)).unwrap_or(false);
 
+        // Determine agent display name.  Prefer process-derived sources (login
+        // chain or cwd match) because the terminal title may be stale (e.g.
+        // still shows "forge" after Claude Code replaced it in the same pane).
+        let agent_name = login_resolved_agents[i]
+            .map(|s| s.to_string())
+            .or_else(|| cwd.as_deref().and_then(|c| agent_name_for_cwd(c)).map(|s| s.to_string()))
+            .or_else(|| agent_name_from_title(&title).map(|s| s.to_string()));
+
         tracing::debug!(
             surface_id = %surface_id,
             pane_id = pane_id,
             title = %title,
             has_claude = has_claude,
+            agent_name = ?agent_name,
             cwd = ?cwd,
             "discover_trm_panes: pane"
         );
@@ -1603,6 +1644,7 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             folder_name,
             cwd,
             has_claude,
+            agent_name,
             surface_id: Some(surface_id),
             title: if title.is_empty() { None } else { Some(title) },
             channel_port: None,
