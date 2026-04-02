@@ -221,7 +221,8 @@ struct App {
     /// Per-column row selection — each column tracks its own cursor independently
     flutter_row: Option<usize>,
     claude_row: Option<usize>,
-    row_state: ListState,
+    flutter_list_state: ListState,
+    claude_list_state: ListState,
     log_state: ListState,
     log_visible: bool,
     toast: Option<(String, Instant)>,
@@ -243,7 +244,8 @@ impl App {
             focus: Focus::Main,
             flutter_row: None,
             claude_row: None,
-            row_state: ListState::default(),
+            flutter_list_state: ListState::default(),
+            claude_list_state: ListState::default(),
             log_state: ListState::default(),
             log_visible: true,
             toast: None,
@@ -267,9 +269,10 @@ impl App {
         }
     }
 
-    /// Sync row_state from the active column's selection (for rendering)
+    /// Sync both column list states from their respective selections
     fn sync_row_state(&mut self) {
-        self.row_state.select(self.active_row());
+        self.flutter_list_state.select(self.flutter_row);
+        self.claude_list_state.select(self.claude_row);
     }
 
     async fn log(
@@ -360,6 +363,15 @@ impl App {
 
         self.flutter_apps = flutter.clone();
         self.cmux_surfaces = surfaces;
+        let mut trm = trm;
+        // Attach registered channel ports to trm panes.
+        {
+            let ports = self.shared.channel_ports.read().await;
+            for pane in &mut trm {
+                let key = format!("trm:{}", pane.index);
+                pane.channel_port = ports.get(&key).copied();
+            }
+        }
         self.trm_panes = trm;
         self.desktop_target = if desktop.alive { Some(desktop.clone()) } else { None };
         *self.shared.desktop_cache.write().await = Some((Instant::now(), desktop));
@@ -635,110 +647,219 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
     let flutter_sel = app.flutter_row;
     let claude_sel = app.claude_row;
 
-    let items: Vec<ListItem> = rows
+    // Active column gets brighter highlight, inactive gets dimmer
+    let hl_bg_active = Color::Rgb(28, 24, 50);
+    let hl_bg_inactive = Color::Rgb(20, 18, 35);
+
+    // Split the area into three columns: flutter | connector | claude
+    let cols = Layout::horizontal([
+        Constraint::Percentage(44),
+        Constraint::Percentage(12),
+        Constraint::Percentage(44),
+    ])
+    .split(area);
+
+    let left_area = cols[0];
+    let conn_area = cols[1];
+    let right_area = cols[2];
+
+    // ── Flutter column (left) ────────────────────────────────────────
+    let left_w = left_area.width.saturating_sub(2) as usize; // account for border
+    let flutter_items: Vec<ListItem> = rows
         .iter()
         .enumerate()
         .map(|(row_idx, row)| {
-            let is_linked = row.flutter.is_some() && row.surface.is_some();
+            let hl = has_focus && flutter_sel == Some(row_idx) && row.flutter.is_some();
+            let bg = if hl {
+                if active_col == Column::Flutter { hl_bg_active } else { hl_bg_inactive }
+            } else {
+                BG
+            };
 
-            // Highlight each column cell independently based on its own selection
-            let hl_left = has_focus && flutter_sel == Some(row_idx) && row.flutter.is_some();
-            let hl_right = has_focus && claude_sel == Some(row_idx) && row.surface.is_some();
-
-            let mut lines = Vec::new();
-
-            let flutter_lines = row
+            let content_lines = row
                 .flutter
                 .map(|fi| build_flutter_lines(app, fi))
                 .unwrap_or_default();
-            let surface_lines = row.surface.map(|si| {
-                let entries = app.claude_entries();
-                build_entry_lines(app, &entries[si])
-            }).unwrap_or_default();
 
-            let max_lines = flutter_lines.len().max(surface_lines.len());
-
-            let left_w = (area.width as usize * 44 / 100).max(10);
-            let conn_w = (area.width as usize * 12 / 100).max(4);
-            let right_w = (area.width as usize * 44 / 100).max(10);
-
-            // Active column gets brighter highlight, inactive gets dimmer
-            let hl_bg_active = Color::Rgb(28, 24, 50);
-            let hl_bg_inactive = Color::Rgb(20, 18, 35);
-
-            let left_bg = if hl_left {
-                if active_col == Column::Flutter { hl_bg_active } else { hl_bg_inactive }
-            } else { BG };
-            let right_bg = if hl_right {
-                if active_col == Column::Claude { hl_bg_active } else { hl_bg_inactive }
-            } else { BG };
+            let max_lines = if content_lines.is_empty() { 1 } else { content_lines.len() };
+            let mut lines = Vec::new();
 
             for line_idx in 0..max_lines {
-                let left = flutter_lines.get(line_idx);
-                let right = surface_lines.get(line_idx);
-
-                let mut spans = Vec::new();
-
-                // Left column (Flutter)
-                if let Some((text, style)) = left {
+                if let Some((text, style)) = content_lines.get(line_idx) {
                     let truncated = truncate_str(text, left_w);
                     let pad = left_w.saturating_sub(char_width(&truncated));
-                    let s = if hl_left { style.bg(left_bg) } else { *style };
-                    spans.push(Span::styled(truncated, s));
+                    let s = if hl { style.bg(bg) } else { *style };
+                    let mut spans = vec![Span::styled(truncated, s)];
                     if pad > 0 {
-                        let pad_style = if hl_left { Style::default().bg(left_bg) } else { Style::default() };
+                        let pad_style = if hl { Style::default().bg(bg) } else { Style::default() };
                         spans.push(Span::styled(" ".repeat(pad), pad_style));
                     }
+                    lines.push(Line::from(spans));
                 } else {
-                    spans.push(Span::raw(" ".repeat(left_w)));
+                    let pad_style = if hl { Style::default().bg(bg) } else { Style::default() };
+                    lines.push(Line::from(Span::styled(" ".repeat(left_w), pad_style)));
                 }
-
-                // Connector
-                if line_idx == 0 && is_linked {
-                    let connector = center_pad(CONNECTOR, conn_w);
-                    spans.push(Span::styled(connector, Style::default().fg(GREEN)));
-                } else {
-                    spans.push(Span::raw(" ".repeat(conn_w)));
-                }
-
-                // Right column (Claude)
-                if let Some((text, style)) = right {
-                    let truncated = truncate_str(text, right_w);
-                    let pad = right_w.saturating_sub(char_width(&truncated));
-                    let s = if hl_right { style.bg(right_bg) } else { *style };
-                    spans.push(Span::styled(truncated, s));
-                    if pad > 0 {
-                        let pad_style = if hl_right { Style::default().bg(right_bg) } else { Style::default() };
-                        spans.push(Span::styled(" ".repeat(pad), pad_style));
-                    }
-                } else if hl_right {
-                    spans.push(Span::styled(" ".repeat(right_w), Style::default().bg(right_bg)));
-                } else {
-                    spans.push(Span::raw(" ".repeat(right_w)));
-                }
-
-                lines.push(Line::from(spans));
             }
 
             // Blank separator line between rows
-            lines.push(Line::from(Span::raw(" ".repeat(left_w + conn_w + right_w))));
+            lines.push(Line::from(Span::raw(" ".repeat(left_w))));
 
             ListItem::new(lines)
         })
         .collect();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(BG));
-
-    // Use stateful rendering for scroll tracking, but suppress the default
-    // whole-row highlight — we handle per-cell highlighting ourselves.
-    let list = List::new(items)
-        .block(block)
+    let flutter_border = if has_focus && active_col == Column::Flutter {
+        ACCENT
+    } else {
+        BORDER
+    };
+    let flutter_list = List::new(flutter_items)
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
+                .border_style(Style::default().fg(flutter_border))
+                .style(Style::default().bg(BG)),
+        )
         .highlight_style(Style::default());
 
-    f.render_stateful_widget(list, area, &mut app.row_state);
+    f.render_stateful_widget(flutter_list, left_area, &mut app.flutter_list_state);
+
+    // ── Connector column (center) ────────────────────────────────────
+    // Rendered as a plain widget (no scrolling) — we need to figure out
+    // which rows are actually visible in each column's viewport to draw
+    // connectors. For simplicity, render connectors based on absolute row
+    // position relative to the area.
+    // The connector column doesn't scroll — it just fills the space.
+    // We render it as a static Paragraph matching visible row offsets.
+    {
+        let conn_w = conn_area.width as usize;
+        let inner_height = conn_area.height.saturating_sub(2) as usize; // top+bottom border
+
+        // Compute each row's line-height so we can map visible lines to connectors.
+        let row_heights: Vec<usize> = rows
+            .iter()
+            .map(|row| {
+                let fl = row
+                    .flutter
+                    .map(|fi| build_flutter_lines(app, fi).len())
+                    .unwrap_or(0)
+                    .max(1);
+                let cl = row.surface.map(|si| {
+                    let entries = app.claude_entries();
+                    build_entry_lines(app, &entries[si]).len()
+                }).unwrap_or(0).max(1);
+                fl.max(cl) + 1 // +1 for separator line
+            })
+            .collect();
+
+        // Use the flutter column's scroll offset as reference for connectors
+        let scroll_offset = app.flutter_list_state.offset();
+        let mut _lines_skipped = 0usize;
+        let mut visible_lines: Vec<Line> = Vec::new();
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            let h = row_heights[row_idx];
+            if row_idx < scroll_offset {
+                _lines_skipped += h;
+                continue;
+            }
+            if visible_lines.len() >= inner_height {
+                break;
+            }
+
+            let is_linked = row.flutter.is_some() && row.surface.is_some();
+            for line_idx in 0..h {
+                if visible_lines.len() >= inner_height {
+                    break;
+                }
+                if line_idx == 0 && is_linked {
+                    let connector = center_pad(CONNECTOR, conn_w);
+                    visible_lines.push(Line::from(Span::styled(
+                        connector,
+                        Style::default().fg(GREEN),
+                    )));
+                } else {
+                    visible_lines.push(Line::from(Span::raw(" ".repeat(conn_w))));
+                }
+            }
+        }
+
+        // Pad remaining space
+        while visible_lines.len() < inner_height {
+            visible_lines.push(Line::from(Span::raw(" ".repeat(conn_w))));
+        }
+
+        let conn_block = Block::default()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(BG));
+
+        f.render_widget(
+            Paragraph::new(visible_lines).block(conn_block),
+            conn_area,
+        );
+    }
+
+    // ── Claude column (right) ────────────────────────────────────────
+    let right_w = right_area.width.saturating_sub(2) as usize; // account for border
+    let claude_items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(row_idx, row)| {
+            let hl = has_focus && claude_sel == Some(row_idx) && row.surface.is_some();
+            let bg = if hl {
+                if active_col == Column::Claude { hl_bg_active } else { hl_bg_inactive }
+            } else {
+                BG
+            };
+
+            let content_lines = row.surface.map(|si| {
+                let entries = app.claude_entries();
+                build_entry_lines(app, &entries[si])
+            }).unwrap_or_default();
+
+            let max_lines = if content_lines.is_empty() { 1 } else { content_lines.len() };
+            let mut lines = Vec::new();
+
+            for line_idx in 0..max_lines {
+                if let Some((text, style)) = content_lines.get(line_idx) {
+                    let truncated = truncate_str(text, right_w);
+                    let pad = right_w.saturating_sub(char_width(&truncated));
+                    let s = if hl { style.bg(bg) } else { *style };
+                    let mut spans = vec![Span::styled(truncated, s)];
+                    if pad > 0 {
+                        let pad_style = if hl { Style::default().bg(bg) } else { Style::default() };
+                        spans.push(Span::styled(" ".repeat(pad), pad_style));
+                    }
+                    lines.push(Line::from(spans));
+                } else {
+                    let pad_style = if hl { Style::default().bg(bg) } else { Style::default() };
+                    lines.push(Line::from(Span::styled(" ".repeat(right_w), pad_style)));
+                }
+            }
+
+            // Blank separator line between rows
+            lines.push(Line::from(Span::raw(" ".repeat(right_w))));
+
+            ListItem::new(lines)
+        })
+        .collect();
+
+    let claude_border = if has_focus && active_col == Column::Claude {
+        ACCENT
+    } else {
+        BORDER
+    };
+    let claude_list = List::new(claude_items)
+        .block(
+            Block::default()
+                .borders(Borders::RIGHT | Borders::TOP | Borders::BOTTOM)
+                .border_style(Style::default().fg(claude_border))
+                .style(Style::default().bg(BG)),
+        )
+        .highlight_style(Style::default());
+
+    f.render_stateful_widget(claude_list, right_area, &mut app.claude_list_state);
 }
 
 fn build_flutter_lines(app: &App, idx: usize) -> Vec<(String, Style)> {
@@ -801,8 +922,11 @@ fn build_entry_lines(app: &App, entry: &ClaudeEntry) -> Vec<(String, Style)> {
         ClaudeEntry::Trm(pane) => {
             let mut lines = Vec::new();
             let status = if pane.has_claude { "Claude Code" } else { "(shell)" };
+            let port_tag = pane.channel_port
+                .map(|p| format!("  ch:{}", p))
+                .unwrap_or_default();
             lines.push((
-                format!("trm:{}  {}", pane.index, status),
+                format!("trm:{}  {}{}", pane.index, status, port_tag),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ));
             if let Some(ref cwd) = pane.cwd {
@@ -1188,10 +1312,17 @@ async fn main() -> io::Result<()> {
                             }
 
                             KeyCode::Char('t') => {
-                                // Send test via channel (port 4051).
-                                let channel_port: u16 = std::env::var("FLAN_CHANNEL_PORT")
-                                    .ok()
-                                    .and_then(|s| s.parse().ok())
+                                // Send test via channel — use the selected pane's
+                                // registered channel port, or fall back to 4051.
+                                let channel_port: u16 = app.selected_entry()
+                                    .and_then(|e| match e {
+                                        ClaudeEntry::Trm(p) => p.channel_port,
+                                        _ => None,
+                                    })
+                                    .or_else(|| {
+                                        std::env::var("FLAN_CHANNEL_PORT").ok()
+                                            .and_then(|s| s.parse().ok())
+                                    })
                                     .unwrap_or(4051);
                                 let payload = serde_json::json!({
                                     "messages": [{
