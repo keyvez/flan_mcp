@@ -194,7 +194,7 @@ impl ClaudeEntry {
     }
     fn is_claude(&self) -> bool {
         match self {
-            ClaudeEntry::Cmux(s) => s.title.contains("Claude"),
+            ClaudeEntry::Cmux(s) => title_has_agent(&s.title),
             ClaudeEntry::Trm(p) => p.has_claude,
         }
     }
@@ -296,7 +296,7 @@ impl App {
         let mut entries: Vec<ClaudeEntry> = self
             .cmux_surfaces
             .iter()
-            .filter(|s| s.title.contains("Claude"))
+            .filter(|s| title_has_agent(&s.title))
             .cloned()
             .map(ClaudeEntry::Cmux)
             .collect();
@@ -313,7 +313,7 @@ impl App {
         self.cmux_surfaces
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.title.contains("Claude"))
+            .filter(|(_, s)| title_has_agent(&s.title))
             .map(|(i, _)| i)
             .collect()
     }
@@ -584,7 +584,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let status = format!(
-        "{} · ● {} flutter · {} claude · {} linked · :{} ",
+        "{} · ● {} flutter · {} agents · {} linked · :{} ",
         desktop_str, flutter_count, claude_count, link_count, app.port
     );
 
@@ -641,9 +641,9 @@ fn render_column_headers(f: &mut Frame, app: &App, area: Rect) {
         "   FLUTTER APPS"
     };
     let cl_header = if claude_active {
-        "CLAUDE CODE ◂ "
+        "CODING AGENTS ◂ "
     } else {
-        "CLAUDE CODE   "
+        "CODING AGENTS   "
     };
 
     f.render_widget(
@@ -673,7 +673,7 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
             .border_style(Style::default().fg(BORDER))
             .style(Style::default().bg(BG));
         let empty = Paragraph::new(Line::from(Span::styled(
-            "No Flutter apps or Claude surfaces found",
+            "No Flutter apps or coding agents found",
             Style::default().fg(TEXT2),
         )))
         .block(block)
@@ -964,7 +964,13 @@ fn build_entry_lines(app: &App, entry: &ClaudeEntry) -> Vec<(String, Style)> {
         }
         ClaudeEntry::Trm(pane) => {
             let mut lines = Vec::new();
-            let status = if pane.has_claude { "Claude Code" } else { "(shell)" };
+            let status = if pane.has_claude {
+                pane.title.as_deref()
+                    .and_then(agent_name_from_title)
+                    .unwrap_or("agent")
+            } else {
+                "(shell)"
+            };
             let port_tag = pane.channel_port
                 .map(|p| format!("  ch:{}", p))
                 .unwrap_or_default();
@@ -1355,59 +1361,78 @@ async fn main() -> io::Result<()> {
                             }
 
                             KeyCode::Char('t') => {
-                                // Send test via channel — use the selected pane's
-                                // registered channel port, or fall back to 4051.
                                 let selected = app.selected_entry();
                                 let target_label = selected.as_ref()
                                     .map(|e| e.id())
                                     .unwrap_or_else(|| format!("none (claude_row={:?})", app.claude_row));
-                                let channel_port: u16 = selected
-                                    .and_then(|e| match e {
-                                        ClaudeEntry::Trm(p) => p.channel_port,
-                                        _ => None,
-                                    })
-                                    .or_else(|| {
-                                        std::env::var("FLAN_CHANNEL_PORT").ok()
-                                            .and_then(|s| s.parse().ok())
-                                    })
-                                    .unwrap_or(4051);
-                                let payload = serde_json::json!({
-                                    "messages": [{
-                                        "type": "test",
-                                        "text": "TEST MESSAGE FROM FLAN",
-                                    }]
+
+                                // If the pane has a channel port, use channel push.
+                                // Otherwise, fall back to text injection via trm socket.
+                                let channel_port = selected.as_ref().and_then(|e| match e {
+                                    ClaudeEntry::Trm(p) => p.channel_port,
+                                    _ => None,
                                 });
-                                let body_str = payload.to_string();
-                                let req = format!(
-                                    "POST /flush HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                    channel_port, body_str.len(), body_str
-                                );
-                                let (ok, detail) = match tokio::net::TcpStream::connect(
-                                    format!("127.0.0.1:{}", channel_port)
-                                ).await {
-                                    Ok(mut stream) => {
-                                        match tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes()).await {
-                                            Ok(_) => {
-                                                // Try to read response
-                                                let mut buf = vec![0u8; 4096];
-                                                let resp = match tokio::time::timeout(
-                                                    std::time::Duration::from_secs(2),
-                                                    tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
-                                                ).await {
-                                                    Ok(Ok(n)) => String::from_utf8_lossy(&buf[..n]).to_string(),
-                                                    Ok(Err(e)) => format!("read err: {}", e),
-                                                    Err(_) => "read timeout".into(),
-                                                };
-                                                (true, format!("sent ok, response: {}", resp))
+
+                                if let Some(port) = channel_port {
+                                    let payload = serde_json::json!({
+                                        "messages": [{
+                                            "type": "test",
+                                            "text": "TEST MESSAGE FROM FLAN",
+                                        }]
+                                    });
+                                    let body_str = payload.to_string();
+                                    let req = format!(
+                                        "POST /flush HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        port, body_str.len(), body_str
+                                    );
+                                    let (ok, detail) = match tokio::net::TcpStream::connect(
+                                        format!("127.0.0.1:{}", port)
+                                    ).await {
+                                        Ok(mut stream) => {
+                                            match tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes()).await {
+                                                Ok(_) => {
+                                                    let mut buf = vec![0u8; 4096];
+                                                    let resp = match tokio::time::timeout(
+                                                        std::time::Duration::from_secs(2),
+                                                        tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+                                                    ).await {
+                                                        Ok(Ok(n)) => String::from_utf8_lossy(&buf[..n]).to_string(),
+                                                        Ok(Err(e)) => format!("read err: {}", e),
+                                                        Err(_) => "read timeout".into(),
+                                                    };
+                                                    (true, format!("sent ok, response: {}", resp))
+                                                }
+                                                Err(e) => (false, format!("write err: {}", e)),
                                             }
-                                            Err(e) => (false, format!("write err: {}", e)),
                                         }
-                                    }
-                                    Err(e) => (false, format!("connect err: {}", e)),
-                                };
-                                app.log("out", format!("Test channel → :{}", channel_port), Some(detail.clone()), ok).await;
-                                app.sync_log_snapshot().await;
-                                app.set_toast(if ok { format!("Test → {} :{}", target_label, channel_port) } else { detail.clone() });
+                                        Err(e) => (false, format!("connect err: {}", e)),
+                                    };
+                                    app.log("out", format!("Test channel → :{}", port), Some(detail.clone()), ok).await;
+                                    app.sync_log_snapshot().await;
+                                    app.set_toast(if ok { format!("Test → {} :{}", target_label, port) } else { detail.clone() });
+                                } else if let Some(entry) = selected {
+                                    // No channel — inject text directly into the pane.
+                                    let text = "flan test message from TUI".to_string();
+                                    let t = text.clone();
+                                    let label = target_label.clone();
+                                    let ok = match entry {
+                                        ClaudeEntry::Trm(p) => {
+                                            let idx = p.index;
+                                            tokio::task::spawn_blocking(move || trm_send_to_pane(idx, &t))
+                                                .await.unwrap_or(false)
+                                        }
+                                        ClaudeEntry::Cmux(s) => {
+                                            let sid = s.id.clone();
+                                            tokio::task::spawn_blocking(move || cmux_send_text(&sid, &t) && cmux_send_text(&sid, "\n"))
+                                                .await.unwrap_or(false)
+                                        }
+                                    };
+                                    app.log("out", format!("Test text → {}", label), Some(text), ok).await;
+                                    app.sync_log_snapshot().await;
+                                    app.set_toast(if ok { format!("Test → {} (text)", target_label) } else { "Test failed".to_string() });
+                                } else {
+                                    app.set_toast("No agent selected");
+                                }
                             }
 
                             KeyCode::Char('x') => {
@@ -1422,32 +1447,75 @@ async fn main() -> io::Result<()> {
                                         let vm_uri = vm_uri.or_else(|| {
                                             tokio::task::block_in_place(|| probe_vm_service_uri(pid))
                                         });
-                                        let Some(uri) = vm_uri else {
+                                        let Some(uri) = vm_uri.clone() else {
                                             app.set_toast("Flush failed: VM service URI not yet resolved");
                                             continue;
                                         };
-                                        let text = format!("flan connect to {} and process queue once connected", uri);
+
                                         let sid = assoc.claude_surface_id.clone();
-                                        let t = text.clone();
                                         let label = sid[..8.min(sid.len())].to_string();
-                                        let ok = tokio::task::spawn_blocking(move || {
-                                            if sid.starts_with("trm:") {
-                                                if let Ok(idx) = sid["trm:".len()..].parse::<usize>() {
-                                                    trm_send_to_pane(idx, &t)
+
+                                        // Check if the target pane has a channel port (Claude w/ flan-channel).
+                                        let channel_port = if sid.starts_with("trm:") {
+                                            sid["trm:".len()..].parse::<usize>().ok()
+                                                .and_then(|idx| app.trm_panes.iter().find(|p| p.index == idx))
+                                                .and_then(|p| p.channel_port)
+                                        } else {
+                                            None
+                                        };
+
+                                        if let Some(port) = channel_port {
+                                            // Channel push — the flan-channel MCP server will
+                                            // deliver the message directly into the Claude session.
+                                            let payload = serde_json::json!({
+                                                "vm_service_uri": uri,
+                                                "messages": [{
+                                                    "type": "flush",
+                                                    "text": format!("flan connect to {} and process queue once connected", uri),
+                                                }]
+                                            });
+                                            let body_str = payload.to_string();
+                                            let req = format!(
+                                                "POST /flush HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                                port, body_str.len(), body_str
+                                            );
+                                            let (ok, detail) = match tokio::net::TcpStream::connect(
+                                                format!("127.0.0.1:{}", port)
+                                            ).await {
+                                                Ok(mut stream) => {
+                                                    match tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes()).await {
+                                                        Ok(_) => (true, "channel push ok".into()),
+                                                        Err(e) => (false, format!("write err: {}", e)),
+                                                    }
+                                                }
+                                                Err(e) => (false, format!("connect err: {}", e)),
+                                            };
+                                            app.log("out", format!("Flush channel → {} :{}", label, port), Some(detail.clone()), ok).await;
+                                            app.sync_log_snapshot().await;
+                                            app.set_toast(if ok { "Flushed (channel)" } else { &detail });
+                                        } else {
+                                            // No channel — inject text directly into the pane.
+                                            let text = format!("flan connect to {} and process queue once connected", uri);
+                                            let t = text.clone();
+                                            let ok = tokio::task::spawn_blocking(move || {
+                                                if sid.starts_with("trm:") {
+                                                    if let Ok(idx) = sid["trm:".len()..].parse::<usize>() {
+                                                        trm_send_to_pane(idx, &t)
+                                                    } else {
+                                                        false
+                                                    }
+                                                } else if cmux_send_text(&sid, &t) {
+                                                    cmux_send_text(&sid, "\n")
                                                 } else {
                                                     false
                                                 }
-                                            } else if cmux_send_text(&sid, &t) {
-                                                cmux_send_text(&sid, "\n")
-                                            } else {
-                                                false
-                                            }
-                                        })
-                                        .await
-                                        .unwrap_or(false);
-                                        app.log("out", format!("Flush → {}…", label), Some(text), ok).await;
-                                        app.sync_log_snapshot().await;
-                                        app.set_toast(if ok { "Flushed" } else { "Flush failed" });
+                                            })
+                                            .await
+                                            .unwrap_or(false);
+                                            app.log("out", format!("Flush text → {}…", label), Some(text), ok).await;
+                                            app.sync_log_snapshot().await;
+                                            app.set_toast(if ok { "Flushed (text)" } else { "Flush failed" });
+                                        }
                                     } else {
                                         app.set_toast("No association for this Flutter app");
                                     }

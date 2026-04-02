@@ -73,6 +73,51 @@ use tokio::sync::RwLock;
 
 pub mod desktop_bridge;
 
+// ── Coding Agent Detection ─────────────────────────────────────────────
+
+/// Process name substrings that identify coding agent processes in `ps` output.
+/// Checked against the `comm` field (case-sensitive).
+const AGENT_PROCESS_NAMES: &[&str] = &["claude", "forge", "opencode", "codex", "gemini"];
+
+/// Substrings that appear in terminal/pane titles when a coding agent is running.
+/// Checked case-sensitively against the title.
+const AGENT_TITLE_MARKERS: &[&str] = &["Claude", "Forge", "OpenCode", "Codex", "Gemini"];
+
+/// Returns true if the process `comm` string looks like a coding agent.
+pub fn is_agent_process(comm: &str) -> bool {
+    AGENT_PROCESS_NAMES.iter().any(|name| comm.contains(name))
+        && !comm.contains("flan")
+}
+
+/// Returns true if a terminal title contains a coding agent marker.
+/// Matching is case-insensitive.
+pub fn title_has_agent(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    AGENT_PROCESS_NAMES.iter().any(|name| lower.contains(name))
+}
+
+/// Returns the display name of the agent detected in a title, or None.
+/// Matching is case-insensitive; returns the canonical display name.
+pub fn agent_name_from_title(title: &str) -> Option<&'static str> {
+    let lower = title.to_lowercase();
+    for (i, name) in AGENT_PROCESS_NAMES.iter().enumerate() {
+        if lower.contains(name) {
+            return Some(AGENT_TITLE_MARKERS[i]);
+        }
+    }
+    None
+}
+
+/// Returns the display name of the agent detected from a process comm, or None.
+pub fn agent_name_from_comm(comm: &str) -> Option<&'static str> {
+    for (i, name) in AGENT_PROCESS_NAMES.iter().enumerate() {
+        if comm.contains(name) && !comm.contains("flan") {
+            return Some(AGENT_TITLE_MARKERS[i]);
+        }
+    }
+    None
+}
+
 // ── Models ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,7 +486,7 @@ mod server {
 
             let cc_surfaces: Vec<&CmuxSurface> = surfaces
                 .iter()
-                .filter(|s| s.title.contains("Claude"))
+                .filter(|s| title_has_agent(&s.title))
                 .collect();
 
             cc_surfaces
@@ -835,7 +880,7 @@ pub fn discover_claude_processes() -> Vec<ClaudeProcess> {
         let tty = parts[1].trim();
         let comm = parts[2].trim();
 
-        if !comm.contains("claude") || comm.contains("flan") || tty == "??" {
+        if !is_agent_process(comm) || tty == "??" {
             continue;
         }
 
@@ -1288,7 +1333,7 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
     let home = std::env::var("HOME").unwrap_or_default();
     let claude_cwds: std::collections::HashSet<String> = all_procs
         .iter()
-        .filter(|(_, _, comm)| comm.contains("claude") && !comm.contains("flan"))
+        .filter(|(_, _, comm)| is_agent_process(comm))
         .filter_map(|(pid, _, _)| {
             let cwd = get_process_cwd(*pid);
             if cwd.is_empty() { None } else { Some(cwd) }
@@ -1347,7 +1392,7 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         let clean = title.trim_start_matches(|c: char| {
             !c.is_alphanumeric() && c != '~' && c != '/'
         }).trim();
-        let has_claude = title.contains("Claude")
+        let has_claude = title_has_agent(&title)
             || (starts_with_spinner && !clean.starts_with('~') && !clean.starts_with('/'));
         let own_cwd = expand_title_path(&title);
         Some(RawPane { surface_id, pane_id, window_id, title, has_claude, own_cwd })
@@ -1424,9 +1469,9 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             let login_infos: Vec<LoginInfo> = shell_pids.iter()
                 .filter_map(|(lp, sp)| {
                     let cwd = shell_cwds_map.get(sp)?.clone();
-                    // Check if this shell has a claude descendant.
+                    // Check if this shell has a coding agent descendant.
                     let has_claude = all_procs.iter().any(|(_, pp, c)| {
-                        *pp == *sp && c.contains("claude") && !c.contains("flan")
+                        *pp == *sp && is_agent_process(c)
                     });
                     Some(LoginInfo { login_pid: *lp, shell_cwd: cwd, has_claude_child: has_claude })
                 })
@@ -1930,7 +1975,7 @@ pub fn cmux_surface_list() -> Vec<CmuxSurface> {
     let home = std::env::var("HOME").unwrap_or_default();
 
     for i in 0..result.len() {
-        if !result[i].title.contains("Claude") {
+        if !title_has_agent(&result[i].title) {
             continue;
         }
         let pane = result[i].pane_id.clone();
