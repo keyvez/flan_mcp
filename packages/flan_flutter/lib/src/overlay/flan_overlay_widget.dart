@@ -1187,6 +1187,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     // web where dart:developer is unavailable), then forward messages + URI
     // to the channel server.
     unawaited(() async {
+      int channelPort = 4051; // default
       // If we don't have the URI yet, ask the TUI.
       if (wsUri == null) {
         try {
@@ -1198,24 +1199,27 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           if (tuiRes.statusCode == 200) {
             final tuiData = jsonDecode(tuiRes.body) as Map<String, dynamic>;
             wsUri = tuiData['vm_service_uri'] as String?;
+            channelPort = (tuiData['channel_port'] as int?) ?? channelPort;
           }
         } catch (_) {}
       } else {
-        // Still notify TUI for association tracking.
-        unawaited(() async {
-          try {
-            await http.post(
-              Uri.parse('http://127.0.0.1:4050/api/flush'),
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode(<String, dynamic>{
-                'vm_service_uri': wsUri,
-              }),
-            );
-          } catch (_) {}
-        }());
+        // Still notify TUI for association tracking and get channel port.
+        try {
+          final tuiRes = await http.post(
+            Uri.parse('http://127.0.0.1:4050/api/flush'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(<String, dynamic>{
+              'vm_service_uri': wsUri,
+            }),
+          );
+          if (tuiRes.statusCode == 200) {
+            final tuiData = jsonDecode(tuiRes.body) as Map<String, dynamic>;
+            channelPort = (tuiData['channel_port'] as int?) ?? channelPort;
+          }
+        } catch (_) {}
       }
 
-      debugPrint('[flan] resolved vm_service_uri=$wsUri');
+      debugPrint('[flan] resolved vm_service_uri=$wsUri channelPort=$channelPort');
 
       try {
         final channelBody = jsonEncode(<String, dynamic>{
@@ -1223,7 +1227,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           'messages': msgs,
         });
         final res = await http.post(
-          Uri.parse('http://127.0.0.1:4051/flush'),
+          Uri.parse('http://127.0.0.1:$channelPort/flush'),
           headers: {'Content-Type': 'application/json'},
           body: channelBody,
         );
@@ -1419,19 +1423,29 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           // The actual app content, wrapped in a RepaintBoundary so we can
           // capture it without annotation/overlay layers.
           RepaintBoundary(key: _appContentKey, child: widget.child),
-          // Annotations are only rendered while annotation mode is active.
-          // Submitting an annotation immediately sends it to the agent.
-          // Inspector overlay (when active)
-          if (widget.inspectorService.enabled)
-            _InspectorOverlay(
+          // Inspector overlay — always in tree to preserve stable widget
+          // indices and avoid disrupting the Navigator's restoration scope.
+          Visibility(
+            visible: widget.inspectorService.enabled,
+            maintainState: true,
+            maintainAnimation: true,
+            maintainSize: false,
+            maintainInteractivity: false,
+            child: _InspectorOverlay(
               service: widget.inspectorService,
               userMessageService: widget.userMessageService,
               screenshotService: widget.screenshotService,
               onMessageSent: () => unawaited(_flushToServer()),
             ),
-          // Annotation overlay (when active)
-          if (widget.annotationService.enabled)
-            _AnnotationOverlay(
+          ),
+          // Annotation overlay — always in tree for the same reason.
+          Visibility(
+            visible: widget.annotationService.enabled,
+            maintainState: true,
+            maintainAnimation: true,
+            maintainSize: false,
+            maintainInteractivity: false,
+            child: _AnnotationOverlay(
               service: widget.annotationService,
               userMessageService: widget.userMessageService,
               onAnnotationSubmitted: () {
@@ -1445,6 +1459,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 unawaited(_flushToServer());
               },
             ),
+          ),
+          // Annotation status badge
           if (widget.annotationService.enabled)
             Positioned(
               top: badgeTop,
