@@ -849,7 +849,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       'data': data,
     });
 
-    unawaited(_flushToServer());
+    unawaited(_flushToServer(clearOnChannelDelivery: true));
     setState(() {
       _lastGeneratedTest = null;
       _lastRecordedStepLabels = const [];
@@ -870,20 +870,32 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     });
   }
 
-  void _onTextMessageSubmitted(String text, String? drawingBase64) {
+  /// Enqueues the text message (Enter). Does NOT flush to the agent.
+  void _onTextMessageQueued(String text, String? drawingBase64) {
     if (text.trim().isEmpty && drawingBase64 == null) {
-      // Nothing to send — just dismiss
       setState(() => _showTextMessageOverlay = false);
       return;
     }
+    _enqueueTextMessage(text, drawingBase64);
+    setState(() => _showTextMessageOverlay = false);
+  }
+
+  /// Enqueues and immediately sends the text message (Cmd+Enter).
+  void _onTextMessageSubmittedAndSent(String text, String? drawingBase64) {
+    if (text.trim().isEmpty && drawingBase64 == null) {
+      setState(() => _showTextMessageOverlay = false);
+      return;
+    }
+    _enqueueTextMessage(text, drawingBase64);
+    unawaited(_flushToServer(clearOnChannelDelivery: true));
+  }
+
+  void _enqueueTextMessage(String text, String? drawingBase64) {
     final displayText = text.trim().isEmpty ? '(drawing attached)' : text;
     final shouldShowWaiting = widget.userMessageService.isAgentListening;
     if (shouldShowWaiting) {
-      // Mark waiting BEFORE sending so the listener doesn't dismiss
-      // when sendMessage triggers notifyListeners.
       widget.userMessageService.markWaiting(displayText);
     } else {
-      // If no active listener is present, queue immediately in offline mode.
       widget.userMessageService.clearWaiting();
     }
     final data = <String, dynamic>{'userMessage': text};
@@ -899,7 +911,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       'text': 'User message: $displayText',
       'data': data,
     });
-    unawaited(_flushToServer());
   }
 
   /// Packages up the current inspector selection and/or annotations
@@ -1038,7 +1049,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// to the agent via flan server flush.
   Future<void> _sendToAgentAndFlush() async {
     await _sendToAgent();
-    unawaited(_flushToServer());
+    unawaited(_flushToServer(clearOnChannelDelivery: true));
   }
 
   void _sendErrorToAgent(InterceptedError error) {
@@ -1179,6 +1190,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
   Future<void> _flushToServer({
     List<Map<String, dynamic>>? messages,
+    bool clearOnChannelDelivery = false,
   }) async {
     String? wsUri;
     try {
@@ -1260,9 +1272,12 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       }
 
       if (channelOk) {
-        // Channel is active — suppress all VM service events so the
-        // flan MCP server doesn't trigger redundant process_queue calls.
         widget.userMessageService.suppressVmEvents = true;
+        if (clearOnChannelDelivery) {
+          // Channel delivered the messages — clear them from the app queue
+          // since process_queue won't run to consume them.
+          widget.userMessageService.clearMessages();
+        }
       } else {
         widget.userMessageService.notifyPending();
       }
@@ -1475,7 +1490,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 service: widget.inspectorService,
                 userMessageService: widget.userMessageService,
                 screenshotService: widget.screenshotService,
-                onMessageSent: () => unawaited(_flushToServer()),
+                onMessageSent: () => unawaited(_flushToServer(clearOnChannelDelivery: true)),
               ),
             ),
           ),
@@ -1497,7 +1512,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   _sendToAgentAndFlush();
                 },
                 onFlushRequested: () {
-                  unawaited(_flushToServer());
+                  unawaited(_flushToServer(clearOnChannelDelivery: true));
                 },
               ),
             ),
@@ -1670,7 +1685,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
             _TextMessageOverlay(
               visible: _showTextMessageOverlay,
               onDismiss: () => setState(() => _showTextMessageOverlay = false),
-              onSubmitted: _onTextMessageSubmitted,
+              onSubmitted: _onTextMessageQueued,
+              onSubmittedAndSent: _onTextMessageSubmittedAndSent,
               userMessageService: widget.userMessageService,
             ),
           Positioned(
@@ -1778,7 +1794,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   if (widget.annotationService.enabled) {
                     widget.annotationService.disable();
                   }
-                  unawaited(_flushToServer());
+                  unawaited(_flushToServer(clearOnChannelDelivery: true));
                   setState(() {
                     _showQueuedMessagesPanel = false;
                     _queuedMessagesSnapshot = const [];
@@ -2522,12 +2538,16 @@ class _TextMessageOverlay extends StatefulWidget {
     required this.visible,
     required this.onDismiss,
     required this.onSubmitted,
+    this.onSubmittedAndSent,
     required this.userMessageService,
   });
 
   final bool visible;
   final VoidCallback onDismiss;
+  /// Called on Enter — queues the message.
   final void Function(String text, String? drawingBase64) onSubmitted;
+  /// Called on Cmd+Enter — queues and immediately sends.
+  final void Function(String text, String? drawingBase64)? onSubmittedAndSent;
   final UserMessageService userMessageService;
 
   @override
@@ -2587,7 +2607,7 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
     if (mounted) setState(() {});
   }
 
-  Future<void> _handleSubmit() async {
+  Future<void> _handleSubmit({bool andSend = false}) async {
     final text = _controller.text;
     String? drawingBase64;
     if (_drawingService.hasContent) {
@@ -2602,7 +2622,11 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
     _controller.clear();
     _drawingService.clear();
     _drawingService.setTool(DrawingTool.none);
-    widget.onSubmitted(text, drawingBase64);
+    if (andSend && widget.onSubmittedAndSent != null) {
+      widget.onSubmittedAndSent!(text, drawingBase64);
+    } else {
+      widget.onSubmitted(text, drawingBase64);
+    }
   }
 
   @override
@@ -2947,6 +2971,7 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
               inputFormatters: [
                 _SubmitOnEnterFormatter(
                   onSubmit: _handleSubmit,
+                  onCmdSubmit: () => _handleSubmit(andSend: true),
                 ),
               ],
             ),
@@ -2960,7 +2985,7 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
             children: [
               Expanded(
                 child: Text(
-                  'Enter to send  \u2022  Shift+Enter for new line',
+                  'Enter to queue  \u2022  \u2318Enter to send  \u2022  Shift+Enter for new line',
                   style: TextStyle(
                     color: const Color(0xFFE0E0E0).withValues(alpha: 0.5),
                     fontSize: 11,
@@ -3730,46 +3755,29 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
   }
 
   Widget _buildInlineTextField() {
-    return Localizations(
-      locale: const Locale('en'),
-      delegates: const [
-        DefaultMaterialLocalizations.delegate,
-        DefaultWidgetsLocalizations.delegate,
-      ],
-      child: Material(
-        color: Colors.transparent,
-        child: SizedBox(
-          height: 28,
-          child: TextField(
-            controller: _editController,
-            focusNode: _editFocusNode,
-            style: const TextStyle(
-              color: Color(0xFFE0E0E0),
-              fontSize: 14,
-              height: 1.4,
-            ),
-            decoration: const InputDecoration(
-              isDense: true,
-              contentPadding: EdgeInsets.symmetric(
-                horizontal: 4,
-                vertical: 4,
-              ),
-              border: OutlineInputBorder(
-                borderSide: BorderSide(color: Color(0xFF00AAFF)),
-              ),
-              enabledBorder: OutlineInputBorder(
-                borderSide: BorderSide(color: Color(0xFF00AAFF)),
-              ),
-              focusedBorder: OutlineInputBorder(
-                borderSide: BorderSide(
-                  color: Color(0xFF00AAFF),
-                  width: 1.5,
-                ),
-              ),
-            ),
-            onSubmitted: (_) => _commitEdit(),
-          ),
+    return Container(
+      constraints: const BoxConstraints(minHeight: 28, maxHeight: 120),
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+      decoration: BoxDecoration(
+        border: Border.all(color: const Color(0xFF00AAFF), width: 1.5),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: EditableText(
+        controller: _editController,
+        focusNode: _editFocusNode,
+        maxLines: null,
+        style: const TextStyle(
+          color: Color(0xFFE0E0E0),
+          fontSize: 14,
+          height: 1.4,
         ),
+        cursorColor: const Color(0xFF00AAFF),
+        backgroundCursorColor: const Color(0xFF333333),
+        selectionColor: const Color(0x4400AAFF),
+        keyboardType: TextInputType.multiline,
+        inputFormatters: [
+          _SubmitOnEnterFormatter(onSubmit: _commitEdit),
+        ],
       ),
     );
   }
@@ -4182,9 +4190,11 @@ class _CropPainter extends CustomPainter {
 /// A [TextInputFormatter] that intercepts bare Enter (without Shift) to
 /// trigger submission, while allowing Shift+Enter to insert a newline.
 class _SubmitOnEnterFormatter extends TextInputFormatter {
-  _SubmitOnEnterFormatter({required this.onSubmit});
+  _SubmitOnEnterFormatter({required this.onSubmit, this.onCmdSubmit});
 
   final VoidCallback onSubmit;
+  /// Called on Cmd/Ctrl+Enter. If null, falls through to [onSubmit].
+  final VoidCallback? onCmdSubmit;
 
   @override
   TextEditingValue formatEditUpdate(
@@ -4196,7 +4206,10 @@ class _SubmitOnEnterFormatter extends TextInputFormatter {
         newValue.text.contains('\n') &&
         !HardwareKeyboard.instance.isShiftPressed) {
       // Strip the newline and schedule submission.
-      WidgetsBinding.instance.addPostFrameCallback((_) => onSubmit());
+      final isCmdHeld = HardwareKeyboard.instance.isMetaPressed ||
+          HardwareKeyboard.instance.isControlPressed;
+      final callback = (isCmdHeld && onCmdSubmit != null) ? onCmdSubmit! : onSubmit;
+      WidgetsBinding.instance.addPostFrameCallback((_) => callback());
       return oldValue;
     }
     return newValue;
