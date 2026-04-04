@@ -106,6 +106,7 @@ class FlanChannel {
 
   final _logger = logging.Logger('FlanChannel');
   HttpServer? _httpServer;
+  Timer? _registrationTimer;
 
   /// Images (screenshots, drawings) buffered from the last flush, available
   /// for retrieval via the `get_flushed_images` tool.
@@ -124,6 +125,11 @@ class FlanChannel {
         _logger.info('Listening for flush events on http://127.0.0.1:$port');
         unawaited(_serveRequests());
         unawaited(_registerWithTui());
+        // Re-register periodically so the TUI picks us up after restarts.
+        _registrationTimer = Timer.periodic(
+          const Duration(seconds: 30),
+          (_) => unawaited(_registerWithTui()),
+        );
         return;
       } on SocketException catch (e) {
         if (attempt == _maxPortAttempts - 1) rethrow;
@@ -196,6 +202,7 @@ class FlanChannel {
   }
 
   Future<void> close() async {
+    _registrationTimer?.cancel();
     await _httpServer?.close(force: true);
   }
 
