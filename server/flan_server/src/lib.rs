@@ -152,8 +152,12 @@ pub struct CmuxSurface {
 /// A pane in the trm terminal emulator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrmPane {
-    /// Zero-based pane index (used to send input via trm socket).
+    /// Zero-based position in the surface.list array (used for "trm:N" surface keys).
     pub index: usize,
+    /// The actual pane_id from trm's surface.list (used to send input via the trm socket).
+    /// This may differ from `index` when pane IDs are non-contiguous (e.g. after pane deletion).
+    #[serde(default)]
+    pub pane_id: usize,
     /// Folder name of the cwd (e.g. "charge/web"), or None if empty/unknown.
     pub folder_name: Option<String>,
     /// Full cwd path, if known.
@@ -173,6 +177,14 @@ pub struct TrmPane {
     /// Channel port for the flan-channel MCP server running in this pane, if registered.
     #[serde(default)]
     pub channel_port: Option<u16>,
+    /// The trm login PID that owns this pane (trm → login → shell → ...).
+    /// Used to match registered flan-channel processes to panes reliably.
+    #[serde(default)]
+    pub login_pid: Option<u32>,
+    /// True if the Claude process in this pane was started with
+    /// --dangerously-load-development-channels, meaning channel notifications work.
+    #[serde(default)]
+    pub has_dev_channels: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +228,10 @@ pub struct SharedState {
     /// Used when surface_id resolution isn't possible; the TUI matches
     /// registered shell cwds against claude process cwds at display time.
     pub channel_ports_by_cwd: RwLock<HashMap<String, u16>>,
+    /// Registered flan-channel ports by login PID (most reliable match key).
+    /// login_pid is the trm-direct-child login that is an ancestor of the
+    /// flan-channel process.
+    pub channel_ports_by_login: RwLock<HashMap<u32, u16>>,
 }
 
 impl SharedState {
@@ -231,6 +247,7 @@ impl SharedState {
             activity_log: RwLock::new(VecDeque::new()),
             channel_ports: RwLock::new(HashMap::new()),
             channel_ports_by_cwd: RwLock::new(HashMap::new()),
+            channel_ports_by_login: RwLock::new(HashMap::new()),
         }
     }
 
@@ -636,6 +653,61 @@ mod server {
         }
     }
 
+    async fn get_trm_debug(
+        State(state): State<Arc<SharedState>>,
+    ) -> impl IntoResponse {
+        let panes = tokio::task::spawn_blocking(discover_trm_panes)
+            .await
+            .unwrap_or_default();
+        let login_ports = state.channel_ports_by_login.read().await.clone();
+        let cwd_ports = state.channel_ports_by_cwd.read().await.clone();
+        let surface_ports = state.channel_ports.read().await.clone();
+
+        let pane_info: Vec<serde_json::Value> = panes.iter().map(|p| {
+            // Compute what channel_port apply_discovery would assign.
+            let assigned_port = p.login_pid
+                .and_then(|lp| login_ports.get(&lp).copied())
+                .or_else(|| {
+                    let key = format!("trm:{}", p.index);
+                    surface_ports.get(&key).copied()
+                })
+                .or_else(|| {
+                    p.cwd.as_ref().and_then(|pane_cwd| {
+                        let pane_clean = pane_cwd.trim_end_matches('/');
+                        cwd_ports.iter().find_map(|(reg_cwd, &port)| {
+                            let reg_clean = reg_cwd.trim_end_matches('/');
+                            if reg_clean == pane_clean
+                                || reg_clean.starts_with(&format!("{}/", pane_clean))
+                                || pane_clean.starts_with(&format!("{}/", reg_clean))
+                            {
+                                Some(port)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                });
+
+            serde_json::json!({
+                "index": p.index,
+                "pane_id": p.pane_id,
+                "title": p.title,
+                "cwd": p.cwd,
+                "folder_name": p.folder_name,
+                "has_claude": p.has_claude,
+                "login_pid": p.login_pid,
+                "channel_port_assigned": assigned_port,
+            })
+        }).collect();
+
+        (StatusCode::OK, Json(serde_json::json!({
+            "panes": pane_info,
+            "channel_ports_by_login": login_ports.iter().map(|(k, v)| (k.to_string(), v)).collect::<std::collections::HashMap<_,_>>(),
+            "channel_ports_by_cwd": cwd_ports,
+            "channel_ports_by_surface": surface_ports,
+        })))
+    }
+
     async fn handle_register_channel(
         State(state): State<Arc<SharedState>>,
         Json(body): Json<RegisterChannelRequest>,
@@ -661,11 +733,10 @@ mod server {
             state.channel_ports.write().await.insert(sid.clone(), port);
         }
 
-        // Also register by shell cwd (ground truth) — the TUI matches this
-        // against claude process cwds at display time.
+        // Also register by login PID and shell cwd — used for matching when
+        // surface_id resolution fails (e.g. pane title has no path).
         if let Some(channel_pid) = body.pid {
-            let shell_cwd = tokio::task::spawn_blocking(move || {
-                // Find the login ancestor, then get its shell's cwd.
+            let (login_pid, shell_cwd) = tokio::task::spawn_blocking(move || {
                 let login = find_login_pid(channel_pid)?;
                 let ps_out = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output().ok()?;
                 let ps_str = String::from_utf8_lossy(&ps_out.stdout);
@@ -681,9 +752,13 @@ mod server {
                     }
                 })?;
                 let cwd = get_process_cwd(shell_pid);
-                if cwd.is_empty() { None } else { Some(cwd) }
-            }).await.ok().flatten();
+                Some((login, if cwd.is_empty() { None } else { Some(cwd) }))
+            }).await.ok().flatten().unwrap_or((0, None));
 
+            if login_pid != 0 {
+                tracing::info!("Channel registered by login: {} → port {}", login_pid, port);
+                state.channel_ports_by_login.write().await.insert(login_pid, port);
+            }
             if let Some(cwd) = shell_cwd {
                 tracing::info!("Channel registered by cwd: {} → port {}", cwd, port);
                 state.channel_ports_by_cwd.write().await.insert(cwd, port);
@@ -806,6 +881,7 @@ mod server {
             .route("/api/rescan", post(handle_rescan))
             .route("/api/status", get(get_status))
             .route("/api/logs", get(get_activity_log))
+            .route("/api/trm-debug", get(get_trm_debug))
             .layer(cors)
             .layer(TraceLayer::new_for_http())
             .with_state(state)
@@ -1428,6 +1504,8 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
     // surfaces get the remaining Claude-bearing logins' cwds.
     let mut login_resolved_cwds: Vec<Option<String>> = vec![None; raw.len()];
     let mut login_resolved_agents: Vec<Option<&str>> = vec![None; raw.len()];
+    let mut login_resolved_pids: Vec<Option<u32>> = vec![None; raw.len()];
+    let mut login_resolved_dev_channels: Vec<bool> = vec![false; raw.len()];
     {
         // Find the trm process PID.
         let trm_pid = all_procs.iter()
@@ -1440,6 +1518,78 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                 .filter(|(_, pp, c)| *pp == trm_pid && c.contains("login"))
                 .map(|(p, _, _)| *p)
                 .collect();
+
+            // Resolve login → shell cwd by tty: each login has a specific tty,
+            // and all processes in the same pane share that tty.  We use this
+            // to match logins to pane_ids reliably.
+            // Step: get tty for every login process.
+            let login_ttys: HashMap<u32, String> = {
+                let pid_args = logins.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+                let mut m = HashMap::new();
+                if !pid_args.is_empty() {
+                    let mut cmd_args = vec!["-p".to_string(), pid_args.join(","), "-o".to_string(), "pid=,tty=".to_string()];
+                    if let Ok(out) = Command::new("ps").args(&cmd_args).output() {
+                        for line in String::from_utf8_lossy(&out.stdout).lines() {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if parts.len() >= 2 {
+                                if let Ok(pid) = parts[0].parse::<u32>() {
+                                    m.insert(pid, parts[1].to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                m
+            };
+
+            // Build a tty → pane_id map by getting the tty for each Claude/agent process
+            // and matching it against the raw pane's surface_id.
+            // Since Claude processes share a tty with their login, we can map:
+            // login_tty → pane_id by finding which Claude process has this tty
+            // and which raw pane contains this cwd via agent_cwd_map.
+            // Simpler: use tty of logins to match login → raw pane by checking
+            // all processes on the same tty. Each raw pane has a pane_id.
+            // We get pane_id→tty from: the login that spawned it is the trm child
+            // whose tty matches pane_id (if tty suffix == pane_id), OR we match
+            // via the shell CWD that we already know.
+            //
+            // Key insight: we already know login→shell_cwd. We can match
+            // login → raw pane by finding the raw pane whose cwd matches the
+            // login's shell_cwd. For panes with own_cwd this is done above. For
+            // panes without own_cwd (spinner titles), we use tty matching.
+            //
+            // Build login_pid → pane_id by checking: for each login, which raw
+            // pane has a process (via all_procs) on the same tty?
+            let login_pane_ids: HashMap<u32, usize> = {
+                // Get tty for ALL processes to find which pane each process is in.
+                // We look for Claude/agent processes whose tty matches a login's tty,
+                // then map to the raw pane whose pane_id we know from surface.list.
+                //
+                // Actually: we know each login's tty. We know each raw pane's pane_id.
+                // We need: login_tty → pane_id.
+                //
+                // Approach: look up tty for each shell (child of login). Then check
+                // which raw pane corresponds to that shell's cwd (already in shell_cwds_map).
+                // For panes with own_cwd that already matched, we skip.
+                // For remaining, we check if any raw pane has processes on the same tty.
+                //
+                // Fallback: match by inspecting which Claude process is on each tty,
+                // then map that Claude process's cwd to the matching raw pane.
+                let mut m: HashMap<u32, usize> = HashMap::new();
+                // For each login: get its tty, find a Claude/agent child on that tty,
+                // then find the raw pane by pane_id (if tty suffix matches).
+                for (&login_pid, tty) in &login_ttys {
+                    // tty is like "ttys003" — extract numeric suffix.
+                    let suffix_str = tty.trim_start_matches(|c: char| !c.is_numeric());
+                    if let Ok(n) = suffix_str.parse::<usize>() {
+                        // Find a raw pane whose pane_id matches this number.
+                        if let Some(raw_idx) = raw.iter().position(|rp| rp.pane_id == n) {
+                            m.insert(login_pid, raw_idx);
+                        }
+                    }
+                }
+                m
+            };
 
             // For each login, find its shell child and get the cwd.
             // Also check if the shell has a claude descendant.
@@ -1485,6 +1635,10 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                 has_claude_child: bool,
                 /// Display name of the agent child (e.g. "Claude", "Forge"), if any.
                 agent_child_name: Option<&'static str>,
+                /// True if the Claude child was started with --dangerously-load-development-channels.
+                has_dev_channels: bool,
+                /// raw array index derived from the login's tty (reliable login↔pane mapping).
+                tty_raw_idx: Option<usize>,
             }
 
             let login_infos: Vec<LoginInfo> = shell_pids.iter()
@@ -1494,11 +1648,25 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                     let agent_child = all_procs.iter()
                         .find(|(_, pp, c)| *pp == *sp && is_agent_process(c))
                         .and_then(|(_, _, c)| agent_name_from_comm(c));
+                    // Check if the Claude child was launched with --dangerously-load-development-channels.
+                    let has_dev_channels = all_procs.iter()
+                        .find(|(_, pp, c)| *pp == *sp && c.ends_with("claude"))
+                        .map(|(claude_pid, _, _)| {
+                            Command::new("ps")
+                                .args(["-p", &claude_pid.to_string(), "-o", "args="])
+                                .output()
+                                .map(|o| String::from_utf8_lossy(&o.stdout)
+                                    .contains("dangerously-load-development-channels"))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
                     Some(LoginInfo {
                         login_pid: *lp,
                         shell_cwd: cwd,
                         has_claude_child: agent_child.is_some(),
                         agent_child_name: agent_child,
+                        has_dev_channels,
+                        tty_raw_idx: login_pane_ids.get(lp).copied(),
                     })
                 })
                 .collect();
@@ -1524,6 +1692,8 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                     if let Some((li_idx, li)) = matched {
                         claimed_logins.insert(li.login_pid);
                         surface_to_login.insert(raw_idx, li_idx);
+                        login_resolved_pids[raw_idx] = Some(li.login_pid);
+                        login_resolved_dev_channels[raw_idx] = li.has_dev_channels;
                         if let Some(name) = li.agent_child_name {
                             login_resolved_agents[raw_idx] = Some(name);
                         }
@@ -1531,7 +1701,9 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                 }
             }
 
-            // Assign unclaimed Claude-bearing logins to Claude panes without own_cwd.
+            // Assign unclaimed logins to Claude panes without own_cwd.
+            // Priority 1: match by tty-derived pane_id (most reliable).
+            // Priority 2: positional zip (best-effort fallback).
             let unclaimed_claude_logins: Vec<usize> = login_infos.iter().enumerate()
                 .filter(|(_, li)| li.has_claude_child && !claimed_logins.contains(&li.login_pid))
                 .map(|(i, _)| i)
@@ -1542,19 +1714,48 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                 .map(|(i, _)| i)
                 .collect();
 
-            // If we can match 1:1 by cwd against claude_cwds, do it.
-            // Otherwise, assign in order (best effort).
-            for (&raw_idx, li_idx) in unclaimed_claude_logins.iter()
-                .zip(unresolved_claude_panes.iter())
-            {
+            let mut tty_matched_raw_idxs: HashSet<usize> = HashSet::new();
+            for &li_info_idx in &unclaimed_claude_logins {
+                let li = &login_infos[li_info_idx];
+                if let Some(raw_idx) = li.tty_raw_idx {
+                    if unresolved_claude_panes.contains(&raw_idx) && !tty_matched_raw_idxs.contains(&raw_idx) {
+                        tty_matched_raw_idxs.insert(raw_idx);
+                        claimed_logins.insert(li.login_pid);
+                        login_resolved_cwds[raw_idx] = Some(li.shell_cwd.clone());
+                        login_resolved_pids[raw_idx] = Some(li.login_pid);
+                        login_resolved_dev_channels[raw_idx] = li.has_dev_channels;
+                        if let Some(name) = li.agent_child_name {
+                            login_resolved_agents[raw_idx] = Some(name);
+                        }
+                        tracing::debug!(
+                            "discover_trm_panes: tty-matched raw_idx={} via login {} → {} (agent: {:?})",
+                            raw_idx, li.login_pid, li.shell_cwd, li.agent_child_name
+                        );
+                    }
+                }
+            }
+
+            // Positional zip fallback for any remaining unmatched logins/panes.
+            let remaining_logins: Vec<usize> = login_infos.iter().enumerate()
+                .filter(|(_, li)| li.has_claude_child && !claimed_logins.contains(&li.login_pid))
+                .map(|(i, _)| i)
+                .collect();
+            let remaining_panes: Vec<usize> = unresolved_claude_panes.iter()
+                .filter(|&&raw_idx| !tty_matched_raw_idxs.contains(&raw_idx))
+                .copied()
+                .collect();
+
+            for (&raw_idx, li_idx) in remaining_logins.iter().zip(remaining_panes.iter()) {
                 // raw_idx is login info index, li_idx is pane index — swap naming
                 let li = &login_infos[raw_idx];
                 login_resolved_cwds[*li_idx] = Some(li.shell_cwd.clone());
+                login_resolved_pids[*li_idx] = Some(li.login_pid);
+                login_resolved_dev_channels[*li_idx] = li.has_dev_channels;
                 if let Some(name) = li.agent_child_name {
                     login_resolved_agents[*li_idx] = Some(name);
                 }
                 tracing::debug!(
-                    "discover_trm_panes: resolved cwd for pane {} via login {} → {} (agent: {:?})",
+                    "discover_trm_panes: positional-matched pane {} via login {} → {} (agent: {:?})",
                     *li_idx, li.login_pid, li.shell_cwd, li.agent_child_name
                 );
             }
@@ -1641,6 +1842,7 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
 
         panes.push(TrmPane {
             index: i,
+            pane_id,
             folder_name,
             cwd,
             has_claude,
@@ -1648,6 +1850,8 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             surface_id: Some(surface_id),
             title: if title.is_empty() { None } else { Some(title) },
             channel_port: None,
+            login_pid: login_resolved_pids[i],
+            has_dev_channels: login_resolved_dev_channels[i],
         });
     }
 
@@ -2118,10 +2322,10 @@ pub fn cmux_focus_surface(surface_id: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// Send `text` to a trm pane by zero-based index, then submit with Enter.
+/// Send `text` to a trm pane by its pane_id (from surface.list), then submit with Enter.
 /// Uses the trm Unix socket protocol: `{"type":"send","pane":N,"text":"..."}\n`.
 /// The server responds with `{"status":"queued"}` on success.
-pub fn trm_send_to_pane(index: usize, text: &str) -> bool {
+pub fn trm_send_to_pane(pane_id: usize, text: &str) -> bool {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
@@ -2133,7 +2337,7 @@ pub fn trm_send_to_pane(index: usize, text: &str) -> bool {
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
         // Append \r (carriage return) to submit the command in the terminal.
         let text_with_cr = format!("{}\r", text);
-        let msg = format!("{}\n", serde_json::json!({"type":"send","pane":index,"text":text_with_cr}));
+        let msg = format!("{}\n", serde_json::json!({"type":"send","pane":pane_id,"text":text_with_cr}));
         stream.write_all(msg.as_bytes()).ok()?;
         stream.flush().ok()?;
         let mut buf = String::new();

@@ -365,17 +365,27 @@ impl App {
         self.cmux_surfaces = surfaces;
         let mut trm = trm;
         // Attach registered channel ports to trm panes.
+        // Priority: 1) login PID (most reliable), 2) surface_id key, 3) cwd prefix match.
         {
             let ports = self.shared.channel_ports.read().await;
+            let login_ports = self.shared.channel_ports_by_login.read().await;
             let cwd_ports = self.shared.channel_ports_by_cwd.read().await;
             let mut used_cwds: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             for pane in &mut trm {
-                // Try direct surface_id match first.
+                // 1. Login PID match — most reliable, survives title changes.
+                if let Some(login_pid) = pane.login_pid {
+                    if let Some(&port) = login_ports.get(&login_pid) {
+                        pane.channel_port = Some(port);
+                        continue;
+                    }
+                }
+
+                // 2. Direct surface_id key match.
                 let key = format!("trm:{}", pane.index);
                 pane.channel_port = ports.get(&key).copied();
 
-                // Try matching by cwd (ground truth shell cwd from registration).
+                // 3. Cwd prefix match (fallback for panes whose login wasn't resolved).
                 if pane.channel_port.is_none() && pane.has_claude && !cwd_ports.is_empty() {
                     if let Some(ref pane_cwd) = pane.cwd {
                         let pane_clean = pane_cwd.trim_end_matches('/');
@@ -390,23 +400,6 @@ impl App {
                                 used_cwds.insert(reg_cwd.clone());
                                 break;
                             }
-                        }
-                    }
-                }
-            }
-
-            // Last resort: unmatched registrations assigned to Claude panes
-            // with no cwd and no channel_port yet.
-            if !cwd_ports.is_empty() {
-                let unmatched_ports: Vec<u16> = cwd_ports.iter()
-                    .filter(|(cwd, _)| !used_cwds.contains(*cwd))
-                    .map(|(_, &port)| port)
-                    .collect();
-                let mut port_iter = unmatched_ports.iter();
-                for pane in &mut trm {
-                    if pane.has_claude && pane.channel_port.is_none() && pane.cwd.is_none() {
-                        if let Some(&port) = port_iter.next() {
-                            pane.channel_port = Some(port);
                         }
                     }
                 }
@@ -1416,8 +1409,8 @@ async fn main() -> io::Result<()> {
                                     let label = target_label.clone();
                                     let ok = match entry {
                                         ClaudeEntry::Trm(p) => {
-                                            let idx = p.index;
-                                            tokio::task::spawn_blocking(move || trm_send_to_pane(idx, &t))
+                                            let pid = p.pane_id;
+                                            tokio::task::spawn_blocking(move || trm_send_to_pane(pid, &t))
                                                 .await.unwrap_or(false)
                                         }
                                         ClaudeEntry::Cmux(s) => {
@@ -1496,13 +1489,17 @@ async fn main() -> io::Result<()> {
                                             // No channel — inject text directly into the pane.
                                             let text = format!("flan connect to {} and process queue once connected", uri);
                                             let t = text.clone();
+                                            // Resolve the actual pane_id before entering spawn_blocking.
+                                            let trm_pane_id = if sid.starts_with("trm:") {
+                                                sid["trm:".len()..].parse::<usize>().ok()
+                                                    .and_then(|idx| app.trm_panes.iter().find(|p| p.index == idx))
+                                                    .map(|p| p.pane_id)
+                                            } else {
+                                                None
+                                            };
                                             let ok = tokio::task::spawn_blocking(move || {
-                                                if sid.starts_with("trm:") {
-                                                    if let Ok(idx) = sid["trm:".len()..].parse::<usize>() {
-                                                        trm_send_to_pane(idx, &t)
-                                                    } else {
-                                                        false
-                                                    }
+                                                if let Some(pid) = trm_pane_id {
+                                                    trm_send_to_pane(pid, &t)
                                                 } else if cmux_send_text(&sid, &t) {
                                                     cmux_send_text(&sid, "\n")
                                                 } else {
