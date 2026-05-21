@@ -1420,7 +1420,6 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             if cwd.is_empty() { None } else { Some((cwd, name)) }
         })
         .collect();
-    let claude_cwds: std::collections::HashSet<String> = agent_cwd_map.keys().cloned().collect();
 
     // Build a map of (window_id, pane_id) → title for adjacency lookups.
     let pane_titles: std::collections::HashMap<(String, usize), String> = surfaces.iter()
@@ -1443,17 +1442,6 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         }
     };
 
-    // Check if a resolved cwd (which may be absolute or "…"-prefixed) matches a claude cwd.
-    // "…/dev/foo" matches "/Users/x/dev/foo" because the suffix agrees.
-    let cwd_has_claude = |cwd: &str| -> bool {
-        if cwd.starts_with('…') {
-            let suffix = &cwd[cwd.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1)..];
-            claude_cwds.iter().any(|c| c.ends_with(suffix))
-        } else {
-            claude_cwds.contains(cwd)
-        }
-    };
-
     // Look up the agent display name for a cwd that matches a live agent process.
     let agent_name_for_cwd = |cwd: &str| -> Option<&'static str> {
         if cwd.starts_with('…') {
@@ -1467,12 +1455,19 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
     };
 
     // --- Pass 1: classify each surface and resolve own-title cwds ---
+    //
+    // `title_suggests_agent` is only a *prefilter* — terminal titles are
+    // unreliable (a project dir named `codex`/`gemini` substring-matches, a
+    // spinner glyph trips the heuristic, and a stale title still says
+    // "Claude Code" after the agent exited).  It decides which panes are
+    // worth attempting login→process resolution on; the authoritative
+    // `has_claude` is computed later from process evidence only.
     struct RawPane {
         surface_id: String,
         pane_id: usize,
         window_id: String,
         title: String,
-        has_claude: bool,
+        title_suggests_agent: bool,
         own_cwd: Option<String>,
     }
     let raw: Vec<RawPane> = surfaces.iter().filter_map(|s| {
@@ -1486,10 +1481,10 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         let clean = title.trim_start_matches(|c: char| {
             !c.is_alphanumeric() && c != '~' && c != '/'
         }).trim();
-        let has_claude = title_has_agent(&title)
+        let title_suggests_agent = title_has_agent(&title)
             || (starts_with_spinner && !clean.starts_with('~') && !clean.starts_with('/'));
         let own_cwd = expand_title_path(&title);
-        Some(RawPane { surface_id, pane_id, window_id, title, has_claude, own_cwd })
+        Some(RawPane { surface_id, pane_id, window_id, title, title_suggests_agent, own_cwd })
     }).collect();
 
     // --- Pass 2a: resolve cwds for Claude panes via login→shell→cwd ---
@@ -1710,7 +1705,7 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                 .collect();
 
             let unresolved_claude_panes: Vec<usize> = raw.iter().enumerate()
-                .filter(|(i, rp)| rp.has_claude && rp.own_cwd.is_none() && !surface_to_login.contains_key(i))
+                .filter(|(i, rp)| rp.title_suggests_agent && rp.own_cwd.is_none() && !surface_to_login.contains_key(i))
                 .map(|(i, _)| i)
                 .collect();
 
@@ -1768,7 +1763,7 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
 
     let mut candidates: Vec<(usize, usize, usize, String, String)> = Vec::new();
     for (i, rp) in raw.iter().enumerate() {
-        if !rp.has_claude || rp.own_cwd.is_some() || login_resolved_cwds[i].is_some() {
+        if !rp.title_suggests_agent || rp.own_cwd.is_some() || login_resolved_cwds[i].is_some() {
             continue;
         }
         for delta in 1usize..=3 {
@@ -1796,7 +1791,7 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
     let mut panes: Vec<TrmPane> = Vec::new();
 
     for (i, rp) in raw.into_iter().enumerate() {
-        let RawPane { surface_id, pane_id, title, has_claude, own_cwd, .. } = rp;
+        let RawPane { surface_id, pane_id, title, title_suggests_agent: _, own_cwd, .. } = rp;
         // Prefer login-resolved cwd (ground truth), then own_cwd (from title),
         // then borrowed cwd (from neighbor).
         let resolved_cwd = login_resolved_cwds[i].take()
@@ -1816,15 +1811,27 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             (None, None)
         };
 
-        // Upgrade has_claude if the resolved cwd matches a live claude process cwd.
-        // This catches panes running Claude Code with --dangerously-load-development-channels
-        // where the title shows the task description instead of "Claude Code".
-        let has_claude = has_claude
-            || cwd.as_deref().map(|c| cwd_has_claude(c)).unwrap_or(false);
+        // `has_claude` is authoritative and must rest on actual process
+        // evidence — never on the terminal title alone (titles go stale and a
+        // project dir named `codex`/`gemini` substring-matches the heuristic).
+        //
+        // The only sound signal is login→shell→process resolution finding an
+        // *agent child* of this pane's own shell. `login_resolved_agents[i]`
+        // is set exactly in that case (unlike `login_resolved_pids`, which is
+        // also set for plain path-bearing shells with no agent child).
+        //
+        // A cwd match against a live agent process is deliberately NOT used
+        // here: it cannot tell which of several panes sharing one project
+        // directory is the real agent, so it flags every co-located shell
+        // (e.g. an editor pane next to a Claude pane in the same repo). The
+        // title heuristic survives only as the pass-1 prefilter that decided
+        // whether login resolution was attempted at all.
+        let has_claude = login_resolved_agents[i].is_some();
 
-        // Determine agent display name.  Prefer process-derived sources (login
-        // chain or cwd match) because the terminal title may be stale (e.g.
-        // still shows "forge" after Claude Code replaced it in the same pane).
+        // Determine agent display name. Prefer the login-resolved name (ground
+        // truth from the process tree); fall back to a cwd match, then the
+        // terminal title. These fallbacks are display-only and never affect
+        // `has_claude` — a non-agent pane stays out of the agent column.
         let agent_name = login_resolved_agents[i]
             .map(|s| s.to_string())
             .or_else(|| cwd.as_deref().and_then(|c| agent_name_for_cwd(c)).map(|s| s.to_string()))
