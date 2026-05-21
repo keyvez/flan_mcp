@@ -275,6 +275,55 @@ impl App {
         self.claude_list_state.select(self.claude_row);
     }
 
+    /// Stable identity of the currently-selected Flutter app (its PID), if any.
+    ///
+    /// Row indices are positions in the derived [`build_rows`] list, which is
+    /// re-sorted whenever associations or discovery change. Capture this before
+    /// mutating state and feed it to [`reanchor_selection`] afterwards so the
+    /// cursor follows the same process instead of pointing at whatever moved
+    /// into that index.
+    fn selected_flutter_pid(&self) -> Option<u32> {
+        self.selected_flutter().map(|f| f.pid)
+    }
+
+    /// Stable identity of the currently-selected Claude entry (its `id()`).
+    fn selected_claude_id(&self) -> Option<String> {
+        self.selected_entry().map(|e| e.id())
+    }
+
+    /// Re-point `flutter_row` / `claude_row` at the rows that now hold the
+    /// given Flutter PID and Claude entry id after the row list was rebuilt.
+    ///
+    /// If an identity is no longer present (process gone, surface closed),
+    /// that column's selection falls back to the first row that has content
+    /// in that column — never a stale index.
+    fn reanchor_selection(&mut self, pid: Option<u32>, claude_id: Option<String>) {
+        let rows = build_rows(self);
+        let entries = self.claude_entries();
+
+        self.flutter_row = pid
+            .and_then(|pid| {
+                rows.iter().position(|r| {
+                    r.flutter
+                        .map(|fi| self.flutter_apps[fi].pid == pid)
+                        .unwrap_or(false)
+                })
+            })
+            .or_else(|| rows.iter().position(|r| r.flutter.is_some()));
+
+        self.claude_row = claude_id
+            .and_then(|id| {
+                rows.iter().position(|r| {
+                    r.surface
+                        .map(|si| entries[si].id() == id)
+                        .unwrap_or(false)
+                })
+            })
+            .or_else(|| rows.iter().position(|r| r.surface.is_some()));
+
+        self.sync_row_state();
+    }
+
     async fn log(
         &self,
         direction: &'static str,
@@ -426,34 +475,20 @@ impl App {
         *self.shared.flutter_cache.write().await = Some((Instant::now(), flutter));
         self.sync_log_snapshot().await;
 
-        let rows = build_rows(self);
-        let row_count = rows.len();
+        // Re-anchor the per-column cursors to the same Flutter PID / Claude
+        // entry they pointed at before this refresh. Discovery can reorder the
+        // row list (new apps, changed cwd pairing), so clamping indices alone
+        // would silently move the cursor onto a different process.
+        let prev_pid = self.selected_flutter_pid();
+        let prev_claude = self.selected_claude_id();
 
-        // Clamp per-column selections
-        if row_count == 0 {
+        if build_rows(self).is_empty() {
             self.flutter_row = None;
             self.claude_row = None;
+            self.sync_row_state();
         } else {
-            if let Some(i) = self.flutter_row {
-                if i >= row_count {
-                    self.flutter_row = Some(row_count - 1);
-                }
-            }
-            if let Some(i) = self.claude_row {
-                if i >= row_count {
-                    self.claude_row = Some(row_count - 1);
-                }
-            }
-
-            if self.flutter_row.is_none() {
-                self.flutter_row = rows.iter().position(|r| r.flutter.is_some());
-            }
-            if self.claude_row.is_none() {
-                self.claude_row = rows.iter().position(|r| r.surface.is_some());
-            }
+            self.reanchor_selection(prev_pid, prev_claude);
         }
-
-        self.sync_row_state();
     }
 
     fn move_up(&mut self) {
@@ -1248,8 +1283,8 @@ async fn main() -> io::Result<()> {
                             }
 
                             KeyCode::Char('l') => {
-                                let flutter_pid = app.selected_flutter().map(|f| f.pid);
-                                let surface_id = app.selected_entry().map(|e| e.id());
+                                let flutter_pid = app.selected_flutter_pid();
+                                let surface_id = app.selected_claude_id();
 
                                 if let (Some(pid), Some(sid)) = (flutter_pid, surface_id) {
                                     let assoc = Association {
@@ -1265,6 +1300,10 @@ async fn main() -> io::Result<()> {
                                         save_associations(&app.shared.persistence_path, &assocs);
                                     }
                                     app.associations = app.shared.associations.read().await.clone();
+                                    // Linking moves this pair to the top of the row list, so the
+                                    // old row indices no longer point at the same items. Re-anchor
+                                    // the cursor to the PID/surface the user actually selected.
+                                    app.reanchor_selection(Some(pid), Some(sid.clone()));
                                     app.log("in", format!("Link created: PID {} → {}", pid, &sid[..8.min(sid.len())]), None, true).await;
                                     app.sync_log_snapshot().await;
                                     app.set_toast("Link created");
@@ -1274,6 +1313,10 @@ async fn main() -> io::Result<()> {
                             }
 
                             KeyCode::Char('u') => {
+                                // Capture the selected identities before the row list
+                                // is rebuilt, so the cursor can follow them afterwards.
+                                let sel_pid = app.selected_flutter_pid();
+                                let sel_claude = app.selected_claude_id();
                                 let assoc_id = match app.active_column {
                                     Column::Flutter => app
                                         .selected_flutter()
@@ -1292,6 +1335,9 @@ async fn main() -> io::Result<()> {
                                         save_associations(&app.shared.persistence_path, &assocs);
                                     }
                                     app.associations = app.shared.associations.read().await.clone();
+                                    // Unlinking moves this pair out of the linked block,
+                                    // shifting row indices — re-anchor to the same items.
+                                    app.reanchor_selection(sel_pid, sel_claude);
                                     app.log("in", format!("Unlinked: {}", id), None, true).await;
                                     app.sync_log_snapshot().await;
                                     app.set_toast("Unlinked");
@@ -1461,10 +1507,7 @@ async fn main() -> io::Result<()> {
                                             // deliver the message directly into the Claude session.
                                             let payload = serde_json::json!({
                                                 "vm_service_uri": uri,
-                                                "messages": [{
-                                                    "type": "flush",
-                                                    "text": format!("flan connect to {} and process queue once connected", uri),
-                                                }]
+                                                "messages": []
                                             });
                                             let body_str = payload.to_string();
                                             let req = format!(
@@ -1487,7 +1530,7 @@ async fn main() -> io::Result<()> {
                                             app.set_toast(if ok { "Flushed (channel)" } else { &detail });
                                         } else {
                                             // No channel — inject text directly into the pane.
-                                            let text = format!("flan connect to {} and process queue once connected", uri);
+                                            let text = format!("flan connect to {}", uri);
                                             let t = text.clone();
                                             // Resolve the actual pane_id before entering spawn_blocking.
                                             let trm_pane_id = if sid.starts_with("trm:") {
