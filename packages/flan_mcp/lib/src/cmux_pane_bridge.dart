@@ -88,13 +88,11 @@ class CmuxPaneBridge {
         return;
       }
 
-      final text = vmServiceUri != null
-          ? 'flan connect to $vmServiceUri and process queue once connected'
-          : 'process queue';
+      if (vmServiceUri == null) return;
 
       final textResp = await _sendRpc('surface.send_text', {
         'surface_id': targetId,
-        'text': text,
+        'text': 'flan connect to $vmServiceUri and process queue once connected',
       });
 
       if (textResp?['ok'] == true) {

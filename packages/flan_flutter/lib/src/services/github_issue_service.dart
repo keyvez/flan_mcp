@@ -11,6 +11,8 @@ class GitHubIssueService {
   static String? _endpointUrl;
   static Map<String, String> Function()? _headersBuilder;
   static Map<String, String>? _userInfo;
+  static void Function()? _onAuthRequired;
+  static void Function()? _onSessionExpired;
 
   /// Whether the issue endpoint has been configured.
   static bool get isConfigured =>
@@ -20,14 +22,20 @@ class GitHubIssueService {
   ///
   /// [userInfo] is an optional map of user details (e.g. `{'name': '...', 'email': '...'}`).
   /// When provided, these details are included in the issue payload.
+  /// [onAuthRequired] is called on 403 (GitHub token missing).
+  /// [onSessionExpired] is called on 401 (session expired).
   static void configure({
     required String url,
     required Map<String, String> Function() headersBuilder,
     Map<String, String>? userInfo,
+    void Function()? onAuthRequired,
+    void Function()? onSessionExpired,
   }) {
     _endpointUrl = url;
     _headersBuilder = headersBuilder;
     _userInfo = userInfo;
+    _onAuthRequired = onAuthRequired;
+    _onSessionExpired = onSessionExpired;
   }
 
   /// Clears the configured endpoint (e.g. on logout).
@@ -35,6 +43,8 @@ class GitHubIssueService {
     _endpointUrl = null;
     _headersBuilder = null;
     _userInfo = null;
+    _onAuthRequired = null;
+    _onSessionExpired = null;
   }
 
   /// Creates a GitHub issue from a list of queued messages.
@@ -76,6 +86,17 @@ class GitHubIssueService {
       headers: headers,
       body: jsonEncode(payload),
     );
+
+    if (response.statusCode == 401 && _onSessionExpired != null) {
+      _onSessionExpired!();
+      throw Exception('Session expired. Please log in again.');
+    }
+    if (response.statusCode == 403 && _onAuthRequired != null) {
+      _onAuthRequired!();
+      throw Exception(
+        'GitHub authentication required. Redirecting...',
+      );
+    }
 
     if (response.statusCode != 200) {
       throw Exception(
@@ -130,6 +151,17 @@ class GitHubIssueService {
       headers: headers,
       body: jsonEncode(payload),
     );
+
+    if (response.statusCode == 401 && _onSessionExpired != null) {
+      _onSessionExpired!();
+      throw Exception('Session expired. Please log in again.');
+    }
+    if (response.statusCode == 403 && _onAuthRequired != null) {
+      _onAuthRequired!();
+      throw Exception(
+        'GitHub authentication required. Redirecting...',
+      );
+    }
 
     if (response.statusCode != 200) {
       throw Exception(

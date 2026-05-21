@@ -44,15 +44,22 @@ class FlanBinding extends WidgetsFlutterBinding {
   /// [url] is the full URL (e.g. `https://dev-api.fasmac.workers.dev/api/github/issues`).
   /// [headersBuilder] returns auth headers for each request.
   /// [userInfo] optional user details included in the issue payload (e.g. `{'name': '...', 'email': '...'}`).
+  /// [onAuthRequired] is called when the backend returns 403,
+  /// indicating the user needs to connect their GitHub account.
+  /// [onSessionExpired] is called on 401 (session expired — re-login needed).
   static void configureIssueEndpoint({
     required String url,
     required Map<String, String> Function() headersBuilder,
     Map<String, String>? userInfo,
+    void Function()? onAuthRequired,
+    void Function()? onSessionExpired,
   }) {
     GitHubIssueService.configure(
       url: url,
       headersBuilder: headersBuilder,
       userInfo: userInfo,
+      onAuthRequired: onAuthRequired,
+      onSessionExpired: onSessionExpired,
     );
   }
 

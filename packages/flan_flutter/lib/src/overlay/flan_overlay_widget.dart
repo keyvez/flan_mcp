@@ -4,6 +4,7 @@ import 'dart:developer' as developer;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart' hide InspectorSelection;
+import 'package:flutter/scheduler.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter/services.dart';
 import 'package:flan_flutter/src/overlay/annotation_painter.dart';
@@ -186,8 +187,29 @@ Future<String?> _buildQueueThumbnailFromScreenshot({
   }
 }
 
-/// Returns the current route name from the binding, or null if unavailable.
-String? _currentRouteName() {
+/// Returns the current route/URL for the active screen.
+///
+/// Prefers the live URL exposed by the app's [Router] (this is what
+/// go_router and any other [Router]-based navigation populate — e.g.
+/// `/orders/42?tab=items`). Falls back to the deepest [ModalRoute]'s
+/// `settings.name`, which is what plain `Navigator.pushNamed` apps use.
+///
+/// [context] is optional only so legacy call sites compile; pass one
+/// whenever available so the [Router] lookup can run — without it the
+/// URL cannot be resolved for go_router apps.
+String? _currentRouteName([BuildContext? context]) {
+  if (context != null) {
+    try {
+      final router = Router.maybeOf(context);
+      final uri = router?.routeInformationProvider?.value.uri;
+      if (uri != null) {
+        final asString = uri.toString();
+        if (asString.isNotEmpty) return asString;
+      }
+    } catch (_) {
+      // Fall through to the ModalRoute-based lookup below.
+    }
+  }
   try {
     return FlanBinding.instance.getCurrentRouteName();
   } catch (_) {
@@ -227,20 +249,36 @@ Future<void> _attachScreenshotAndQueueThumbnail({
   }
 
   if (cleanScreenshot != null) {
-    data['screenshot'] = cleanScreenshot;
     if (previewBounds != null) {
       final viewportSize = _resolveViewportSize(context);
       if (viewportSize.width > 0 && viewportSize.height > 0) {
-        final queueThumbnail = await _buildQueueThumbnailFromScreenshot(
+        // Send a cropped region to the agent instead of the full screen.
+        // Match the output aspect ratio to the annotation bounds so no
+        // padding is added, capped at 800px on the longest side.
+        final cropAspect = previewBounds.width / previewBounds.height.clamp(1.0, double.infinity);
+        final agentW = (cropAspect >= 1.0 ? 800 : (800 * cropAspect).round()).clamp(1, 800);
+        final agentH = (cropAspect >= 1.0 ? (800 / cropAspect).round() : 800).clamp(1, 800);
+        final cropped = await _buildQueueThumbnailFromScreenshot(
           screenshotBase64: cleanScreenshot,
           targetBounds: previewBounds,
           viewportSize: viewportSize,
+          thumbnailWidth: agentW,
+          thumbnailHeight: agentH,
         );
-        if (queueThumbnail != null) {
-          data['queueThumbnail'] = queueThumbnail;
+        if (cropped != null) {
+          data['screenshot'] = cropped;
+          // Downscale further for the queue panel thumbnail.
+          final queueThumbnail = await _buildQueueThumbnailFromScreenshot(
+            screenshotBase64: cleanScreenshot,
+            targetBounds: previewBounds,
+            viewportSize: viewportSize,
+          );
+          if (queueThumbnail != null) data['queueThumbnail'] = queueThumbnail;
+          return;
         }
       }
     }
+    data['screenshot'] = cleanScreenshot;
     return;
   }
 
@@ -250,28 +288,40 @@ Future<void> _attachScreenshotAndQueueThumbnail({
     return;
   }
 
-  data['screenshot'] = screenshots.first;
   if (previewBounds == null) {
+    data['screenshot'] = screenshots.first;
     return;
   }
 
   final viewportSize = _resolveViewportSize(context);
   if (viewportSize.width <= 0 || viewportSize.height <= 0) {
+    data['screenshot'] = screenshots.first;
     return;
   }
 
+  final cropAspect = previewBounds.width / previewBounds.height.clamp(1.0, double.infinity);
+  final agentW = (cropAspect >= 1.0 ? 800 : (800 * cropAspect).round()).clamp(1, 800);
+  final agentH = (cropAspect >= 1.0 ? (800 / cropAspect).round() : 800).clamp(1, 800);
   for (final screenshot in screenshots) {
-    final queueThumbnail = await _buildQueueThumbnailFromScreenshot(
+    final cropped = await _buildQueueThumbnailFromScreenshot(
       screenshotBase64: screenshot,
       targetBounds: previewBounds,
       viewportSize: viewportSize,
+      thumbnailWidth: agentW,
+      thumbnailHeight: agentH,
     );
-    if (queueThumbnail != null) {
-      data['queueThumbnail'] = queueThumbnail;
-      data['screenshot'] = screenshot;
+    if (cropped != null) {
+      data['screenshot'] = cropped;
+      final queueThumbnail = await _buildQueueThumbnailFromScreenshot(
+        screenshotBase64: screenshot,
+        targetBounds: previewBounds,
+        viewportSize: viewportSize,
+      );
+      if (queueThumbnail != null) data['queueThumbnail'] = queueThumbnail;
       return;
     }
   }
+  data['screenshot'] = screenshots.first;
 }
 
 /// Overlay widget injected at the root of the app via
@@ -304,17 +354,49 @@ class FlanOverlayWidget extends StatefulWidget {
 
 class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   bool _showTextMessageOverlay = false;
-  bool _textOverlayEverShown = false;
   bool _showQueuedMessagesPanel = false;
   bool _showErrorPanel = false;
   List<Map<String, dynamic>> _queuedMessagesSnapshot = const [];
   int? _annotationDraftQueueId;
   String _lastQueuedAnnotationsSignature = '';
 
+  /// Schedules a setState that is safe to call from ChangeNotifier listeners.
+  /// If a build/layout/paint is already in progress, defers to the next frame
+  /// to avoid "dirty widget in wrong build scope" assertion from go_router.
+  void _safeSetState() {
+    if (!mounted) return;
+    final phase = SchedulerBinding.instance.schedulerPhase;
+    if (phase == SchedulerPhase.persistentCallbacks ||
+        phase == SchedulerPhase.transientCallbacks) {
+      // During build/layout — defer to next frame.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() {});
+      });
+    } else if (phase == SchedulerPhase.postFrameCallbacks) {
+      // Already in postFrameCallbacks (e.g. _SubmitOnEnterFormatter fires
+      // _handleSubmit via addPostFrameCallback which synchronously calls
+      // notifyListeners). addPostFrameCallback would loop forever here,
+      // so schedule a microtask to run after the current callback completes
+      // but before the next frame.
+      scheduleMicrotask(() {
+        if (mounted) setState(() {});
+      });
+    } else {
+      setState(() {});
+    }
+  }
+
   /// Key for the RepaintBoundary wrapping the app content.
   /// Used to capture only the app layer (without annotation overlays
   /// or Flan UI) via [ScreenshotService.takeScreenshotFromBoundary].
   final _appContentKey = GlobalKey();
+
+  /// Cached widget subtree for the app content. Holding a reference to the
+  /// same widget instance across rebuilds prevents Flutter from unnecessarily
+  /// reconciling widget.child (which contains the Navigator), avoiding
+  /// "dirty widget in wrong build scope" assertions from go_router.
+  late Widget _appContent;
+
 
   /// Monotonically increasing counter to detect stale async thumbnail
   /// completions. Incremented every time a new draft thumbnail is started.
@@ -363,8 +445,22 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     widget.errorInterceptor.addListener(_onServiceChanged);
     widget.macroRecorderService.addListener(_onServiceChanged);
     HardwareKeyboard.instance.addHandler(_handleGlobalKey);
-    _onAnnotationServiceChanged();
+
+    _appContent = RepaintBoundary(key: _appContentKey, child: widget.child);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _onAnnotationServiceChanged(); // safe: runs after first frame
+    });
+
     _loadBadgeOffset();
+  }
+
+  @override
+  void didUpdateWidget(covariant FlanOverlayWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(widget.child, oldWidget.child)) {
+      _appContent = RepaintBoundary(key: _appContentKey, child: widget.child);
+    }
   }
 
   Future<void> _loadBadgeOffset() async {
@@ -372,7 +468,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     final dx = prefs.getDouble(_badgeDxKey);
     final dy = prefs.getDouble(_badgeDyKey);
     if (dx != null && dy != null && mounted) {
-      setState(() => _badgeDragOffset = Offset(dx, dy));
+      _badgeDragOffset = Offset(dx, dy);
+      _safeSetState();
     }
   }
 
@@ -398,36 +495,27 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     super.reassemble();
     // Dismiss the text message overlay on hot reload.
     if (_showTextMessageOverlay) {
-      setState(() => _showTextMessageOverlay = false);
+      _showTextMessageOverlay = false;
+      _safeSetState();
     }
   }
-
-  bool _serviceChangePending = false;
 
   void _onServiceChanged() {
     if (_showErrorPanel && widget.errorInterceptor.errors.isEmpty) {
       _showErrorPanel = false;
     }
-    if (!mounted || _serviceChangePending) return;
-    _serviceChangePending = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _serviceChangePending = false;
-      if (mounted) setState(() {});
-    });
+    _safeSetState();
   }
 
   void _onAnnotationServiceChanged() {
-    if (_suppressAnnotationDraftUpsert) {
-      if (mounted) setState(() {});
-      return;
-    }
     final annotations = widget.annotationService.getAnnotationsData();
     final signature = jsonEncode(annotations);
-    if (signature != _lastQueuedAnnotationsSignature) {
+    if (!_suppressAnnotationDraftUpsert &&
+        signature != _lastQueuedAnnotationsSignature) {
       _lastQueuedAnnotationsSignature = signature;
       _upsertQueuedAnnotationDraft(annotations);
     }
-    if (mounted) setState(() {});
+    _safeSetState();
   }
 
   void _upsertQueuedAnnotationDraft(List<Map<String, dynamic>> annotations) {
@@ -440,30 +528,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       return;
     }
 
+    // Skip widget inspection here — it does a full element-tree walk which
+    // blocks the UI for ~1s per annotation.  The flush-time builder at
+    // _rebuildQueuedMessageText already runs inspectAtForAgent just before
+    // sending, so no context is lost.
     final enrichedAnnotations = annotations
         .map((annotation) => Map<String, dynamic>.from(annotation))
         .toList(growable: false);
-    for (final annotation in enrichedAnnotations) {
-      final bounds = annotation['bounds'] as Map<String, dynamic>?;
-      if (bounds == null) continue;
-      final x = bounds['x'];
-      final y = bounds['y'];
-      final width = bounds['width'];
-      final height = bounds['height'];
-      if (x is! num || y is! num || width is! num || height is! num) {
-        continue;
-      }
-      final centerX = x + width / 2;
-      final centerY = y + height / 2;
-      final widgetSelection = widget.inspectorService.inspectAtForAgent(
-        centerX.toDouble(),
-        centerY.toDouble(),
-        includeProperties: false,
-      );
-      if (widgetSelection != null) {
-        annotation['widget'] = widgetSelection.toJson();
-      }
-    }
 
     final data = <String, dynamic>{
       'annotations': enrichedAnnotations,
@@ -523,11 +594,17 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       }
     }
 
+    // Suppress the VM event — this is a draft, not a user-initiated flush.
+    // Firing userMessageQueued here causes the MCP server to notify Claude,
+    // which then calls process_queue before the user has sent anything.
+    final wasSuppressed = widget.userMessageService.suppressVmEvents;
+    widget.userMessageService.suppressVmEvents = true;
     widget.userMessageService.sendMessage({
       'type': 'user_feedback',
       'text': text,
       'data': data,
     });
+    widget.userMessageService.suppressVmEvents = wasSuppressed;
     final pendingMessages = widget.userMessageService.peekMessages();
     if (pendingMessages.isNotEmpty) {
       _annotationDraftQueueId = _queueIdOf(pendingMessages.last);
@@ -628,24 +705,20 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       }
     }
 
-    setState(() {
-      // Dismiss the overlay when the waiting state clears (e.g. after hot
-      // reload).
-      if (_showTextMessageOverlay &&
-          !widget.userMessageService.waitingForActivity) {
-        _showTextMessageOverlay = false;
+    // Mutate local UI state then schedule a rebuild safely after the frame.
+    if (_showTextMessageOverlay &&
+        !widget.userMessageService.waitingForActivity) {
+      _showTextMessageOverlay = false;
+    }
+    if (_showQueuedMessagesPanel) {
+      _queuedMessagesSnapshot = pendingMessages
+          .map((message) => Map<String, dynamic>.from(message))
+          .toList();
+      if (_queuedMessagesSnapshot.isEmpty) {
+        _showQueuedMessagesPanel = false;
       }
-
-      // Keep the open queue panel synchronized with the service queue.
-      if (_showQueuedMessagesPanel) {
-        _queuedMessagesSnapshot = pendingMessages
-            .map((message) => Map<String, dynamic>.from(message))
-            .toList();
-        if (_queuedMessagesSnapshot.isEmpty) {
-          _showQueuedMessagesPanel = false;
-        }
-      }
-    });
+    }
+    _safeSetState();
   }
 
   /// Global keyboard shortcut handler.
@@ -694,19 +767,20 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     // Escape exits whichever mode is active (no modifiers needed).
     if (event.logicalKey == LogicalKeyboardKey.escape) {
       if (_showErrorPanel) {
-        setState(() => _showErrorPanel = false);
+        _showErrorPanel = false;
+        _safeSetState();
         return true;
       }
       if (_showQueuedMessagesPanel) {
-        setState(() {
-          _showQueuedMessagesPanel = false;
-          _queuedMessagesSnapshot = const [];
-        });
+        _showQueuedMessagesPanel = false;
+        _queuedMessagesSnapshot = const [];
+        _safeSetState();
         return true;
       }
       if (_showTextMessageOverlay) {
         widget.userMessageService.clearWaiting();
-        setState(() => _showTextMessageOverlay = false);
+        _showTextMessageOverlay = false;
+        _safeSetState();
         return true;
       }
       if (widget.inspectorService.enabled) {
@@ -763,7 +837,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         for (final error in errors) {
           _sendErrorToAgent(error);
         }
-        setState(() => _showErrorPanel = false);
+        _showErrorPanel = false;
+        _safeSetState();
       } else {
         _sendToAgent();
       }
@@ -790,16 +865,16 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         '// ─────────────────────────────────────────────────────────────\n',
         name: 'FlanRecorder',
       );
-      setState(() {
-        _lastGeneratedTest = source;
-        _lastRecordedStepLabels = stepLabels;
-      });
+      _lastGeneratedTest = source;
+      _lastRecordedStepLabels = stepLabels;
+      _safeSetState();
     } else {
       // Disable other overlay modes while recording.
       if (widget.inspectorService.enabled) widget.inspectorService.disable();
       if (widget.annotationService.enabled) widget.annotationService.disable();
       recorder.startRecording();
-      setState(() => _lastGeneratedTest = null);
+      _lastGeneratedTest = null;
+      _safeSetState();
     }
   }
 
@@ -824,7 +899,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       stepsBlock = buf.toString().trimRight();
     }
 
-    final routeName = _currentRouteName();
+    final routeName = _currentRouteName(context);
     final data = <String, dynamic>{
       'kind': 'recorded_integration_test',
       'testSource': source,
@@ -850,10 +925,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     });
 
     unawaited(_flushToServer(clearOnChannelDelivery: true));
-    setState(() {
-      _lastGeneratedTest = null;
-      _lastRecordedStepLabels = const [];
-    });
+    _lastGeneratedTest = null;
+    _lastRecordedStepLabels = const [];
+    _safeSetState();
   }
 
   void _openTextMessageOverlay() {
@@ -864,30 +938,50 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     if (widget.annotationService.enabled) {
       widget.annotationService.disable();
     }
-    setState(() {
-      _showTextMessageOverlay = true;
-      _textOverlayEverShown = true;
-    });
+    _showTextMessageOverlay = true;
+    _safeSetState();
   }
 
   /// Enqueues the text message (Enter). Does NOT flush to the agent.
   void _onTextMessageQueued(String text, String? drawingBase64) {
     if (text.trim().isEmpty && drawingBase64 == null) {
-      setState(() => _showTextMessageOverlay = false);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _showTextMessageOverlay = false;
+        _safeSetState();
+      });
       return;
     }
     _enqueueTextMessage(text, drawingBase64);
-    setState(() => _showTextMessageOverlay = false);
+    // Defer the dismiss to the next frame so we don't call setState
+    // synchronously inside the key-event call stack that triggered
+    // _handleSubmit. Doing so while FocusScope is still processing
+    // focus events causes "_dependents.isEmpty" / "wrong build scope"
+    // framework assertions.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _showTextMessageOverlay = false;
+      _safeSetState();
+    });
   }
 
   /// Enqueues and immediately sends the text message (Cmd+Enter).
   void _onTextMessageSubmittedAndSent(String text, String? drawingBase64) {
     if (text.trim().isEmpty && drawingBase64 == null) {
-      setState(() => _showTextMessageOverlay = false);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _showTextMessageOverlay = false;
+        _safeSetState();
+      });
       return;
     }
     _enqueueTextMessage(text, drawingBase64);
     unawaited(_flushToServer(clearOnChannelDelivery: true));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _showTextMessageOverlay = false;
+      _safeSetState();
+    });
   }
 
   void _enqueueTextMessage(String text, String? drawingBase64) {
@@ -899,7 +993,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       widget.userMessageService.clearWaiting();
     }
     final data = <String, dynamic>{'userMessage': text};
-    final routeName = _currentRouteName();
+    final routeName = _currentRouteName(context);
     if (routeName != null) {
       data['currentRoute'] = routeName;
     }
@@ -928,7 +1022,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     final data = <String, dynamic>{};
 
     // Include current route/URL
-    final routeName = _currentRouteName();
+    final routeName = _currentRouteName(context);
     if (routeName != null) {
       data['currentRoute'] = routeName;
     }
@@ -1078,11 +1172,14 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     if (messages.isEmpty) return;
 
     // Hide the flan overlay so the screenshot shows the app cleanly.
-    setState(() => _showQueuedMessagesPanel = false);
+    _showQueuedMessagesPanel = false;
+    _safeSetState();
     // Wait for the frame to paint without the overlay.
     await Future<void>.delayed(const Duration(milliseconds: 150));
 
-    // Capture a fresh screenshot of the clean app.
+    // Capture a fresh screenshot for messages that don't already have one.
+    // Messages queued with annotations may already carry a screenshot
+    // taken at annotation time — those should be preserved.
     try {
       final screenshots =
           await widget.screenshotService.takeScreenshots();
@@ -1094,9 +1191,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         for (final msg in messages) {
           final msgData = msg['data'];
           if (msgData is Map<String, dynamic>) {
-            final copy = Map<String, dynamic>.from(msgData);
-            copy['screenshot'] = screenshots.first;
-            msg['data'] = copy;
+            // Only attach if no screenshot already saved
+            if (msgData['screenshot'] == null ||
+                (msgData['screenshot'] as String).isEmpty) {
+              final copy = Map<String, dynamic>.from(msgData);
+              copy['screenshot'] = screenshots.first;
+              msg['data'] = copy;
+            }
           } else {
             msg['data'] = <String, dynamic>{
               'screenshot': screenshots.first,
@@ -1119,10 +1220,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       widget.userMessageService.clearMessages();
       _isSendingToAgent = false;
       if (mounted) {
-        setState(() {
-          _showQueuedMessagesPanel = false;
-          _queuedMessagesSnapshot = const [];
-        });
+        _showQueuedMessagesPanel = false;
+        _queuedMessagesSnapshot = const [];
+        _safeSetState();
       }
     } catch (e) {
       _isSendingToAgent = false;
@@ -1160,14 +1260,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     final removed = widget.userMessageService.removeMessageByQueueId(queueId);
     if (!removed || !mounted) return;
 
-    setState(() {
-      _queuedMessagesSnapshot = _queuedMessagesSnapshot
-          .where((message) => _queueIdOf(message) != queueId)
-          .toList();
-      if (_queuedMessagesSnapshot.isEmpty) {
-        _showQueuedMessagesPanel = false;
-      }
-    });
+    _queuedMessagesSnapshot = _queuedMessagesSnapshot
+        .where((message) => _queueIdOf(message) != queueId)
+        .toList();
+    if (_queuedMessagesSnapshot.isEmpty) {
+      _showQueuedMessagesPanel = false;
+    }
+    _safeSetState();
   }
 
   void _clearQueuedMessages() {
@@ -1182,10 +1281,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     widget.userMessageService.clearMessages();
     _isSendingToAgent = false;
     if (!mounted) return;
-    setState(() {
-      _queuedMessagesSnapshot = const [];
-      _showQueuedMessagesPanel = false;
-    });
+    _queuedMessagesSnapshot = const [];
+    _showQueuedMessagesPanel = false;
+    _safeSetState();
   }
 
   Future<void> _flushToServer({
@@ -1274,9 +1372,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       if (channelOk) {
         widget.userMessageService.suppressVmEvents = true;
         if (clearOnChannelDelivery) {
-          // Channel delivered the messages — clear them from the app queue
-          // since process_queue won't run to consume them.
-          widget.userMessageService.clearMessages();
+          // Channel delivered the messages — consume them from the app queue
+          // (not just clear) so agentConsumeGeneration increments and the
+          // overlay clears annotations as it would on a process_queue call.
+          widget.userMessageService.consumeMessages();
         }
       } else {
         widget.userMessageService.notifyPending();
@@ -1302,9 +1401,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     });
 
     if (!mounted) return;
-    setState(() {
-      _queuedMessagesSnapshot = widget.userMessageService.peekMessages();
-    });
+    _queuedMessagesSnapshot = widget.userMessageService.peekMessages();
+    _safeSetState();
   }
 
   Future<void> _editQueuedAnnotation(
@@ -1316,6 +1414,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     final controller = TextEditingController(text: currentText);
     await showDialog<void>(
       context: context,
+      useRootNavigator: true,
       builder: (dialogContext) {
         return AlertDialog(
           title: const Text('Edit annotation'),
@@ -1450,13 +1549,12 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     widget.userMessageService.updateMessageByQueueId(queueId, updatedMessage);
 
     if (!mounted) return;
-    setState(() {
-      _queuedMessagesSnapshot = _queuedMessagesSnapshot
-          .map((message) => _queueIdOf(message) == queueId
-              ? Map<String, dynamic>.from(updatedMessage)
-              : message)
-          .toList();
-    });
+    _queuedMessagesSnapshot = _queuedMessagesSnapshot
+        .map((message) => _queueIdOf(message) == queueId
+            ? Map<String, dynamic>.from(updatedMessage)
+            : message)
+        .toList();
+    _safeSetState();
   }
 
   @override
@@ -1472,48 +1570,52 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       textDirection: TextDirection.ltr,
       child: Stack(
         children: [
-          // The actual app content, wrapped in a RepaintBoundary so we can
-          // capture it without annotation/overlay layers.
-          RepaintBoundary(key: _appContentKey, child: widget.child),
-          // Inspector overlay — always in tree to preserve stable widget
-          // indices and avoid disrupting the Navigator's restoration scope.
-          // Wrapped in Positioned.fill so the Visibility/Offstage layer
-          // doesn't break the Stack → Positioned parent-data contract.
+          _appContent,
+          // Inspector layer — wrapped in its own FocusScope to isolate
+          // its FocusNodes from go_router's Navigator focus hierarchy.
+          // Without this, the inspector's FocusNodes become dependents
+          // of the Navigator's _FocusInheritedScope; when the Navigator
+          // deactivates during route changes the framework asserts
+          // _dependents.isEmpty.
           Positioned.fill(
-            child: Visibility(
-              visible: widget.inspectorService.enabled,
-              maintainState: true,
-              maintainAnimation: true,
-              maintainSize: false,
-              maintainInteractivity: false,
-              child: _InspectorOverlay(
-                service: widget.inspectorService,
-                userMessageService: widget.userMessageService,
-                screenshotService: widget.screenshotService,
-                onMessageSent: () => unawaited(_flushToServer(clearOnChannelDelivery: true)),
+            child: FocusScope(
+              child: Visibility(
+                visible: widget.inspectorService.enabled,
+                maintainState: true,
+                maintainAnimation: true,
+                maintainSize: false,
+                maintainInteractivity: false,
+                child: _InspectorOverlay(
+                  service: widget.inspectorService,
+                  userMessageService: widget.userMessageService,
+                  screenshotService: widget.screenshotService,
+                  onMessageSent: () => unawaited(_flushToServer(clearOnChannelDelivery: true)),
+                ),
               ),
             ),
           ),
-          // Annotation overlay — always in tree for the same reason.
+          // Annotation layer — also wrapped in FocusScope for isolation.
           Positioned.fill(
-            child: Visibility(
-              visible: widget.annotationService.enabled,
-              maintainState: true,
-              maintainAnimation: true,
-              maintainSize: false,
-              maintainInteractivity: false,
-              child: _AnnotationOverlay(
-                service: widget.annotationService,
-                userMessageService: widget.userMessageService,
-                onAnnotationSubmitted: () {
-                  _sendToAgent();
-                },
-                onAnnotationSubmittedAndSent: () {
-                  _sendToAgentAndFlush();
-                },
-                onFlushRequested: () {
-                  unawaited(_flushToServer(clearOnChannelDelivery: true));
-                },
+            child: FocusScope(
+              child: Visibility(
+                visible: widget.annotationService.enabled,
+                maintainState: true,
+                maintainAnimation: true,
+                maintainSize: false,
+                maintainInteractivity: false,
+                child: _AnnotationOverlay(
+                  service: widget.annotationService,
+                  userMessageService: widget.userMessageService,
+                  onAnnotationSubmitted: () {
+                    _sendToAgent();
+                  },
+                  onAnnotationSubmittedAndSent: () {
+                    _sendToAgentAndFlush();
+                  },
+                  onFlushRequested: () {
+                    unawaited(_flushToServer(clearOnChannelDelivery: true));
+                  },
+                ),
               ),
             ),
           ),
@@ -1617,10 +1719,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
             _RecordingResultSheet(
               source: _lastGeneratedTest!,
               stepLabels: _lastRecordedStepLabels,
-              onDismiss: () => setState(() {
+              onDismiss: () {
                 _lastGeneratedTest = null;
                 _lastRecordedStepLabels = const [];
-              }),
+                _safeSetState();
+              },
               onSendToAgent: () => _sendRecordingToAgent(
                 _lastGeneratedTest!,
                 _lastRecordedStepLabels,
@@ -1634,12 +1737,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: () {
-                  setState(() {
-                    _showErrorPanel = !_showErrorPanel;
-                    if (_showErrorPanel) {
-                      _showQueuedMessagesPanel = false;
-                    }
-                  });
+                  _showErrorPanel = !_showErrorPanel;
+                  if (_showErrorPanel) {
+                    _showQueuedMessagesPanel = false;
+                  }
+                  _safeSetState();
                 },
                 child: _ErrorDot(
                   count: widget.errorInterceptor.errors.length,
@@ -1656,13 +1758,15 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 onDismiss: (id) {
                   widget.errorInterceptor.dismiss(id);
                   if (widget.errorInterceptor.errors.isEmpty) {
-                    setState(() => _showErrorPanel = false);
+                    _showErrorPanel = false;
+                    _safeSetState();
                   }
                 },
                 onAddToQueue: (error) {
                   _sendErrorToAgent(error);
                   if (widget.errorInterceptor.errors.isEmpty) {
-                    setState(() => _showErrorPanel = false);
+                    _showErrorPanel = false;
+                    _safeSetState();
                   }
                 },
                 onSendAllToAgent: () {
@@ -1672,65 +1776,84 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   for (final error in errors) {
                     _sendErrorToAgent(error);
                   }
-                  setState(() => _showErrorPanel = false);
+                  _showErrorPanel = false;
+                  _safeSetState();
                 },
                 onClearAll: () {
                   widget.errorInterceptor.clear();
-                  setState(() => _showErrorPanel = false);
+                  _showErrorPanel = false;
+                  _safeSetState();
                 },
               ),
             ),
-          // Text message overlay — kept in tree to preserve state across dismiss
-          if (_textOverlayEverShown)
-            _TextMessageOverlay(
-              visible: _showTextMessageOverlay,
-              onDismiss: () => setState(() => _showTextMessageOverlay = false),
-              onSubmitted: _onTextMessageQueued,
-              onSubmittedAndSent: _onTextMessageSubmittedAndSent,
-              userMessageService: widget.userMessageService,
+          // Text message overlay — always in the tree (like inspector/
+          // annotation layers) so FocusScope is never torn down while
+          // its FocusNodes are still registered as dependents of
+          // go_router's Navigator. Visibility(maintainState: true)
+          // hides it without removing it from the element tree.
+          Positioned.fill(
+            child: FocusScope(
+              child: Visibility(
+                visible: _showTextMessageOverlay,
+                maintainState: true,
+                maintainAnimation: true,
+                maintainSize: false,
+                maintainInteractivity: false,
+                child: _TextMessageOverlay(
+                  visible: _showTextMessageOverlay,
+                  onDismiss: () {
+                    _showTextMessageOverlay = false;
+                    _safeSetState();
+                  },
+                  onSubmitted: _onTextMessageQueued,
+                  onSubmittedAndSent: _onTextMessageSubmittedAndSent,
+                  userMessageService: widget.userMessageService,
+                ),
+              ),
             ),
+          ),
           Positioned(
             top: badgeTop,
             right: badgeRight,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: () {
-                setState(() {
-                  _showErrorPanel = false;
-                  if (_showQueuedMessagesPanel) {
-                    _showQueuedMessagesPanel = false;
-                    _queuedMessagesSnapshot = const [];
-                    return;
-                  }
-                  if (pendingMessages.isEmpty) {
-                    // Nothing queued — enter annotation mode.
-                    if (!widget.annotationService.enabled) {
-                      if (widget.inspectorService.enabled) {
-                        widget.inspectorService.disable();
-                      }
-                      widget.annotationService.enable();
+                _showErrorPanel = false;
+                if (_showQueuedMessagesPanel) {
+                  _showQueuedMessagesPanel = false;
+                  _queuedMessagesSnapshot = const [];
+                  _safeSetState();
+                  return;
+                }
+                if (pendingMessages.isEmpty) {
+                  // Nothing queued — enter annotation mode.
+                  if (!widget.annotationService.enabled) {
+                    if (widget.inspectorService.enabled) {
+                      widget.inspectorService.disable();
                     }
-                    return;
+                    widget.annotationService.enable();
                   }
-                  _queuedMessagesSnapshot =
-                      List<Map<String, dynamic>>.from(pendingMessages);
-                  _showQueuedMessagesPanel = _queuedMessagesSnapshot.isNotEmpty;
-                });
+                  _safeSetState();
+                  return;
+                }
+                _queuedMessagesSnapshot =
+                    List<Map<String, dynamic>>.from(pendingMessages);
+                _showQueuedMessagesPanel = _queuedMessagesSnapshot.isNotEmpty;
+                _safeSetState();
               },
               onLongPressStart: (_) {
-                setState(() {
-                  _isDraggingBadge = true;
-                  _badgeDragStartOffset = _badgeDragOffset ?? Offset.zero;
-                });
+                _isDraggingBadge = true;
+                _badgeDragStartOffset = _badgeDragOffset ?? Offset.zero;
+                _safeSetState();
               },
               onLongPressMoveUpdate: (details) {
-                setState(() {
-                  _badgeDragOffset = (_badgeDragStartOffset ?? Offset.zero) +
-                      details.offsetFromOrigin;
-                });
+                _badgeDragOffset = (_badgeDragStartOffset ?? Offset.zero) +
+                    details.offsetFromOrigin;
+                _safeSetState();
               },
               onLongPressEnd: (_) {
-                setState(() => _isDraggingBadge = false);
+                _isDraggingBadge = false;
+                _safeSetState();
                 if (_badgeDragOffset != null) {
                   unawaited(_saveBadgeOffset(_badgeDragOffset!));
                 }
@@ -1738,21 +1861,20 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               // Cmd+drag to move on web/desktop.
               onPanStart: (details) {
                 if (!HardwareKeyboard.instance.isMetaPressed) return;
-                setState(() {
-                  _isDraggingBadge = true;
-                  _badgeDragStartOffset = _badgeDragOffset ?? Offset.zero;
-                });
+                _isDraggingBadge = true;
+                _badgeDragStartOffset = _badgeDragOffset ?? Offset.zero;
+                _safeSetState();
               },
               onPanUpdate: (details) {
                 if (!_isDraggingBadge) return;
-                setState(() {
-                  _badgeDragOffset = (_badgeDragOffset ?? Offset.zero) +
-                      details.delta;
-                });
+                _badgeDragOffset = (_badgeDragOffset ?? Offset.zero) +
+                    details.delta;
+                _safeSetState();
               },
               onPanEnd: (_) {
                 if (_isDraggingBadge) {
-                  setState(() => _isDraggingBadge = false);
+                  _isDraggingBadge = false;
+                  _safeSetState();
                   if (_badgeDragOffset != null) {
                     unawaited(_saveBadgeOffset(_badgeDragOffset!));
                   }
@@ -1778,10 +1900,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 onDeleteMessage: _removeQueuedMessage,
                 onClearAll: _clearQueuedMessages,
                 onStartRecording: () {
-                  setState(() {
-                    _showQueuedMessagesPanel = false;
-                    _queuedMessagesSnapshot = const [];
-                  });
+                  _showQueuedMessagesPanel = false;
+                  _queuedMessagesSnapshot = const [];
+                  _safeSetState();
                   _toggleRecording();
                 },
                 onSend: () {
@@ -1795,11 +1916,10 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                     widget.annotationService.disable();
                   }
                   unawaited(_flushToServer(clearOnChannelDelivery: true));
-                  setState(() {
-                    _showQueuedMessagesPanel = false;
-                    _queuedMessagesSnapshot = const [];
-                    _annotationDraftQueueId = null;
-                  });
+                  _showQueuedMessagesPanel = false;
+                  _queuedMessagesSnapshot = const [];
+                  _annotationDraftQueueId = null;
+                  _safeSetState();
                 },
                 onSaveAnnotation: _applyQueuedAnnotationEdit,
                 onDeleteAnnotation: _removeQueuedAnnotation,
@@ -1969,11 +2089,13 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
   final FocusNode _focusNode = FocusNode();
   final TextEditingController _textController = TextEditingController();
   late final FocusNode _textFocusNode;
+  bool _wasEnabled = false;
 
   @override
   void initState() {
     super.initState();
     _textFocusNode = FocusNode(onKeyEvent: _handleTextFieldKey);
+    _wasEnabled = widget.service.enabled;
     widget.service.addListener(_onChanged);
   }
 
@@ -2001,7 +2123,19 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
   }
 
   void _onChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+
+    // Unfocus when inspector becomes disabled so the FocusNodes don't
+    // hold stale InheritedElement dependencies on go_router's Navigator
+    // scope across route changes (causes framework assertion).
+    final enabled = widget.service.enabled;
+    if (_wasEnabled && !enabled) {
+      _focusNode.unfocus();
+      _textFocusNode.unfocus();
+    }
+    _wasEnabled = enabled;
+
+    setState(() {});
   }
 
   void _submitMessage(String text) async {
@@ -2012,7 +2146,7 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
     final data = <String, dynamic>{};
 
     // Include current route/URL
-    final routeName = _currentRouteName();
+    final routeName = _currentRouteName(context);
     if (routeName != null) {
       data['currentRoute'] = routeName;
     }
@@ -2201,11 +2335,13 @@ class _AnnotationOverlay extends StatefulWidget {
 class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   final TextEditingController _textController = TextEditingController();
   late final FocusNode _textFocusNode;
+  bool _wasEnabled = false;
 
   @override
   void initState() {
     super.initState();
     _textFocusNode = FocusNode(onKeyEvent: _handleTextFieldKey);
+    _wasEnabled = widget.service.enabled;
     widget.service.addListener(_onChanged);
     widget.userMessageService.addListener(_onChanged);
   }
@@ -2243,9 +2379,18 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   }
 
   void _onChanged() {
-    if (mounted) {
-      setState(() {});
+    if (!mounted) return;
+
+    // Unfocus when annotation mode becomes disabled so the FocusNode
+    // doesn't hold stale InheritedElement dependencies on go_router's
+    // Navigator scope across route changes (causes framework assertion).
+    final enabled = widget.service.enabled;
+    if (_wasEnabled && !enabled) {
+      _textFocusNode.unfocus();
     }
+    _wasEnabled = enabled;
+
+    setState(() {});
   }
 
   @override
@@ -2556,7 +2701,7 @@ class _TextMessageOverlay extends StatefulWidget {
 
 class _TextMessageOverlayState extends State<_TextMessageOverlay> {
   final TextEditingController _controller = TextEditingController();
-  final FocusNode _focusNode = FocusNode();
+  late final FocusNode _focusNode;
   final DrawingService _drawingService = DrawingService();
   final TextEditingController _floatingTextController = TextEditingController();
   final FocusNode _floatingTextFocusNode = FocusNode();
@@ -2569,21 +2714,38 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
   @override
   void initState() {
     super.initState();
+    // The _SubmitOnEnterFormatter only detects plain Enter, because a plain
+    // Enter inserts a '\n' into the buffer.  Cmd/Ctrl+Enter is swallowed by
+    // the platform text-input layer as a shortcut and never reaches the
+    // formatter, so the input field needs its own key handler to catch it.
+    _focusNode = FocusNode(onKeyEvent: _handleTextFieldKey);
     widget.userMessageService.addListener(_onServiceChanged);
     _drawingService.addListener(_onDrawingChanged);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _focusNode.requestFocus();
-    });
+    // Only request focus if already visible on first build. When the
+    // overlay lives permanently in the tree via Visibility(maintainState:
+    // true), initState fires at app startup before the overlay is shown,
+    // and an unconditional requestFocus() would register _focusNode as a
+    // dependent of the Navigator's _FocusInheritedScope while hidden.
+    if (widget.visible) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _focusNode.requestFocus();
+      });
+    }
   }
 
   @override
   void didUpdateWidget(covariant _TextMessageOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // Re-focus text field when overlay becomes visible again
     if (widget.visible && !oldWidget.visible) {
+      // Re-focus text field when overlay becomes visible again.
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        _focusNode.requestFocus();
+        if (mounted) _focusNode.requestFocus();
       });
+    } else if (!widget.visible && oldWidget.visible) {
+      // Unfocus when hidden so the FocusNode doesn't hold a stale
+      // dependency on the Navigator's _FocusInheritedScope across
+      // route changes (causes framework assertion).
+      _focusNode.unfocus();
     }
   }
 
@@ -2600,11 +2762,38 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
   }
 
   void _onServiceChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    // Defer setState to avoid marking a Visibility(maintainState: true)
+    // subtree dirty during an active build/layout phase, which causes
+    // "dirty widget in wrong build scope" assertions from the framework.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() {});
+    });
   }
 
   void _onDrawingChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  /// Intercepts Cmd/Ctrl+Enter in the message text field and submits-and-sends.
+  ///
+  /// Cmd+Enter never inserts a newline into the buffer (the platform text
+  /// layer treats it as a shortcut), so [_SubmitOnEnterFormatter] — which
+  /// only fires on a '\n' insertion — never sees it.  Returning [handled]
+  /// also stops the event from propagating, so no stray newline is inserted.
+  KeyEventResult _handleTextFieldKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event.logicalKey != LogicalKeyboardKey.enter) {
+      return KeyEventResult.ignored;
+    }
+    final isCmdHeld = HardwareKeyboard.instance.isMetaPressed ||
+        HardwareKeyboard.instance.isControlPressed;
+    if (!isCmdHeld) return KeyEventResult.ignored;
+    _handleSubmit(andSend: true);
+    return KeyEventResult.handled;
   }
 
   Future<void> _handleSubmit({bool andSend = false}) async {
@@ -2618,6 +2807,15 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
       // Nothing to send
       return;
     }
+    // Explicitly unfocus before calling the submit callback. The callback
+    // calls notifyListeners() synchronously, which triggers the parent to
+    // call setState(). If a FocusNode is still active at that point, the
+    // FocusScope rebuild races with focus cleanup — causing
+    // "_dependents.isEmpty" / "wrong build scope" framework assertions.
+    // (Same pattern as _InspectorOverlayState._onChanged which unfocuses
+    // before any state change propagates.)
+    _focusNode.unfocus();
+    _floatingTextFocusNode.unfocus();
     // Clear content on successful submit
     _controller.clear();
     _drawingService.clear();
@@ -2631,16 +2829,21 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
 
   @override
   Widget build(BuildContext context) {
-    if (!widget.visible) {
-      return const SizedBox.shrink();
-    }
-
     final isWaiting = widget.userMessageService.waitingForActivity;
     final activeTool = _drawingService.activeTool;
 
-    return Positioned.fill(
-      child: LayoutBuilder(
-        builder: (context, constraints) {
+    // Use Offstage instead of returning SizedBox.shrink() when not visible.
+    // Returning a different widget type tears down the EditableText subtree,
+    // which deactivates the FocusNode while it may still be registered with
+    // the Navigator's inherited scope — causing "_dependents.isEmpty" and
+    // "wrong build scope" framework assertions. Offstage keeps the full
+    // element tree alive (including EditableText and its FocusNode) but
+    // removes it from layout and painting.
+    return Offstage(
+      offstage: !widget.visible,
+      child: SizedBox.expand(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
           const dialogWidth = 480.0;
           final maxDialogHeight = _showShortcuts ? 560.0 : 300.0;
           _lastConstraints = constraints;
@@ -2779,9 +2982,10 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
                 _buildFloatingTextInput(_drawingService.pendingTextPosition!),
             ],
           );
-        },
+          },
+        ),
       ),
-    );
+    ); // Offstage
   }
 
   Widget _buildFloatingTextInput(Offset position) {
@@ -4528,8 +4732,8 @@ class _ErrorPanel extends StatelessWidget {
     return Material(
       type: MaterialType.transparency,
       child: Container(
-        width: 340,
-        constraints: const BoxConstraints(maxHeight: 400),
+        width: 380,
+        constraints: const BoxConstraints(maxHeight: 600),
         decoration: BoxDecoration(
           color: const Color(0xF02A1010),
           borderRadius: BorderRadius.circular(10),
@@ -4575,16 +4779,27 @@ class _ErrorPanel extends StatelessWidget {
                   ),
                   const Spacer(),
                   _ErrorPanelButton(
+                    label: 'Copy all',
+                    onTap: () {
+                      final text = errors.map((e) {
+                        final lines = e.details.split('\n');
+                        return lines.length > 20
+                            ? lines.take(20).join('\n')
+                            : e.details;
+                      }).join('\n\n---\n\n');
+                      Clipboard.setData(ClipboardData(text: text));
+                    },
+                  ),
+                  const SizedBox(width: 4),
+                  _ErrorPanelButton(
                     label: 'Send all',
                     onTap: onSendAllToAgent,
                   ),
-                  if (errors.length > 1) ...[
-                    const SizedBox(width: 4),
-                    _ErrorPanelButton(
-                      label: 'Clear all',
-                      onTap: onClearAll,
-                    ),
-                  ],
+                  const SizedBox(width: 4),
+                  _ErrorPanelButton(
+                    label: 'Clear all',
+                    onTap: onClearAll,
+                  ),
                 ],
               ),
             ),
@@ -4612,7 +4827,7 @@ class _ErrorPanel extends StatelessWidget {
   }
 }
 
-class _ErrorPanelItem extends StatelessWidget {
+class _ErrorPanelItem extends StatefulWidget {
   const _ErrorPanelItem({
     required this.error,
     required this.onDismiss,
@@ -4624,11 +4839,14 @@ class _ErrorPanelItem extends StatelessWidget {
   final VoidCallback onAddToQueue;
 
   @override
-  Widget build(BuildContext context) {
-    final display = error.summary.length > 200
-        ? '${error.summary.substring(0, 200)}...'
-        : error.summary;
+  State<_ErrorPanelItem> createState() => _ErrorPanelItemState();
+}
 
+class _ErrorPanelItemState extends State<_ErrorPanelItem> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       child: Container(
@@ -4641,29 +4859,68 @@ class _ErrorPanelItem extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                display,
+              SelectableText(
+                widget.error.summary,
                 style: const TextStyle(
                   color: Color(0xFFFFCDD2),
                   fontSize: 11,
                   height: 1.4,
                   decoration: TextDecoration.none,
                 ),
-                maxLines: 4,
-                overflow: TextOverflow.ellipsis,
+                maxLines: _expanded ? null : 4,
               ),
+              if (widget.error.details.isNotEmpty &&
+                  widget.error.details != widget.error.summary) ...[
+                const SizedBox(height: 4),
+                GestureDetector(
+                  onTap: () => setState(() => _expanded = !_expanded),
+                  child: Text(
+                    _expanded ? 'Show less' : 'Show full trace',
+                    style: const TextStyle(
+                      color: Color(0xFFFF8A80),
+                      fontSize: 10,
+                      decoration: TextDecoration.underline,
+                      decorationColor: Color(0xFFFF8A80),
+                    ),
+                  ),
+                ),
+                if (_expanded) ...[
+                  const SizedBox(height: 4),
+                  SelectableText(
+                    widget.error.details,
+                    style: const TextStyle(
+                      color: Color(0xFFFFAB91),
+                      fontSize: 10,
+                      height: 1.4,
+                      fontFamily: 'monospace',
+                      decoration: TextDecoration.none,
+                    ),
+                  ),
+                ],
+              ],
               const SizedBox(height: 6),
               Row(
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
                   _ErrorPanelButton(
+                    label: 'Copy',
+                    onTap: () {
+                      final lines = widget.error.details.split('\n');
+                      final text = lines.length > 20
+                          ? lines.take(20).join('\n')
+                          : widget.error.details;
+                      Clipboard.setData(ClipboardData(text: text));
+                    },
+                  ),
+                  const SizedBox(width: 4),
+                  _ErrorPanelButton(
                     label: 'Send',
-                    onTap: onAddToQueue,
+                    onTap: widget.onAddToQueue,
                   ),
                   const SizedBox(width: 4),
                   _ErrorPanelButton(
                     label: 'Dismiss',
-                    onTap: onDismiss,
+                    onTap: widget.onDismiss,
                   ),
                 ],
               ),
