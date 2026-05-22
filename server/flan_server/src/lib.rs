@@ -5,6 +5,7 @@ use std::{
     net::TcpStream,
     path::PathBuf,
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -194,6 +195,39 @@ pub struct Association {
     pub flutter_pid: u32,
 }
 
+/// An annotated feedback message sent by a web (React) client over the
+/// `/ws` WebSocket. Web apps have no Dart VM, so — unlike Flutter apps,
+/// which host their own queue — their messages are queued server-side in
+/// [`SharedState::web_queue`] and drained by the MCP server's
+/// `process_queue` tool.
+///
+/// `text` is required; everything else is optional context the web
+/// inspector/annotation tools attach. Unknown fields are preserved as
+/// `extra` so the payload shape can evolve without a server change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebMessage {
+    /// Server-assigned monotonic id, set on receipt (clients omit it).
+    #[serde(default)]
+    pub queue_id: u64,
+    /// ISO-8601 receipt timestamp, set by the server.
+    #[serde(default)]
+    pub timestamp: String,
+    /// Message kind, e.g. "user_feedback". Defaults to "user_feedback".
+    #[serde(default = "default_web_message_type")]
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// The user's message text (required).
+    pub text: String,
+    /// Optional structured context (annotations, selector, sourceHint,
+    /// screenshot/drawing data URLs, etc.). Passed through verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+fn default_web_message_type() -> String {
+    "user_feedback".to_string()
+}
+
 /// Represents the floss desktop agent (system-wide interaction target).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopTarget {
@@ -232,6 +266,12 @@ pub struct SharedState {
     /// login_pid is the trm-direct-child login that is an ancestor of the
     /// flan-channel process.
     pub channel_ports_by_login: RwLock<HashMap<u32, u16>>,
+    /// Server-side message queue for web (React) clients. Web apps cannot
+    /// host their own queue the way Flutter apps do, so annotated feedback
+    /// arriving on `/ws` is buffered here and drained by the MCP server.
+    pub web_queue: RwLock<Vec<WebMessage>>,
+    /// Monotonic counter assigning `queue_id`s to web messages.
+    pub web_queue_seq: AtomicU64,
 }
 
 impl SharedState {
@@ -248,6 +288,8 @@ impl SharedState {
             channel_ports: RwLock::new(HashMap::new()),
             channel_ports_by_cwd: RwLock::new(HashMap::new()),
             channel_ports_by_login: RwLock::new(HashMap::new()),
+            web_queue: RwLock::new(Vec::new()),
+            web_queue_seq: AtomicU64::new(1),
         }
     }
 
@@ -278,9 +320,12 @@ impl SharedState {
 mod server {
     use super::*;
     use axum::{
-        extract::{Query, State},
+        extract::{
+            ws::{Message, WebSocket, WebSocketUpgrade},
+            Query, State,
+        },
         http::StatusCode,
-        response::{Html, IntoResponse},
+        response::{Html, IntoResponse, Response},
         routing::{delete, get, post},
         Json, Router,
     };
@@ -852,6 +897,131 @@ mod server {
         Html(include_str!("../static/index.html"))
     }
 
+    // ── Web channel (React clients) ─────────────────────────────────────
+    //
+    // A web app has no Dart VM and cannot host its own message queue the
+    // way a Flutter app does. Instead, `flan_web` clients open a WebSocket
+    // to `/ws` and push annotated feedback as JSON `WebMessage`s; the
+    // server buffers them in `SharedState::web_queue`, and the MCP server
+    // drains that queue through the `/api/web-messages/*` endpoints.
+
+    /// Frame received on the `/ws` socket. A bare message (no `kind`) is
+    /// treated as a `WebMessage`; `{"kind":"ping"}` is answered with a pong.
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    enum WebSocketIncoming {
+        Control { kind: String },
+        Message(WebMessage),
+    }
+
+    /// GET /ws — upgrade to a WebSocket for a web (React) client.
+    async fn handle_web_socket(
+        ws: WebSocketUpgrade,
+        State(state): State<Arc<SharedState>>,
+    ) -> Response {
+        ws.on_upgrade(move |socket| web_socket_loop(socket, state))
+    }
+
+    /// Per-connection loop: parse incoming frames, enqueue `WebMessage`s,
+    /// and answer control pings. Server→client frames carry queue depth so
+    /// the web overlay can show a "queued" indicator.
+    async fn web_socket_loop(mut socket: WebSocket, state: Arc<SharedState>) {
+        tracing::info!("web client connected on /ws");
+        let _ = socket
+            .send(Message::Text(web_status_frame(&state).await.into()))
+            .await;
+
+        while let Some(frame) = socket.recv().await {
+            let Ok(frame) = frame else { break };
+            match frame {
+                Message::Text(text) => {
+                    match serde_json::from_str::<WebSocketIncoming>(&text) {
+                        Ok(WebSocketIncoming::Control { kind }) if kind == "ping" => {
+                            let _ = socket
+                                .send(Message::Text(
+                                    r#"{"kind":"pong"}"#.to_string().into(),
+                                ))
+                                .await;
+                        }
+                        Ok(WebSocketIncoming::Control { kind }) => {
+                            tracing::debug!("web /ws: ignoring control frame '{}'", kind);
+                        }
+                        Ok(WebSocketIncoming::Message(msg)) => {
+                            let depth = enqueue_web_message(&state, msg).await;
+                            // Echo back the new queue depth as an ack.
+                            let _ = socket
+                                .send(Message::Text(
+                                    web_status_frame(&state).await.into(),
+                                ))
+                                .await;
+                            tracing::info!("web /ws: queued message (depth={})", depth);
+                        }
+                        Err(err) => {
+                            tracing::warn!("web /ws: bad frame: {err}");
+                        }
+                    }
+                }
+                Message::Ping(payload) => {
+                    let _ = socket.send(Message::Pong(payload)).await;
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        tracing::info!("web client disconnected from /ws");
+    }
+
+    /// Assigns a queue id + timestamp to `msg`, appends it to `web_queue`,
+    /// and returns the resulting queue depth.
+    async fn enqueue_web_message(state: &Arc<SharedState>, mut msg: WebMessage) -> usize {
+        msg.queue_id = state.web_queue_seq.fetch_add(1, Ordering::Relaxed);
+        msg.timestamp = chrono_now();
+        let preview: String = msg.text.chars().take(60).collect();
+        state
+            .log("in", format!("Web message: {preview}"), None, true)
+            .await;
+        let mut queue = state.web_queue.write().await;
+        queue.push(msg);
+        queue.len()
+    }
+
+    /// A small JSON status frame sent to web clients (current queue depth).
+    async fn web_status_frame(state: &Arc<SharedState>) -> String {
+        let depth = state.web_queue.read().await.len();
+        format!(r#"{{"kind":"status","queued":{depth}}}"#)
+    }
+
+    /// GET /api/web-messages — peek the web queue without draining it.
+    async fn get_web_messages(State(state): State<Arc<SharedState>>) -> impl IntoResponse {
+        let queue = state.web_queue.read().await;
+        Json(serde_json::json!({
+            "count": queue.len(),
+            "messages": &*queue,
+        }))
+    }
+
+    /// POST /api/web-messages/consume — drain and return the web queue.
+    async fn consume_web_messages(State(state): State<Arc<SharedState>>) -> impl IntoResponse {
+        let drained: Vec<WebMessage> = {
+            let mut queue = state.web_queue.write().await;
+            std::mem::take(&mut *queue)
+        };
+        Json(serde_json::json!({
+            "count": drained.len(),
+            "messages": drained,
+        }))
+    }
+
+    /// Accept a `WebMessage` over plain HTTP as well — useful for clients
+    /// that cannot hold a WebSocket open, and for testing with `curl`.
+    async fn post_web_message(
+        State(state): State<Arc<SharedState>>,
+        Json(msg): Json<WebMessage>,
+    ) -> impl IntoResponse {
+        let depth = enqueue_web_message(&state, msg).await;
+        Json(serde_json::json!({ "ok": true, "queued": depth }))
+    }
+
     /// Build the Axum router using the given shared state.
     pub fn build_router(state: Arc<SharedState>) -> Router {
         let cors = CorsLayer::new()
@@ -882,6 +1052,12 @@ mod server {
             .route("/api/status", get(get_status))
             .route("/api/logs", get(get_activity_log))
             .route("/api/trm-debug", get(get_trm_debug))
+            .route("/ws", get(handle_web_socket))
+            .route(
+                "/api/web-messages",
+                get(get_web_messages).post(post_web_message),
+            )
+            .route("/api/web-messages/consume", post(consume_web_messages))
             .layer(cors)
             .layer(TraceLayer::new_for_http())
             .with_state(state)

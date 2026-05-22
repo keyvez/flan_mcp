@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:logging/logging.dart' as logging;
 import 'package:flan_mcp/src/utils/num_parser.dart';
@@ -147,6 +148,71 @@ final class VmServiceContext {
       _logger.warning('Failed to drain user messages ($origin)', err, st);
     } finally {
       _isDrainingMessages = false;
+    }
+  }
+
+  /// Drains the flan_server's server-side web-message queue and appends any
+  /// messages to [_bufferedMessages].
+  ///
+  /// Web (React) apps have no Dart VM, so their annotated feedback is queued
+  /// in the Rust `flan_server` rather than inside the app. This polls the
+  /// server's `/api/web-messages/consume` endpoint so `process_queue` /
+  /// `get_user_message` surface web and Flutter messages uniformly. It is
+  /// independent of the VM connection — web feedback works even when no
+  /// Flutter app is connected.
+  ///
+  /// Best-effort: if the flan_server is not running, this is a silent no-op.
+  /// Returns the number of web messages added.
+  Future<int> _drainWebQueue({required String origin}) async {
+    final port =
+        int.tryParse(Platform.environment['FLAN_SERVER_PORT'] ?? '') ?? 4050;
+    HttpClient? client;
+    try {
+      client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 2);
+      final request = await client.postUrl(
+        Uri.parse('http://127.0.0.1:$port/api/web-messages/consume'),
+      );
+      final response = await request.close().timeout(
+        const Duration(seconds: 3),
+      );
+      if (response.statusCode != 200) {
+        return 0;
+      }
+      final body = await response.transform(utf8.decoder).join();
+      final decoded = jsonDecode(body) as Map<String, dynamic>;
+      final messages = (decoded['messages'] as List<dynamic>?)
+              ?.cast<Map<String, dynamic>>() ??
+          const <Map<String, dynamic>>[];
+      if (messages.isEmpty) return 0;
+
+      // Normalize web messages into the same shape Flutter messages use so
+      // _formatUserMessages and the image-extraction logic work unchanged.
+      for (final m in messages) {
+        _bufferedMessages.add(<String, dynamic>{
+          'queueId': m['queue_id'],
+          'type': m['type'] ?? 'user_feedback',
+          'text': m['text'] ?? '(no text)',
+          'timestamp': m['timestamp'],
+          if (m['data'] != null) 'data': m['data'],
+          'source': 'web',
+        });
+      }
+      _lastMessageReceivedAt = DateTime.now().toUtc();
+      _logger.info(
+        'Drained ${messages.length} web message(s) from flan_server ($origin)',
+      );
+      return messages.length;
+    } on TimeoutException {
+      return 0;
+    } on SocketException {
+      // flan_server not running — expected when only a Flutter app is in use.
+      return 0;
+    } catch (err) {
+      _logger.fine('Failed to drain web queue ($origin): $err');
+      return 0;
+    } finally {
+      client?.close(force: true);
     }
   }
 
@@ -1284,11 +1350,13 @@ final class VmServiceContext {
       ..registerTool(
         'get_user_message',
         description:
-            'Retrieves pending messages sent by the user from the Flutter app. '
-            'The user can use the inspector (Ctrl+Shift+H) to select a widget '
-            'and type a message, or use annotations (Ctrl+Shift+A) to draw on '
-            'the screen. Messages include the selected widget details (type, '
-            'path, source location, properties) and any user instructions. '
+            'Retrieves pending messages sent by the user from the Flutter app '
+            'or a flan_web React client. The user can use the inspector '
+            '(Ctrl+Shift+H) to select a widget/DOM element and type a '
+            'message, or use annotations (Ctrl+Shift+A) to draw on the '
+            'screen. Messages include the selected widget details (type, '
+            'path, source location, properties) for Flutter, or DOM selector '
+            'and source hint for web, plus any user instructions. '
             'This tool consumes and returns those messages. '
             'IMPORTANT: When the message includes a widget selection, the '
             'widget details (type, source location, bounds) are already '
@@ -1307,7 +1375,11 @@ final class VmServiceContext {
           _logger.info('Getting user messages');
 
           try {
+            // Drain both the Flutter app queue (VM service) and the
+            // server-side web-client queue. The web drain works even with
+            // no VM connection.
             await _drainMessagesAndNotify(origin: 'get_user_message');
+            await _drainWebQueue(origin: 'get_user_message');
             final allMessages = List<Map<String, dynamic>>.from(
               _bufferedMessages,
             );
@@ -1365,12 +1437,15 @@ final class VmServiceContext {
       ..registerTool(
         'process_queue',
         description:
-            'Consumes and returns queued user messages from the Flutter app '
-            'until the queue is drained. Use this after the user sends a batch '
-            'of instructions, then run it once to process all pending items. '
-            'Messages include selected-widget metadata and optional images. '
-            'After applying changes, verify with inspect_widget_at when '
-            'possible instead of full screenshots.',
+            'Consumes and returns queued user messages until the queue is '
+            'drained. Sources both the Flutter app queue (when connected) and '
+            'the server-side web queue used by flan_web React clients — web '
+            'feedback is processed even with no Flutter app connected. Use '
+            'this after the user sends a batch of instructions, then run it '
+            'once to process all pending items. Messages include '
+            'selected-widget metadata (Flutter) or DOM selector / source hint '
+            '(web) and optional images. After applying changes, verify with '
+            'inspect_widget_at when possible instead of full screenshots.',
         annotations: const ToolAnnotations(
           title: 'Process Queue',
           readOnlyHint: true,
@@ -1414,26 +1489,21 @@ final class VmServiceContext {
             final allMessages = <Map<String, dynamic>>[];
 
             while (DateTime.now().isBefore(deadline)) {
-              // Bail out immediately if the connection was lost.
-              if (!connector.isConnected) {
-                return CallToolResult(
-                  isError: true,
-                  content: [
-                    const TextContent(
-                      text:
-                          'Connection to the Flutter app was lost. '
-                          'Use the connect tool to reconnect.',
-                    ),
-                  ],
-                );
+              // Drain the Flutter app queue when connected, and always drain
+              // the server-side web queue. If the VM connection dropped but
+              // web feedback is still arriving, keep processing rather than
+              // failing — web clients do not need a VM connection.
+              if (connector.isConnected) {
+                await _drainMessagesAndNotify(origin: 'process_queue');
               }
-
-              await _drainMessagesAndNotify(origin: 'process_queue');
+              await _drainWebQueue(origin: 'process_queue');
 
               if (_bufferedMessages.isNotEmpty) {
                 allMessages.addAll(_bufferedMessages);
                 _bufferedMessages.clear();
               } else if (allMessages.isEmpty) {
+                // First drain found nothing in either queue — return now
+                // rather than idling for the full max_wait_seconds.
                 return CallToolResult(
                   content: [
                     const TextContent(text: 'No pending user messages'),
@@ -1458,7 +1528,18 @@ final class VmServiceContext {
                   remaining < waitWindow ? remaining : waitWindow,
                 );
               } on TimeoutException {
-                // Queue stayed idle for the configured window: done.
+                // The Flutter queue stayed idle for the configured window.
+                // Web messages arrive over HTTP and cannot complete the
+                // VM-event completer, so do one last web drain before
+                // finishing — otherwise a web message that landed during
+                // this wait window would be missed until the next call.
+                final lateWebCount =
+                    await _drainWebQueue(origin: 'process_queue-idle');
+                if (lateWebCount > 0) {
+                  allMessages.addAll(_bufferedMessages);
+                  _bufferedMessages.clear();
+                  continue;
+                }
                 break;
               }
             }
@@ -1581,7 +1662,12 @@ final class VmServiceContext {
 
     for (final m in messages) {
       final text = m['text'] as String? ?? '(no text)';
-      buffer.writeln(text);
+      final isWeb = m['source'] == 'web';
+      buffer.writeln(isWeb ? '[web] $text' : text);
+      final data = m['data'] as Map<String, dynamic>?;
+      if (isWeb && data != null) {
+        _appendWebContext(buffer, data);
+      }
       buffer.writeln();
     }
 
@@ -1607,6 +1693,45 @@ final class VmServiceContext {
     }
 
     return CallToolResult(content: contentList);
+  }
+
+  /// Appends web-specific context (DOM selector, source hint, annotations,
+  /// current URL) from a web message's `data` payload to [buffer].
+  void _appendWebContext(StringBuffer buffer, Map<String, dynamic> data) {
+    final url = data['url'];
+    if (url is String && url.isNotEmpty) {
+      buffer.writeln('  URL: $url');
+    }
+    final selector = data['selector'];
+    if (selector is String && selector.isNotEmpty) {
+      buffer.writeln('  Selector: $selector');
+    }
+    final sourceHint = data['sourceHint'];
+    if (sourceHint is String && sourceHint.isNotEmpty) {
+      buffer.writeln('  Source: $sourceHint');
+    }
+    final componentName = data['componentName'];
+    if (componentName is String && componentName.isNotEmpty) {
+      buffer.writeln('  Component: $componentName');
+    }
+    final annotations = data['annotations'];
+    if (annotations is List && annotations.isNotEmpty) {
+      buffer.writeln('  ${annotations.length} annotation(s):');
+      for (final a in annotations) {
+        if (a is! Map) continue;
+        final label = a['text'] ?? a['label'] ?? '(no label)';
+        final aSelector = a['selector'];
+        final aSource = a['sourceHint'];
+        final line = StringBuffer('    - "$label"');
+        if (aSelector is String && aSelector.isNotEmpty) {
+          line.write(' @ $aSelector');
+        }
+        if (aSource is String && aSource.isNotEmpty) {
+          line.write(' ($aSource)');
+        }
+        buffer.writeln(line.toString());
+      }
+    }
   }
 
   /// Formats an inspector selection for display.
