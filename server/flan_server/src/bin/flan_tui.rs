@@ -1479,6 +1479,22 @@ async fn main() -> io::Result<()> {
                                     let vm_uri = flutter.vm_service_uri.clone();
 
                                     let assoc = app.assoc_for_flutter(pid).cloned();
+                                    // The association must still resolve to a live linked
+                                    // receiver — a Claude-bearing entry that currently
+                                    // exists. claude_entries() only contains entries with
+                                    // Claude running, so a match here means the receiver is
+                                    // live. Without it a flush would silently fall back to
+                                    // text injection into a dead/missing pane and the
+                                    // message would be lost — refuse and tell the user.
+                                    let receiver_live = assoc.as_ref().is_some_and(|a| {
+                                        app.claude_entries()
+                                            .iter()
+                                            .any(|e| e.id() == a.claude_surface_id)
+                                    });
+                                    if assoc.is_some() && !receiver_live {
+                                        app.set_toast("No linked receiver — message not sent (link it first)");
+                                        continue;
+                                    }
                                     if let Some(assoc) = assoc {
                                         // Re-probe at flush time if not in cache — the
                                         // discovery cycle may have missed the URI.

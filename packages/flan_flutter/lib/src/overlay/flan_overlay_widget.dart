@@ -187,35 +187,80 @@ Future<String?> _buildQueueThumbnailFromScreenshot({
   }
 }
 
-/// Returns the current route/URL for the active screen.
+/// Captures everything we can reasonably learn about the user's current
+/// location in the app, so the agent has a referent when the user says
+/// "fix this" without a widget selection.
 ///
-/// Prefers the live URL exposed by the app's [Router] (this is what
-/// go_router and any other [Router]-based navigation populate — e.g.
-/// `/orders/42?tab=items`). Falls back to the deepest [ModalRoute]'s
-/// `settings.name`, which is what plain `Navigator.pushNamed` apps use.
+/// Three distinct signals are surfaced — each populated independently
+/// because real apps use one, the other, or both:
 ///
-/// [context] is optional only so legacy call sites compile; pass one
-/// whenever available so the [Router] lookup can run — without it the
-/// URL cannot be resolved for go_router apps.
-String? _currentRouteName([BuildContext? context]) {
+///  - `url` — the platform URL exposed by the app's [Router], e.g.
+///    `/orders/42?tab=items` for go_router or the browser address bar
+///    on web. Comes from `Router.routeInformationProvider?.value.uri`.
+///  - `routeStack` — the in-app navigation breadcrumb: the
+///    `settings.name`s of every active [ModalRoute] from root to top,
+///    as a `"/" `-joined string. Populated for any app whose routes are
+///    named, including those that use plain `Navigator.pushNamed`.
+///  - `currentRoute` — the deepest active route's name. Kept as a
+///    single field for backward-compat with the channel formatter.
+class _NavContext {
+  const _NavContext({this.url, this.routeStack, this.currentRoute});
+  final String? url;
+  final String? routeStack;
+  final String? currentRoute;
+
+  /// Merges any non-null fields into [data] using the keys the channel
+  /// formatter reads (`url`, `routeStack`, `currentRoute`).
+  void applyTo(Map<String, dynamic> data) {
+    if (url != null && url!.isNotEmpty) data['url'] = url;
+    if (routeStack != null && routeStack!.isNotEmpty) {
+      data['routeStack'] = routeStack;
+    }
+    if (currentRoute != null && currentRoute!.isNotEmpty) {
+      data['currentRoute'] = currentRoute;
+    }
+  }
+}
+
+_NavContext _collectNavigationContext(BuildContext? context) {
+  String? url;
   if (context != null) {
     try {
       final router = Router.maybeOf(context);
       final uri = router?.routeInformationProvider?.value.uri;
       if (uri != null) {
         final asString = uri.toString();
-        if (asString.isNotEmpty) return asString;
+        if (asString.isNotEmpty) url = asString;
       }
     } catch (_) {
-      // Fall through to the ModalRoute-based lookup below.
+      // Router lookup is best-effort — fall through to the binding walk.
     }
   }
+
+  String? currentRoute;
+  String? routeStack;
   try {
-    return FlanBinding.instance.getCurrentRouteName();
+    final binding = FlanBinding.instance;
+    final stack = binding.getCurrentRouteStack();
+    if (stack.isNotEmpty) {
+      routeStack = stack.join(' / ');
+      currentRoute = stack.last;
+    } else {
+      // Some apps name only the top-level route; preserve the legacy
+      // single-name signal if the stack walk found nothing nameable.
+      currentRoute = binding.getCurrentRouteName();
+    }
   } catch (_) {
-    return null;
+    // Binding may be uninitialised in tests — leave the fields null.
   }
+
+  return _NavContext(
+    url: url,
+    routeStack: routeStack,
+    currentRoute: currentRoute,
+  );
 }
+
 
 Size _resolveViewportSize(BuildContext context) {
   final mediaSize = MediaQuery.maybeSizeOf(context);
@@ -899,12 +944,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       stepsBlock = buf.toString().trimRight();
     }
 
-    final routeName = _currentRouteName(context);
     final data = <String, dynamic>{
       'kind': 'recorded_integration_test',
       'testSource': source,
-      if (routeName != null) 'currentRoute': routeName,
     };
+    _collectNavigationContext(context).applyTo(data);
 
     widget.userMessageService.sendMessage({
       'type': 'user_feedback',
@@ -993,10 +1037,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       widget.userMessageService.clearWaiting();
     }
     final data = <String, dynamic>{'userMessage': text};
-    final routeName = _currentRouteName(context);
-    if (routeName != null) {
-      data['currentRoute'] = routeName;
-    }
+    // Attach every navigation signal we can capture (platform URL +
+    // in-app route stack + deepest route name). The command overlay
+    // sends bare text with no widget selection, so this is the only
+    // referent the agent has for "this" / "fix that".
+    _collectNavigationContext(context).applyTo(data);
     if (drawingBase64 != null) {
       data['drawingImage'] = drawingBase64;
     }
@@ -1021,11 +1066,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     final parts = <String>[];
     final data = <String, dynamic>{};
 
-    // Include current route/URL
-    final routeName = _currentRouteName(context);
-    if (routeName != null) {
-      data['currentRoute'] = routeName;
-    }
+    // Include URL, route stack, and current route name.
+    _collectNavigationContext(context).applyTo(data);
 
     // Include inspector selection if available
     final selection = widget.inspectorService.lastSelection;
@@ -1319,6 +1361,12 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     // to the channel server.
     unawaited(() async {
       int channelPort = 4051; // default
+      // Whether the flan server resolved a *real* linked channel for this app.
+      // The server only returns a channel_port when it found a Claude Code
+      // surface with a registered channel — i.e. an actual receiver. Without it
+      // there is no link, and pushing to the default port would hit a stale or
+      // unrelated channel that returns 200 while delivering nowhere.
+      var hasLinkedChannel = false;
       // If we don't have the URI yet, ask the TUI.
       if (wsUri == null) {
         try {
@@ -1330,7 +1378,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           if (tuiRes.statusCode == 200) {
             final tuiData = jsonDecode(tuiRes.body) as Map<String, dynamic>;
             wsUri = tuiData['vm_service_uri'] as String?;
-            channelPort = (tuiData['channel_port'] as int?) ?? channelPort;
+            final port = tuiData['channel_port'] as int?;
+            if (port != null) {
+              channelPort = port;
+              hasLinkedChannel = true;
+            }
           }
         } catch (_) {}
       } else {
@@ -1345,12 +1397,27 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           );
           if (tuiRes.statusCode == 200) {
             final tuiData = jsonDecode(tuiRes.body) as Map<String, dynamic>;
-            channelPort = (tuiData['channel_port'] as int?) ?? channelPort;
+            final port = tuiData['channel_port'] as int?;
+            if (port != null) {
+              channelPort = port;
+              hasLinkedChannel = true;
+            }
           }
         } catch (_) {}
       }
 
-      debugPrint('[flan] resolved vm_service_uri=$wsUri channelPort=$channelPort');
+      debugPrint('[flan] resolved vm_service_uri=$wsUri '
+          'channelPort=$channelPort hasLinkedChannel=$hasLinkedChannel');
+
+      // The flan channel is the only delivery path: fast, predictable, and
+      // reliable. We deliberately do NOT fall back to the legacy process_queue
+      // nudge. If no linked channel was resolved, there is no receiver — keep
+      // the message queued so it isn't lost and tell the user.
+      if (!hasLinkedChannel) {
+        debugPrint('[flan] flush undelivered: no linked receiver');
+        _showNoReceiverDialog();
+        return;
+      }
 
       var channelOk = false;
       try {
@@ -1364,10 +1431,21 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           body: channelBody,
         );
         debugPrint('[flan] channel response: ${res.statusCode} ${res.body}');
-        channelOk = res.statusCode == 200;
+        // The channel reports {"ok": true} only when it actually pushed the
+        // message to its Claude session; "no messages" or errors come back
+        // ok:false. Treat anything else as undelivered.
+        if (res.statusCode == 200) {
+          try {
+            final body = jsonDecode(res.body) as Map<String, dynamic>;
+            channelOk = body['ok'] == true;
+          } catch (_) {
+            channelOk = false;
+          }
+        }
       } catch (e) {
         debugPrint('[flan] channel not available: $e');
       }
+
 
       if (channelOk) {
         widget.userMessageService.suppressVmEvents = true;
@@ -1378,9 +1456,39 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           widget.userMessageService.consumeMessages();
         }
       } else {
-        widget.userMessageService.notifyPending();
+        // We had a linked channel but the push failed, so the message reached
+        // no live receiver. Keep it queued (do not consume) so it isn't lost
+        // and tell the user why via a dialog. No process_queue fallback.
+        debugPrint('[flan] flush undelivered: linked channel push failed');
+        _showNoReceiverDialog();
       }
     }());
+  }
+
+  /// Shows a dialog explaining that the message couldn't be delivered because
+  /// no Claude Code agent is linked to receive it. The message stays queued.
+  void _showNoReceiverDialog() {
+    if (!mounted) return;
+    unawaited(showDialog<void>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('No agent linked'),
+          content: const Text(
+            'Your message was not sent because no Claude Code agent is '
+            'linked to receive it.\n\n'
+            'The message is still queued — link an agent, then send again.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    ));
   }
 
   void _saveQueuedMessageText(int queueId, String newText) {
@@ -2145,11 +2253,8 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
     final parts = <String>[];
     final data = <String, dynamic>{};
 
-    // Include current route/URL
-    final routeName = _currentRouteName(context);
-    if (routeName != null) {
-      data['currentRoute'] = routeName;
-    }
+    // Include URL, route stack, and current route name.
+    _collectNavigationContext(context).applyTo(data);
 
     data['inspectorSelection'] = selection.toJson();
     parts.add(
