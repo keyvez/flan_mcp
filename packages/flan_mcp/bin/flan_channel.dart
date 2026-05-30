@@ -20,6 +20,7 @@ import 'dart:io';
 
 import 'package:args/args.dart';
 import 'package:logging/logging.dart' as logging;
+import 'package:flan_mcp/src/chat_log_formatter.dart';
 import 'package:flan_mcp/src/compat/copilot_stdio_server_transport.dart';
 import 'package:flan_mcp/src/version.g.dart';
 import 'package:mcp_dart/mcp_dart.dart';
@@ -265,7 +266,12 @@ class FlanChannel {
       }
 
       final content = _formatMessages(messages);
-      await _pushToClaudeSession(content: content, vmUri: vmUri);
+      final route = _extractRouteAttribute(messages);
+      await _pushToClaudeSession(
+        content: content,
+        vmUri: vmUri,
+        route: route,
+      );
 
       req.response
         ..statusCode = HttpStatus.ok
@@ -303,7 +309,20 @@ class FlanChannel {
       buf.writeln(text);
 
       if (data != null) {
-        // Current route / URL
+        // Navigation context — emit each signal on its own line so the
+        // agent can latch onto whichever one the app populates. `url` is
+        // the platform/deep-link URL (browser bar / go_router); `Route
+        // stack` is the in-app breadcrumb of named routes from root to
+        // top; `Current route` is the deepest route name (kept for
+        // backward compat with older messages that only sent that one).
+        final url = data['url'] as String?;
+        if (url != null && url.isNotEmpty) {
+          buf.writeln('URL: $url');
+        }
+        final routeStack = data['routeStack'] as String?;
+        if (routeStack != null && routeStack.isNotEmpty) {
+          buf.writeln('Route stack: $routeStack');
+        }
         final currentRoute = data['currentRoute'] as String?;
         if (currentRoute != null && currentRoute.isNotEmpty) {
           buf.writeln('Current route: $currentRoute');
@@ -336,6 +355,15 @@ class FlanChannel {
           buf.writeln('Annotations: ${jsonEncode(annotations)}');
         }
 
+        // Chat log — a structured conversation transcript (e.g. an
+        // in-app AI chat). Rendered as a readable, role-prefixed
+        // transcript AND echoed as structured JSON so the agent can
+        // both skim it and parse it precisely.
+        final chatLog = data['turns'] ?? data['chatLog'];
+        if (chatLog is List && chatLog.isNotEmpty) {
+          buf.write(formatChatLog(chatLog, data));
+        }
+
         // Buffer images for retrieval via tool
         if (data.containsKey('screenshot')) {
           _pendingImages.add({
@@ -360,9 +388,32 @@ class FlanChannel {
     return buf.toString().trim();
   }
 
+  /// Picks the best `route` attribute value to surface on the `<channel>`
+  /// element. The agent reads this from the element header so pronouns
+  /// like "this screen" have a referent even when the user didn't use
+  /// the inspector/annotation tools.
+  ///
+  /// Preference order: the first message's `data.url` (platform / deep
+  /// link — go_router URI, browser address bar), then `data.currentRoute`
+  /// (deepest [ModalRoute] name) for non-Router apps.
+  String? _extractRouteAttribute(List<Map<String, dynamic>> messages) {
+    for (final msg in messages) {
+      final data = msg['data'];
+      if (data is! Map<String, dynamic>) continue;
+      final url = data['url'];
+      if (url is String && url.isNotEmpty) return url;
+      final currentRoute = data['currentRoute'];
+      if (currentRoute is String && currentRoute.isNotEmpty) {
+        return currentRoute;
+      }
+    }
+    return null;
+  }
+
   Future<void> _pushToClaudeSession({
     required String content,
     String? vmUri,
+    String? route,
   }) async {
     if (!mcpServer.isConnected) {
       _logger.warning('MCP server not connected, cannot push channel event');
@@ -371,6 +422,7 @@ class FlanChannel {
 
     final meta = <String, String>{
       if (vmUri != null) 'vm_uri': vmUri,
+      if (route != null) 'route': route,
     };
 
     await mcpServer.server.notification(
@@ -383,7 +435,10 @@ class FlanChannel {
       ),
     );
 
-    _logger.info('Channel event pushed to Claude (${content.length} chars)');
+    _logger.info(
+      'Channel event pushed to Claude (${content.length} chars, '
+      'route=${route ?? "-"}, vm_uri=${vmUri != null ? "set" : "-"})',
+    );
   }
 }
 
@@ -426,10 +481,13 @@ Future<int> main(List<String> arguments) async {
             'into this Claude Code session. When you receive a <channel> event '
             'from flan-channel, the content IS the user message(s) including '
             'context (current route, inspector selection, annotations). Act on '
-            'the message content directly. If a vm_uri attribute is present '
-            'and you are not already connected, use the flan connect tool '
-            'first. If the message mentions attached images, call '
-            'get_flushed_images to retrieve them.',
+            'the message content directly. The <channel> element may carry a '
+            'route="..." attribute (the deep-link URL or current route name '
+            'when no widget was picked) — treat that as the user\'s "this" '
+            'referent unless the body specifies otherwise. If a vm_uri '
+            'attribute is present and you are not already connected, use the '
+            'flan connect tool first. If the message mentions attached '
+            'images, call get_flushed_images to retrieve them.',
       ),
     );
 

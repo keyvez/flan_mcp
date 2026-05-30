@@ -88,6 +88,41 @@ class FlanBinding extends WidgetsFlutterBinding {
     return true;
   }
 
+  /// Sends a structured chat log (an in-app conversation, e.g. an
+  /// AI chat transcript) to the connected agent as a first-class
+  /// `chat_log` modality — a sibling of screenshots and direct
+  /// messages.
+  ///
+  /// [turns] is an ordered list of `{role, text}` maps; `role` is
+  /// typically 'user' | 'assistant' | 'error'. Optional context
+  /// ([route], [screen], [entity], [lastError]) helps the agent
+  /// reproduce the situation. [summary] is the human-readable lead
+  /// line; a default is derived from the turn count when omitted.
+  ///
+  /// Returns `true` if Flan is initialized and the message was
+  /// queued, `false` when Flan is not active (e.g. release builds).
+  static bool sendChatLog({
+    required List<Map<String, dynamic>> turns,
+    String? summary,
+    String? route,
+    String? screen,
+    Map<String, dynamic>? entity,
+    String? lastError,
+  }) {
+    return trySendToAgent(
+      text: summary ??
+          'Chat log sent from the app (${turns.length} turns).',
+      type: 'chat_log',
+      data: <String, dynamic>{
+        'turns': turns,
+        if (route != null) 'route': route,
+        if (screen != null) 'screen': screen,
+        if (entity != null) 'selected_entity': entity,
+        if (lastError != null) 'last_error': lastError,
+      },
+    );
+  }
+
   FlanBinding._(this.configuration);
 
   /// Configuration for the Flan extensions.
@@ -835,6 +870,69 @@ class FlanBinding extends WidgetsFlutterBinding {
     }
     renderViewElement?.visitChildElements(visitor);
     return routeName;
+  }
+
+  /// Returns the active route stack as a list of [RouteSettings.name]s,
+  /// ordered from the root route down to the topmost.
+  ///
+  /// Walks the deepest [NavigatorState] (the one the user is interacting
+  /// with) and collects every `Route<dynamic>` whose `settings.name` is
+  /// non-empty. Unnamed routes are skipped — they have no useful breadcrumb
+  /// label — but the list order still reflects only the named portion of
+  /// the stack. Returns an empty list when no Navigator is found.
+  ///
+  /// This is what gives the agent the navigation breadcrumb context that a
+  /// single deepest-route name cannot: e.g. `["/home", "/orders", "/orders/42"]`
+  /// instead of just `/orders/42`.
+  List<String> getCurrentRouteStack() {
+    final navigator = _findDeepestNavigator();
+    if (navigator == null) return const [];
+    final names = <String>[];
+    // NavigatorState exposes its history via the protected _history field
+    // — not part of the public API — so we use the public `popUntil`
+    // visitor trick: iterate via the navigator's `widget.pages` when
+    // pages-API is in use, otherwise fall back to walking ModalRoutes.
+    final pages = navigator.widget.pages;
+    if (pages.isNotEmpty) {
+      for (final page in pages) {
+        final name = page.name;
+        if (name != null && name.isNotEmpty) {
+          names.add(name);
+        }
+      }
+      return names;
+    }
+    // Imperative Navigator (push/pop): walk the route tree by visiting
+    // every ModalRoute reachable from the root and keeping those whose
+    // navigator matches.
+    final seen = <String>{};
+    void collect(Element element) {
+      final route = ModalRoute.of(element);
+      if (route != null && identical(route.navigator, navigator)) {
+        final name = route.settings.name;
+        if (name != null && name.isNotEmpty && seen.add(name)) {
+          names.add(name);
+        }
+      }
+      element.visitChildren(collect);
+    }
+    renderViewElement?.visitChildElements(collect);
+    return names;
+  }
+
+  /// Finds the deepest [NavigatorState] in the tree — i.e. the one the
+  /// user is currently interacting with, which for nested navigators is
+  /// the inner one (e.g. a tab's nested Navigator inside a shell route).
+  NavigatorState? _findDeepestNavigator() {
+    NavigatorState? deepest;
+    void visitor(Element element) {
+      if (element is StatefulElement && element.state is NavigatorState) {
+        deepest = element.state as NavigatorState;
+      }
+      element.visitChildren(visitor);
+    }
+    renderViewElement?.visitChildElements(visitor);
+    return deepest;
   }
 
   @override

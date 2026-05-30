@@ -1665,8 +1665,14 @@ final class VmServiceContext {
       final isWeb = m['source'] == 'web';
       buffer.writeln(isWeb ? '[web] $text' : text);
       final data = m['data'] as Map<String, dynamic>?;
-      if (isWeb && data != null) {
-        _appendWebContext(buffer, data);
+      if (data != null) {
+        // Navigation context (URL / route stack / current route) is the
+        // primary referent when a command-overlay message arrives with no
+        // widget selection — surface it for both Flutter and web sources.
+        _appendNavContext(buffer, data);
+        if (isWeb) {
+          _appendWebContext(buffer, data);
+        }
       }
       buffer.writeln();
     }
@@ -1695,13 +1701,29 @@ final class VmServiceContext {
     return CallToolResult(content: contentList);
   }
 
-  /// Appends web-specific context (DOM selector, source hint, annotations,
-  /// current URL) from a web message's `data` payload to [buffer].
-  void _appendWebContext(StringBuffer buffer, Map<String, dynamic> data) {
+  /// Appends shared navigation context (platform URL, in-app route stack,
+  /// deepest route name) to [buffer]. This is the only locator the agent
+  /// has when the user sends a bare command-overlay message with no
+  /// widget selection — without it, "fix this" has no referent.
+  void _appendNavContext(StringBuffer buffer, Map<String, dynamic> data) {
     final url = data['url'];
     if (url is String && url.isNotEmpty) {
       buffer.writeln('  URL: $url');
     }
+    final routeStack = data['routeStack'];
+    if (routeStack is String && routeStack.isNotEmpty) {
+      buffer.writeln('  Route stack: $routeStack');
+    }
+    final currentRoute = data['currentRoute'];
+    if (currentRoute is String && currentRoute.isNotEmpty) {
+      buffer.writeln('  Current route: $currentRoute');
+    }
+  }
+
+  /// Appends web-specific context (DOM selector, source hint, annotations,
+  /// component name) from a web message's `data` payload to [buffer].
+  /// Nav context (URL / route stack) is handled by [_appendNavContext].
+  void _appendWebContext(StringBuffer buffer, Map<String, dynamic> data) {
     final selector = data['selector'];
     if (selector is String && selector.isNotEmpty) {
       buffer.writeln('  Selector: $selector');
