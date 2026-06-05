@@ -401,6 +401,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   bool _showTextMessageOverlay = false;
   bool _showQueuedMessagesPanel = false;
   bool _showErrorPanel = false;
+
+  /// Transient banner shown when a flush couldn't be delivered (e.g. no agent
+  /// connected). Rendered directly in the overlay's own Stack rather than via
+  /// showDialog, which is unreliable in this overlay/go_router context. null
+  /// when no error is showing.
+  String? _flushErrorMessage;
+  int _flushErrorGeneration = 0;
   List<Map<String, dynamic>> _queuedMessagesSnapshot = const [];
   int? _annotationDraftQueueId;
   String _lastQueuedAnnotationsSignature = '';
@@ -1155,30 +1162,33 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     final queueId = widget.userMessageService.lastQueueId;
     _isSendingToAgent = false;
 
-    // Capture screenshot and patch it into the queued message asynchronously.
+    // Capture the screenshot and patch it into the queued message. This is
+    // awaited (not fire-and-forget) so callers that flush immediately
+    // afterwards — e.g. _sendToAgentAndFlush — send a message that already
+    // carries the screenshot. Firing it unawaited raced the flush, which
+    // snapshots the queue synchronously, so the screenshot for a bounding-box
+    // selection never reached the agent.
     final previewBounds = _resolveQueuePreviewBounds(
       selection: selection,
       annotations: annotations,
     );
-    unawaited(() async {
-      try {
-        final screenshotData = <String, dynamic>{};
-        await _attachScreenshotAndQueueThumbnail(
-          context: context,
-          screenshotService: widget.screenshotService,
-          data: screenshotData,
-          previewBounds: previewBounds,
-          boundaryKey: _appContentKey,
-        );
-        if (screenshotData.isNotEmpty) {
-          widget.userMessageService.patchMessage(queueId, {
-            'data': {...data, ...screenshotData},
-          });
-        }
-      } catch (_) {
-        // Screenshot capture is best-effort.
+    try {
+      final screenshotData = <String, dynamic>{};
+      await _attachScreenshotAndQueueThumbnail(
+        context: context,
+        screenshotService: widget.screenshotService,
+        data: screenshotData,
+        previewBounds: previewBounds,
+        boundaryKey: _appContentKey,
+      );
+      if (screenshotData.isNotEmpty) {
+        widget.userMessageService.patchMessage(queueId, {
+          'data': {...data, ...screenshotData},
+        });
       }
-    }());
+    } catch (_) {
+      // Screenshot capture is best-effort.
+    }
   }
 
   /// Packages annotations into a real queue item and immediately sends
@@ -1415,7 +1425,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       // the message queued so it isn't lost and tell the user.
       if (!hasLinkedChannel) {
         debugPrint('[flan] flush undelivered: no linked receiver');
-        _showNoReceiverDialog();
+        _showNoReceiverError();
         return;
       }
 
@@ -1460,35 +1470,41 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         // no live receiver. Keep it queued (do not consume) so it isn't lost
         // and tell the user why via a dialog. No process_queue fallback.
         debugPrint('[flan] flush undelivered: linked channel push failed');
-        _showNoReceiverDialog();
+        _showNoReceiverError();
       }
     }());
   }
 
-  /// Shows a dialog explaining that the message couldn't be delivered because
-  /// no Claude Code agent is linked to receive it. The message stays queued.
-  void _showNoReceiverDialog() {
+  /// Shows an in-overlay error banner explaining that the message couldn't be
+  /// delivered because no Claude Code agent is connected to receive it. The
+  /// message stays queued.
+  ///
+  /// Rendered as a [Positioned] child of the overlay's own Stack (see
+  /// [_FlushErrorBanner] in [build]) rather than via `showDialog`. The overlay
+  /// lives above go_router's Navigator and tearing a dialog route in/out of
+  /// that scope is fragile here, so we surface the error inline instead.
+  void _showNoReceiverError() {
     if (!mounted) return;
-    unawaited(showDialog<void>(
-      context: context,
-      useRootNavigator: true,
-      builder: (dialogContext) {
-        return AlertDialog(
-          title: const Text('No agent linked'),
-          content: const Text(
-            'Your message was not sent because no Claude Code agent is '
-            'linked to receive it.\n\n'
-            'The message is still queued — link an agent, then send again.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogContext).pop(),
-              child: const Text('OK'),
-            ),
-          ],
-        );
-      },
-    ));
+    _flushErrorMessage =
+        'Your message was not sent because no Claude Code agent is '
+        'connected to receive it.\n\n'
+        'The message is still queued — connect an agent, then send again.';
+    final generation = ++_flushErrorGeneration;
+    _safeSetState();
+    // Auto-dismiss after a while so a stale banner doesn't linger, but only if
+    // it's still the same error the user last saw.
+    Future<void>.delayed(const Duration(seconds: 8), () {
+      if (!mounted) return;
+      if (_flushErrorGeneration != generation) return;
+      _flushErrorMessage = null;
+      _safeSetState();
+    });
+  }
+
+  void _dismissFlushError() {
+    _flushErrorMessage = null;
+    _flushErrorGeneration++;
+    _safeSetState();
   }
 
   void _saveQueuedMessageText(int queueId, String newText) {
@@ -2040,6 +2056,18 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 onExitAnnotationMode: () {
                   widget.annotationService.disable();
                 },
+              ),
+            ),
+          // Transient error banner shown when a flush couldn't be delivered
+          // (e.g. no agent connected). Positioned below the queue badge so it
+          // reads as related to the send action.
+          if (_flushErrorMessage != null)
+            Positioned(
+              top: badgeTop + 40,
+              right: badgeRight,
+              child: _FlushErrorBanner(
+                message: _flushErrorMessage!,
+                onDismiss: _dismissFlushError,
               ),
             ),
         ],
@@ -3775,6 +3803,33 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     return (charCount / 4).ceil() + imageTokens;
   }
 
+  /// Builds the panel header count label. The queue badge counts *messages*,
+  /// but a single annotated message renders one row per annotation — so a
+  /// queue of 1 message can show several rows. Without this the header read
+  /// "Queued (1)" next to 4 rows, which looks like a counting bug. We label
+  /// the message count explicitly and, when annotations outnumber messages,
+  /// spell out the row count so the mismatch reads as intentional.
+  static String _queuedHeaderLabel(List<Map<String, dynamic>> messages) {
+    final messageCount = messages.length;
+    var annotationCount = 0;
+    for (final m in messages) {
+      final data = m['data'];
+      if (data is Map<String, dynamic>) {
+        final annotations = data['annotations'];
+        if (annotations is List) annotationCount += annotations.length;
+      }
+    }
+    final messageWord = messageCount == 1 ? 'message' : 'messages';
+    // Only add the annotation breakdown when it would otherwise look off —
+    // i.e. there are more annotation rows than messages.
+    if (annotationCount > messageCount) {
+      final annWord = annotationCount == 1 ? 'annotation' : 'annotations';
+      return 'Queued ($messageCount $messageWord · '
+          '$annotationCount $annWord) · ';
+    }
+    return 'Queued ($messageCount $messageWord) · ';
+  }
+
   /// Reads width and height from the IHDR chunk of a base64-encoded PNG
   /// and returns (width × height) / 750. Falls back to 1600 on failure.
   static int _imageTokensFromBase64(String base64Data) {
@@ -3835,8 +3890,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                         TextSpan(
                           children: [
                             TextSpan(
-                              text:
-                                  'Queued (${widget.messages.length}) · ',
+                              text: _queuedHeaderLabel(widget.messages),
                             ),
                             TextSpan(
                               text: estimatedTokens >= 1000
@@ -4812,6 +4866,101 @@ class _ErrorDot extends StatelessWidget {
 }
 
 /// Panel that expands below the error dot showing error details with
+/// A transient, dismissible banner surfaced inside the overlay when a user
+/// message couldn't be delivered (e.g. no agent connected). Rendered in the
+/// overlay's own Stack so it doesn't depend on a Navigator/dialog route.
+class _FlushErrorBanner extends StatelessWidget {
+  const _FlushErrorBanner({
+    required this.message,
+    required this.onDismiss,
+  });
+
+  final String message;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      type: MaterialType.transparency,
+      child: Container(
+        width: 320,
+        padding: const EdgeInsets.fromLTRB(12, 10, 8, 12),
+        decoration: BoxDecoration(
+          color: const Color(0xF02A1010),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: const Color(0xFFD32F2F),
+            width: 1,
+          ),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x60000000),
+              blurRadius: 16,
+              offset: Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.only(top: 1),
+                  child: Icon(
+                    Icons.error_outline,
+                    size: 16,
+                    color: Color(0xFFFF6060),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Message not sent',
+                    style: TextStyle(
+                      color: Color(0xFFFF8080),
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      decoration: TextDecoration.none,
+                    ),
+                  ),
+                ),
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: onDismiss,
+                  child: const Padding(
+                    padding: EdgeInsets.all(2),
+                    child: Icon(
+                      Icons.close,
+                      size: 16,
+                      color: Color(0xFFAAAAAA),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Padding(
+              padding: const EdgeInsets.only(left: 24, right: 4),
+              child: Text(
+                message,
+                style: const TextStyle(
+                  color: Color(0xFFE0C8C8),
+                  fontSize: 12,
+                  height: 1.35,
+                  decoration: TextDecoration.none,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// "Add to Queue" and dismiss buttons for each error.
 class _ErrorPanel extends StatelessWidget {
   const _ErrorPanel({
