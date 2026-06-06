@@ -39,31 +39,121 @@ const CONNECTOR: &str = "──────";
 
 struct Row {
     flutter: Option<usize>,
+    /// Surface (agent) rendered in the right column on THIS row, if any.
     surface: Option<usize>,
+    /// Surface (agent) this row's Flutter app is *linked* to. Usually equals
+    /// `surface`, but when several apps share one agent the agent is rendered
+    /// once (on the group's head row) and the other rows carry `link_si`
+    /// pointing at that same surface so the connector column can draw an
+    /// orthogonal bus joining them. `None` when the app isn't linked.
+    link_si: Option<usize>,
+    /// Whether this row's Flutter app has a LIVE agent connection (an agent has
+    /// called `connect`), as opposed to a mere persisted association. The
+    /// connector line is drawn only when this is true — an association alone is
+    /// not enough.
+    ///
+    /// "Reachable" = the linked agent (surface) has a live flan-channel
+    /// registered (a channel_port), so the app's messages can actually be
+    /// delivered to it. We deliberately do NOT require the agent to have called
+    /// the VM-service `connect` tool: the normal flow delivers messages over the
+    /// channel and the agent never needs to VM-connect, so isHostConnected stays
+    /// false even while the agent is actively handling the app's messages.
+    connected: bool,
 }
 
 fn build_rows(app: &App) -> Vec<Row> {
     let entries = app.claude_entries();
-    let mut used_flutter: Vec<bool> = vec![false; app.flutter_apps.len()];
-    let mut used_surface: Vec<bool> = vec![false; entries.len()];
+    let entry_ids: Vec<String> = entries.iter().map(|e| e.id()).collect();
+    let entry_cwds: Vec<Option<&str>> = entries.iter().map(|e| e.cwd()).collect();
+    // An entry is "reachable" if it's a trm pane with a registered channel port.
+    let entry_reachable: Vec<bool> = entries
+        .iter()
+        .map(|e| match e {
+            ClaudeEntry::Trm(p) => p.channel_port.is_some(),
+            // cmux/cloud agents reachability isn't tracked on the synced
+            // snapshot yet; trm panes are the linkable agents in practice.
+            ClaudeEntry::Cmux(_) => false,
+        })
+        .collect();
+    let flutter: Vec<(u32, &str)> = app
+        .flutter_apps
+        .iter()
+        .map(|f| (f.pid, f.cwd.as_str()))
+        .collect();
+    build_rows_inner(&flutter, &entry_reachable, &entry_ids, &entry_cwds, &app.associations)
+}
+
+/// Pure core of `build_rows`, factored out so it can be unit-tested without an
+/// `App`/`SharedState`. Pairs Flutter apps with Claude entries:
+///   1. by explicit association (one app ↔ one agent),
+///   2. then unlinked apps by cwd proximity,
+///   3. then any remainder as single-sided rows.
+///
+/// INVARIANT: every Flutter app appears in exactly one row. A Flutter app must
+/// never be silently dropped — e.g. when two apps are linked to the SAME agent,
+/// the second can't claim that (already-used) surface, but it must still surface
+/// as its own row rather than vanish from the list.
+fn build_rows_inner(
+    flutter: &[(u32, &str)],
+    entry_reachable: &[bool],
+    entry_ids: &[String],
+    entry_cwds: &[Option<&str>],
+    associations: &[Association],
+) -> Vec<Row> {
+    let mut used_flutter: Vec<bool> = vec![false; flutter.len()];
+    let mut used_surface: Vec<bool> = vec![false; entry_ids.len()];
     let mut rows = Vec::new();
 
-    for assoc in &app.associations {
-        let fi = app
-            .flutter_apps
-            .iter()
-            .position(|f| f.pid == assoc.flutter_pid);
-        let si = entries
-            .iter()
-            .position(|e| e.id() == assoc.claude_surface_id);
-        if let (Some(fi), Some(si)) = (fi, si) {
-            if !used_flutter[fi] && !used_surface[si] {
+    // Linked pass. Group Flutter apps by the agent (surface) they link to, so
+    // apps sharing one agent render as a contiguous block: the agent appears
+    // once on the block's head row, and the remaining rows carry `link_si`
+    // (but no `surface`) so the connector column can join them with an
+    // orthogonal bus. Association order is preserved for the head of each group.
+    for assoc in associations {
+        let Some(fi) = flutter.iter().position(|(pid, _)| *pid == assoc.flutter_pid)
+        else { continue };
+        if used_flutter[fi] {
+            continue; // app already placed (duplicate association for same pid)
+        }
+        let si = entry_ids.iter().position(|id| *id == assoc.claude_surface_id);
+
+        match si {
+            Some(si) => {
+                if used_surface[si] {
+                    // Agent already heads an existing group — append this app to
+                    // that group as a linked (but agent-less) row. Insert it
+                    // right after the group's existing members so the block stays
+                    // contiguous.
+                    used_flutter[fi] = true;
+                    let insert_at = rows
+                        .iter()
+                        .rposition(|r: &Row| r.surface == Some(si) || r.link_si == Some(si))
+                        .map(|p| p + 1)
+                        .unwrap_or(rows.len());
+                    rows.insert(insert_at, Row {
+                        flutter: Some(fi),
+                        surface: None,
+                        link_si: Some(si),
+                        connected: entry_reachable.get(si).copied().unwrap_or(false),
+                    });
+                } else {
+                    // First app for this agent — it becomes the group head and
+                    // renders the agent.
+                    used_flutter[fi] = true;
+                    used_surface[si] = true;
+                    rows.push(Row {
+                        flutter: Some(fi),
+                        surface: Some(si),
+                        link_si: Some(si),
+                        connected: entry_reachable.get(si).copied().unwrap_or(false),
+                    });
+                }
+            }
+            None => {
+                // Association points at an agent that no longer exists. Keep the
+                // app visible on its own row so it is never silently dropped.
                 used_flutter[fi] = true;
-                used_surface[si] = true;
-                rows.push(Row {
-                    flutter: Some(fi),
-                    surface: Some(si),
-                });
+                rows.push(Row { flutter: Some(fi), surface: None, link_si: None, connected: false });
             }
         }
     }
@@ -90,13 +180,13 @@ fn build_rows(app: &App) -> Vec<Row> {
     let mut leftover_flutter: Vec<usize> = Vec::new();
 
     for &fi in &unlinked_flutter {
-        let flutter_cwd = app.flutter_apps[fi].cwd.as_str();
+        let flutter_cwd = flutter[fi].1;
         let best = unlinked_surface
             .iter()
             .enumerate()
             .filter(|(j, _)| !used_surface2[*j])
             .filter_map(|(j, &si)| {
-                let claude_cwd = entries[si].cwd().unwrap_or("");
+                let claude_cwd = entry_cwds[si].unwrap_or("");
                 if claude_cwd.is_empty() {
                     return None;
                 }
@@ -109,7 +199,16 @@ fn build_rows(app: &App) -> Vec<Row> {
 
         if let Some((j, si, _)) = best {
             used_surface2[j] = true;
-            rows.push(Row { flutter: Some(fi), surface: Some(si) });
+            // cwd-proximity pairing — purely a layout hint to place a likely
+            // app/agent pair on the same row. It is NOT an explicit link, so it
+            // draws NO connector line (link_si: None). A line means a real
+            // association, established via the `l` key.
+            rows.push(Row {
+                flutter: Some(fi),
+                surface: Some(si),
+                link_si: None,
+                connected: false,
+            });
         } else {
             leftover_flutter.push(fi);
         }
@@ -123,19 +222,23 @@ fn build_rows(app: &App) -> Vec<Row> {
         .map(|(_, &si)| si)
         .collect();
 
-    // Zip any leftover Flutter and Claude entries side-by-side (no path match).
+    // Zip any leftover Flutter and Claude entries side-by-side. This is just
+    // visual co-location with no real or proximity link, so `link_si` stays
+    // None and no connector is drawn.
     let paired = leftover_flutter.len().min(leftover_surface.len());
     for j in 0..paired {
         rows.push(Row {
             flutter: Some(leftover_flutter[j]),
             surface: Some(leftover_surface[j]),
+            link_si: None,
+            connected: false,
         });
     }
     for &fi in &leftover_flutter[paired..] {
-        rows.push(Row { flutter: Some(fi), surface: None });
+        rows.push(Row { flutter: Some(fi), surface: None, link_si: None, connected: false });
     }
     for &si in &leftover_surface[paired..] {
-        rows.push(Row { flutter: None, surface: Some(si) });
+        rows.push(Row { flutter: None, surface: Some(si), link_si: None, connected: false });
     }
 
     rows
@@ -146,6 +249,128 @@ fn row_has_column(row: &Row, col: Column) -> bool {
         Column::Flutter => row.flutter.is_some(),
         Column::Claude => row.surface.is_some(),
     }
+}
+
+/// Build the connector column as a vector of `inner_height` strings (one per
+/// visible line), each exactly `conn_w` columns wide, using box-drawing glyphs.
+///
+/// Connectors are ORTHOGONAL. For a single linked row, a straight horizontal
+/// run `───────` joins the app to its agent. When several apps share one agent,
+/// the agent is rendered once (on the group's head row) and the connectors form
+/// a vertical bus with right-angle corners, e.g.:
+/// ```text
+///   app A ──┐
+///           ├── agent
+///   app B ──┘
+/// ```
+/// The bus sits at a fixed center column; each member row gets a horizontal stub
+/// from the left edge to the bus, the agent row gets a stub from the bus to the
+/// right edge, and the bus is joined vertically between the topmost and
+/// bottommost anchored lines in the group.
+fn build_connector_glyphs(
+    rows: &[Row],
+    row_heights: &[usize],
+    scroll_offset: usize,
+    inner_height: usize,
+    conn_w: usize,
+) -> Vec<String> {
+    // grid[line][col] glyph; ' ' = empty.
+    let mut grid: Vec<Vec<char>> = vec![vec![' '; conn_w]; inner_height];
+    if conn_w == 0 || inner_height == 0 {
+        return vec![" ".repeat(conn_w); inner_height];
+    }
+    let bus = conn_w / 2; // bus column
+
+    // Compute the absolute visible-line index of each row's anchor (first line).
+    // Rows before scroll_offset are skipped; we lay rows out sequentially.
+    let mut anchor: Vec<Option<usize>> = vec![None; rows.len()];
+    let mut line = 0usize;
+    for (row_idx, _row) in rows.iter().enumerate() {
+        if row_idx < scroll_offset {
+            continue;
+        }
+        if line >= inner_height {
+            break;
+        }
+        anchor[row_idx] = Some(line);
+        line += row_heights[row_idx];
+    }
+
+    // Group rows by the surface they link to (`link_si`) — but ONLY rows with a
+    // live agent connection. An association without a live connection draws no
+    // line: the connector reflects an actual connection, not a saved link.
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        if let (Some(si), true) = (row.link_si, row.connected) {
+            groups.entry(si).or_default().push(row_idx);
+        }
+    }
+
+    let set = |grid: &mut Vec<Vec<char>>, l: usize, c: usize, ch: char| {
+        if l < inner_height && c < conn_w {
+            grid[l][c] = ch;
+        }
+    };
+
+    for (_si, members) in groups {
+        // Anchor lines of members actually visible in the viewport.
+        let mut lines: Vec<(usize, bool)> = members
+            .iter()
+            .filter_map(|&ri| anchor[ri].map(|l| (l, rows[ri].surface.is_some())))
+            .collect();
+        if lines.is_empty() {
+            continue;
+        }
+        lines.sort_by_key(|&(l, _)| l);
+
+        // Single visible member → straight horizontal run across the column.
+        if lines.len() == 1 {
+            let (l, _) = lines[0];
+            for c in 0..conn_w {
+                set(&mut grid, l, c, '─');
+            }
+            continue;
+        }
+
+        let top = lines.first().unwrap().0;
+        let bottom = lines.last().unwrap().0;
+
+        // Vertical bus between top and bottom anchored member lines.
+        for l in top..=bottom {
+            set(&mut grid, l, bus, '│');
+        }
+
+        // Each member: horizontal stub from left edge to the bus, with a corner
+        // glyph where it meets the bus.
+        for &(l, is_agent_row) in &lines {
+            for c in 0..bus {
+                set(&mut grid, l, c, '─');
+            }
+            let corner = if l == top {
+                '┐'
+            } else if l == bottom {
+                '┘'
+            } else {
+                '┤'
+            };
+            set(&mut grid, l, bus, corner);
+            // The agent (head) row also extends a stub from the bus to the right
+            // edge toward the agent, turning the corner into a tee/cross.
+            if is_agent_row {
+                for c in (bus + 1)..conn_w {
+                    set(&mut grid, l, c, '─');
+                }
+                let tee = match corner {
+                    '┐' => '┬',
+                    '┘' => '┴',
+                    _ => '┼',
+                };
+                set(&mut grid, l, bus, tee);
+            }
+        }
+    }
+
+    grid.into_iter().map(|r| r.into_iter().collect()).collect()
 }
 
 // ── Background refresh ───────────────────────────────────────────────────
@@ -189,7 +414,13 @@ impl ClaudeEntry {
     fn id(&self) -> String {
         match self {
             ClaudeEntry::Cmux(s) => s.id.clone(),
-            ClaudeEntry::Trm(p) => format!("trm:{}", p.index),
+            // Key by the stable pane_id, NOT the positional `index`. `index` is
+            // the enumeration order in trm's live surface list and shifts when
+            // panes are created/removed/reordered, so associations stored by
+            // index would silently re-point at a different pane (and several
+            // would collapse onto whatever sits at the low indices — "the first
+            // agent"). pane_id is assigned per-pane by trm and is stable.
+            ClaudeEntry::Trm(p) => format!("trm:{}", p.pane_id),
         }
     }
     fn is_claude(&self) -> bool {
@@ -430,8 +661,8 @@ impl App {
                     }
                 }
 
-                // 2. Direct surface_id key match.
-                let key = format!("trm:{}", pane.index);
+                // 2. Direct surface_id key match (keyed by stable pane_id).
+                let key = format!("trm:{}", pane.pane_id);
                 pane.channel_port = ports.get(&key).copied();
 
                 // 3. Cwd prefix match (fallback for panes whose login wasn't resolved).
@@ -791,9 +1022,6 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
 
-            // Blank separator line between rows
-            lines.push(Line::from(Span::raw(" ".repeat(left_w))));
-
             ListItem::new(lines)
         })
         .collect();
@@ -824,41 +1052,13 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
     {
         let conn_w = conn_area.width as usize;
         let inner_height = conn_area.height.saturating_sub(2) as usize; // top+bottom border
-
-        // Use the flutter column's scroll offset as reference for connectors
         let scroll_offset = app.flutter_list_state.offset();
-        let mut visible_lines: Vec<Line> = Vec::new();
 
-        for (row_idx, row) in rows.iter().enumerate() {
-            let h = row_heights[row_idx] + 1; // +1 for separator line
-            if row_idx < scroll_offset {
-                continue;
-            }
-            if visible_lines.len() >= inner_height {
-                break;
-            }
-
-            let is_linked = row.flutter.is_some() && row.surface.is_some();
-            for line_idx in 0..h {
-                if visible_lines.len() >= inner_height {
-                    break;
-                }
-                if line_idx == 0 && is_linked {
-                    let connector = center_pad(CONNECTOR, conn_w);
-                    visible_lines.push(Line::from(Span::styled(
-                        connector,
-                        Style::default().fg(GREEN),
-                    )));
-                } else {
-                    visible_lines.push(Line::from(Span::raw(" ".repeat(conn_w))));
-                }
-            }
-        }
-
-        // Pad remaining space
-        while visible_lines.len() < inner_height {
-            visible_lines.push(Line::from(Span::raw(" ".repeat(conn_w))));
-        }
+        let glyphs = build_connector_glyphs(&rows, &row_heights, scroll_offset, inner_height, conn_w);
+        let visible_lines: Vec<Line> = glyphs
+            .into_iter()
+            .map(|g| Line::from(Span::styled(g, Style::default().fg(GREEN))))
+            .collect();
 
         let conn_block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
@@ -908,9 +1108,6 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
                     lines.push(Line::from(Span::styled(" ".repeat(right_w), pad_style)));
                 }
             }
-
-            // Blank separator line between rows
-            lines.push(Line::from(Span::raw(" ".repeat(right_w))));
 
             ListItem::new(lines)
         })
@@ -1002,7 +1199,8 @@ fn build_entry_lines(app: &App, entry: &ClaudeEntry) -> Vec<(String, Style)> {
                 .map(|p| format!("  ch:{}", p))
                 .unwrap_or_default();
             lines.push((
-                format!("trm:{}  {}{}", pane.index, status, port_tag),
+                // Show pane_id — this is the stable id used as the routing key.
+                format!("trm:{}  {}{}", pane.pane_id, status, port_tag),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ));
             if let Some(ref cwd) = pane.cwd {
@@ -1376,7 +1574,7 @@ async fn main() -> io::Result<()> {
                                             Some(ClaudeEntry::Trm(pane)) => {
                                                 let idx = pane.index;
                                                 let sid = pane.surface_id.clone();
-                                                let label = sid.clone().unwrap_or_else(|| format!("trm:{}", pane.index));
+                                                let label = sid.clone().unwrap_or_else(|| format!("trm:{}", pane.pane_id));
                                                 let ok = tokio::task::spawn_blocking(move || {
                                                     if let Some(sid) = sid {
                                                         trm_focus_pane_by_surface(&sid)
@@ -1512,7 +1710,7 @@ async fn main() -> io::Result<()> {
                                         // Check if the target pane has a channel port (Claude w/ flan-channel).
                                         let channel_port = if sid.starts_with("trm:") {
                                             sid["trm:".len()..].parse::<usize>().ok()
-                                                .and_then(|idx| app.trm_panes.iter().find(|p| p.index == idx))
+                                                .and_then(|pane_id| app.trm_panes.iter().find(|p| p.pane_id == pane_id))
                                                 .and_then(|p| p.channel_port)
                                         } else {
                                             None
@@ -1551,7 +1749,7 @@ async fn main() -> io::Result<()> {
                                             // Resolve the actual pane_id before entering spawn_blocking.
                                             let trm_pane_id = if sid.starts_with("trm:") {
                                                 sid["trm:".len()..].parse::<usize>().ok()
-                                                    .and_then(|idx| app.trm_panes.iter().find(|p| p.index == idx))
+                                                    .and_then(|pane_id| app.trm_panes.iter().find(|p| p.pane_id == pane_id))
                                                     .map(|p| p.pane_id)
                                             } else {
                                                 None
@@ -1607,3 +1805,128 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assoc(pid: u32, sid: &str) -> Association {
+        Association { id: format!("{pid}"), claude_surface_id: sid.into(), flutter_pid: pid }
+    }
+
+    // Reproduces the live state: 3 chrome Flutter apps, 4 trm agents, with two
+    // apps linked to the SAME agent (trm:19).
+    #[test]
+    fn all_flutter_apps_get_a_row_even_when_two_link_to_one_agent() {
+        let flutter = vec![
+            (31421u32, "/Users/gaurav/dev/fasmac/frontend"),
+            (35190, "/Users/gaurav/dev/tow/dispatch/tower"),
+            (36213, "/Users/gaurav/dev/tow/dispatch/customer"),
+        ];
+        let entry_ids = vec![
+            "trm:0".to_string(), "trm:19".to_string(),
+            "trm:20".to_string(), "trm:25".to_string(),
+        ];
+        let entry_cwds = vec![
+            Some("/Users/gaurav/dev/fasmac"),
+            Some("/Users/gaurav/dev/tow"),
+            Some("/Users/gaurav/dev/trm"),
+            Some("/Users/gaurav/dev/flan_mcp"),
+        ];
+        let assocs = vec![
+            assoc(31421, "trm:0"),
+            assoc(35190, "trm:19"),
+            assoc(36213, "trm:19"), // duplicate target
+        ];
+        // entry_reachable is indexed by ENTRY (surface), not flutter app.
+        let entry_reachable = vec![true, true, true, true];
+
+        let rows = build_rows_inner(&flutter, &entry_reachable, &entry_ids, &entry_cwds, &assocs);
+
+        // Every Flutter app must be present in exactly one row.
+        for (pid, _) in &flutter {
+            let count = rows.iter()
+                .filter(|r| r.flutter.map(|fi| flutter[fi].0 == *pid).unwrap_or(false))
+                .count();
+            assert_eq!(count, 1, "pid {pid} should appear in exactly one row, got {count}");
+        }
+
+        // The shared agent (trm:19) must be RENDERED exactly once...
+        let si_19 = entry_ids.iter().position(|id| id == "trm:19").unwrap();
+        let rendered = rows.iter().filter(|r| r.surface == Some(si_19)).count();
+        assert_eq!(rendered, 1, "shared agent should render once, got {rendered}");
+        // ...but BOTH apps linked to it must reference it via link_si.
+        let linked = rows.iter().filter(|r| r.link_si == Some(si_19)).count();
+        assert_eq!(linked, 2, "both apps should link to the shared agent, got {linked}");
+
+        // The two members should be contiguous so the connector bus is unbroken.
+        let positions: Vec<usize> = rows.iter().enumerate()
+            .filter(|(_, r)| r.link_si == Some(si_19))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions[1] - positions[0], 1, "shared-agent rows must be adjacent");
+    }
+
+    #[test]
+    fn cwd_proximity_without_association_draws_no_line() {
+        // App and agent share a cwd but there is NO association. They may be
+        // placed on the same row for layout, but NO connector line should draw —
+        // a line means an explicit link, not a proximity guess.
+        let flutter = vec![(111u32, "/Users/gaurav/dev/fasmac/frontend")];
+        let entry_ids = vec!["trm:0".to_string()];
+        let entry_cwds = vec![Some("/Users/gaurav/dev/fasmac")];
+        let entry_reachable = vec![true]; // agent IS reachable, but unlinked
+        let assocs: Vec<Association> = vec![]; // <-- no associations
+
+        let rows = build_rows_inner(&flutter, &entry_reachable, &entry_ids, &entry_cwds, &assocs);
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].link_si.is_none(), "proximity row must not carry link_si");
+        assert!(!rows[0].connected, "proximity row must not be marked connected");
+    }
+
+    #[test]
+    fn single_link_draws_straight_horizontal_run() {
+        let rows = vec![Row { flutter: Some(0), surface: Some(0), link_si: Some(0), connected: true }];
+        let heights = vec![2];
+        let g = build_connector_glyphs(&rows, &heights, 0, 4, 7);
+        // Anchor (line 0) is a full horizontal run; other lines blank.
+        assert!(g[0].chars().all(|c| c == '─'), "got {:?}", g[0]);
+        assert_eq!(g[0].chars().count(), 7);
+        assert!(g[1].trim().is_empty());
+    }
+
+    #[test]
+    fn no_connection_draws_no_line() {
+        // Linked (link_si set) but NOT connected → no connector at all.
+        let rows = vec![Row { flutter: Some(0), surface: Some(0), link_si: Some(0), connected: false }];
+        let heights = vec![2];
+        let g = build_connector_glyphs(&rows, &heights, 0, 4, 7);
+        assert!(g.iter().all(|l| l.trim().is_empty()), "no line when disconnected; got {:?}", g);
+    }
+
+    #[test]
+    fn shared_agent_draws_orthogonal_bus() {
+        // Two apps (rows 0 and 1) share agent rendered on row 0.
+        let rows = vec![
+            Row { flutter: Some(0), surface: Some(5), link_si: Some(5), connected: true }, // head: renders agent
+            Row { flutter: Some(1), surface: None,    link_si: Some(5), connected: true }, // member
+        ];
+        let heights = vec![2, 2];
+        let g = build_connector_glyphs(&rows, &heights, 0, 4, 7);
+        // Row 0 anchor at line 0, row 1 anchor at line 2. Bus column = 3.
+        let chars = |s: &str| s.chars().collect::<Vec<_>>();
+        // Line 0 = head row: left stub + tee (agent stub goes right too).
+        let l0 = chars(&g[0]);
+        assert_eq!(l0[3], '┬', "head corner is a downward tee; got {:?}", g[0]);
+        assert_eq!(&l0[0..3], &['─', '─', '─'], "head has left stub");
+        assert_eq!(&l0[4..7], &['─', '─', '─'], "head extends right toward agent");
+        // Line 1 = vertical bus between the two members.
+        assert_eq!(chars(&g[1])[3], '│', "bus runs vertically");
+        // Line 2 = bottom member: left stub + bottom corner, no right stub.
+        let l2 = chars(&g[2]);
+        assert_eq!(l2[3], '┘', "bottom member corner; got {:?}", g[2]);
+        assert_eq!(&l2[0..3], &['─', '─', '─'], "bottom member has left stub");
+        assert_eq!(&l2[4..7], &[' ', ' ', ' '], "no right stub on a non-agent member");
+    }
+}

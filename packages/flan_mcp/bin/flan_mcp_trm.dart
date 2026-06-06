@@ -98,9 +98,8 @@ Future<int> main(List<String> arguments) async {
     }
 
     // --- Best-effort cmux bridge ---
-    // Always create the bridge — it uses the flan server HTTP endpoint first
-    // regardless of whether the cmux socket is reachable. Only discard it if
-    // even the flan server is unreachable (handled inside sendProcessQueue).
+    // Used only for surface identification / connection bookkeeping; message
+    // delivery flows through the flan-channel push path, not pane injection.
     final cmuxBridge = CmuxPaneBridge();
     try {
       await cmuxBridge.connect();

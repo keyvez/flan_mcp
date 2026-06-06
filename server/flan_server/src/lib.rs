@@ -138,6 +138,15 @@ pub struct FlutterApp {
     pub device: Option<String>,
     #[serde(default)]
     pub queue_count: usize,
+    /// Whether an agent is currently CONNECTED to this app — the steady
+    /// connection truth, distinct from a persisted association. Drives whether
+    /// the TUI draws a connector line.
+    #[serde(default)]
+    pub connected: bool,
+    /// The `--web-port` this app was launched with, if any. Used to identify a
+    /// web app that flushes with only its origin (no vm_service_uri / pid).
+    #[serde(default)]
+    pub web_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,7 +286,14 @@ pub struct SharedState {
 impl SharedState {
     pub fn new() -> Self {
         let persistence_path = flan_dir().join("associations.json");
-        let associations = load_associations(&persistence_path);
+        let mut associations = load_associations(&persistence_path);
+        // One-time migration: older builds keyed trm associations by the
+        // positional surface index (trm:<index>), which drifts as panes are
+        // created/removed and silently re-points links at the wrong agent. The
+        // key is now the stable trm:<pane_id>, and the old index→pane mapping
+        // can't be faithfully recovered. Drop the legacy trm associations once
+        // so the user re-links cleanly; cmux associations are untouched.
+        migrate_drop_legacy_trm_associations(&persistence_path, &mut associations);
         Self {
             associations: RwLock::new(associations),
             persistence_path,
@@ -344,6 +360,10 @@ mod server {
         vm_service_uri: Option<String>,
         /// "desktop" to route to floss instead of Flutter VM service.
         mode: Option<String>,
+        /// The web app's own origin (e.g. "http://localhost:5005"). Web apps
+        /// can't read their vm_service_uri, so they send this; the server maps
+        /// the port to the flutter app's --web-port.
+        origin: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -522,16 +542,46 @@ mod server {
             save_associations(&state.persistence_path, &assocs);
         }
 
-        let assoc = if let Some(pid) = body.flutter_pid {
-            // Prefer an exact pid match; fall back to any saved association so
-            // that a re-launched Flutter app (new pid) still routes to the
-            // linked Claude surface.
-            assocs.iter().find(|a| a.flutter_pid == pid)
-                .or_else(|| assocs.first())
-                .cloned()
-        } else {
-            assocs.first().cloned()
-        };
+        // The Flutter overlay flushes with only `vm_service_uri` (no pid — it
+        // can't get its own flutter_tools pid, especially on web). Resolve the
+        // pid from the vm_service_uri via the flutter cache so we can match the
+        // association by pid. Without this, a vm-uri-only flush finds no
+        // association and the app reports "no agent connected".
+        //
+        // On WEB there is no vm_service_uri either (dart:isolate unsupported),
+        // so the app sends its own `origin` (http://host:PORT). We map that PORT
+        // to the flutter app's --web-port. This is the only identifier a web app
+        // actually has.
+        let origin_port = body.origin.as_deref().and_then(parse_origin_port);
+        let resolved_pid = body.flutter_pid.or_else(|| {
+            let cache = state.flutter_cache.try_read().ok()?;
+            let (_, ref apps) = (*cache).as_ref()?;
+            // 1. Match by vm_service_uri (native/desktop debug apps).
+            if let Some(uri) = body.vm_service_uri.as_ref() {
+                if let Some(app) = apps.iter()
+                    .find(|a| a.vm_service_uri.as_deref() == Some(uri.as_str()))
+                {
+                    return Some(app.pid);
+                }
+            }
+            // 2. Match by web port (web apps).
+            if let Some(port) = origin_port {
+                if let Some(app) = apps.iter().find(|a| a.web_port == Some(port)) {
+                    return Some(app.pid);
+                }
+            }
+            None
+        });
+
+        // Only an EXACT pid match counts as an association here. We deliberately
+        // do NOT fall back to `assocs.first()`: with multiple linked services
+        // that would route every unmatched flush to whichever association sits
+        // first in the vector — the "all tests go to the first agent" bug. When
+        // there's no exact match (e.g. a re-launched Flutter app with a new
+        // pid), we leave `assoc` as None and let the cwd-based surface discovery
+        // below pick the correct Claude surface by matching working directories.
+        let assoc = resolved_pid
+            .and_then(|pid| assocs.iter().find(|a| a.flutter_pid == pid).cloned());
         let pruned = before - assocs.len();
         drop(assocs);
 
@@ -546,8 +596,8 @@ mod server {
             // Try to find the Claude Code surface whose cwd matches the
             // flutter app's cwd (or an ancestor/descendant), preferring an
             // exact match. Falls back to any Claude Code surface.
-            let flutter_cwd = body.flutter_pid
-                .map(|pid| get_process_cwd(pid))
+            let flutter_cwd = resolved_pid
+                .map(get_process_cwd)
                 .unwrap_or_default();
 
             let cc_surfaces: Vec<&CmuxSurface> = surfaces
@@ -598,7 +648,7 @@ mod server {
         } else {
             body.vm_service_uri.clone().or_else(|| {
                 let flutter_pid = assoc.as_ref().map(|a| a.flutter_pid)
-                    .or(body.flutter_pid)?;
+                    .or(resolved_pid)?;
                 if let Ok(cache) = state.flutter_cache.try_read() {
                     if let Some((_, ref apps)) = *cache {
                         if let Some(app) = apps.iter().find(|a| a.pid == flutter_pid) {
@@ -713,7 +763,7 @@ mod server {
             let assigned_port = p.login_pid
                 .and_then(|lp| login_ports.get(&lp).copied())
                 .or_else(|| {
-                    let key = format!("trm:{}", p.index);
+                    let key = format!("trm:{}", p.pane_id);
                     surface_ports.get(&key).copied()
                 })
                 .or_else(|| {
@@ -850,14 +900,28 @@ mod server {
         let flutter_pid: Option<u32> = params.get("pid").and_then(|s| s.parse().ok());
         let assocs = state.associations.read().await;
 
-        // Find the association for this flutter pid (exact match, then any).
-        let assoc = if let Some(pid) = flutter_pid {
-            assocs.iter().find(|a| a.flutter_pid == pid)
-                .or_else(|| assocs.first())
+        // Prefer an exact pid match. If that fails (e.g. the app relaunched with
+        // a new pid, or discovery momentarily lost it), fall back to matching by
+        // working directory — the association whose own stored flutter app shares
+        // this app's cwd. We deliberately do NOT fall back to assocs.first(),
+        // which would mislabel an unmatched app as linked to the first agent
+        // (the same root cause as the flush mis-routing bug).
+        let assoc = flutter_pid.and_then(|pid| {
+            if let Some(a) = assocs.iter().find(|a| a.flutter_pid == pid) {
+                return Some(a.clone());
+            }
+            // cwd-based recovery: compare this app's cwd against the cwd of each
+            // association's stored flutter app. Exact cwd equality only — no
+            // first() guessing.
+            let my_cwd = get_process_cwd(pid);
+            if my_cwd.is_empty() {
+                return None;
+            }
+            assocs
+                .iter()
+                .find(|a| get_process_cwd(a.flutter_pid) == my_cwd)
                 .cloned()
-        } else {
-            assocs.first().cloned()
-        };
+        });
 
         // Derive a short label from the claude_surface_id.
         // For trm panes, look up the surface's folder_name via discover_trm_panes.
@@ -865,10 +929,10 @@ mod server {
             let sid = &a.claude_surface_id;
             if sid.starts_with("trm:") {
                 // Try to get the folder_name for this pane from live discovery.
-                if let Ok(idx) = sid["trm:".len()..].parse::<usize>() {
+                if let Ok(pane_id) = sid["trm:".len()..].parse::<usize>() {
                     let panes = discover_trm_panes();
                     panes.iter()
-                        .find(|p| p.index == idx)
+                        .find(|p| p.pane_id == pane_id)
                         .and_then(|p| p.folder_name.clone())
                         .unwrap_or_else(|| sid.clone())
                 } else {
@@ -1100,6 +1164,29 @@ pub fn save_associations(path: &PathBuf, associations: &[Association]) {
     }
 }
 
+/// One-time migration: remove `trm:`-keyed associations left over from the
+/// positional-index scheme. Gated by a marker file in ~/.flan so it runs once.
+/// Mutates `associations` in place and persists the result if anything changed.
+pub fn migrate_drop_legacy_trm_associations(path: &PathBuf, associations: &mut Vec<Association>) {
+    let marker = flan_dir().join(".trm_pane_id_migration_done");
+    if marker.exists() {
+        return;
+    }
+    let before = associations.len();
+    associations.retain(|a| !a.claude_surface_id.starts_with("trm:"));
+    let dropped = before - associations.len();
+    if dropped > 0 {
+        save_associations(path, associations);
+        tracing::info!(
+            "Migration: dropped {} legacy positional trm association(s); re-link affected services",
+            dropped
+        );
+    }
+    // Write the marker regardless, so the migration never runs again even if
+    // there was nothing to drop.
+    std::fs::write(&marker, "1").ok();
+}
+
 pub fn new_association_id() -> String {
     format!(
         "{}",
@@ -1253,21 +1340,24 @@ pub fn discover_flutter_apps() -> Vec<FlutterApp> {
         };
 
         let device = extract_device_flag(line);
+        let web_port = extract_web_port(line);
         let cwd = get_process_cwd(pid);
         let folder_name = cwd.rsplit('/').next().unwrap_or(&cwd).to_string();
         let vm_uri = probe_vm_service_uri(pid);
 
-        let queue_count = vm_uri
+        let peek = vm_uri
             .as_deref()
-            .map(peek_flan_queue)
-            .unwrap_or(0);
+            .map(peek_flan)
+            .unwrap_or_default();
         apps.push(FlutterApp {
             pid,
             cwd,
             folder_name,
             vm_service_uri: vm_uri,
             device: Some(device),
-            queue_count,
+            queue_count: peek.queue_count,
+            connected: peek.connected,
+            web_port,
         });
     }
 
@@ -1297,6 +1387,34 @@ pub fn extract_device_flag(cmd_line: &str) -> String {
         }
     }
     "unknown".to_string()
+}
+
+/// Parse the `--web-port` from a flutter run command line. Web apps can't read
+/// their own VM service URI (no dart:isolate), so they identify themselves to
+/// the flan server by their web origin/port; this lets the server map that back
+/// to the flutter process. Handles both `--web-port 5005` and `--web-port=5005`.
+pub fn extract_web_port(cmd_line: &str) -> Option<u16> {
+    let parts: Vec<&str> = cmd_line.split_whitespace().collect();
+    for (i, part) in parts.iter().enumerate() {
+        if let Some(rest) = part.strip_prefix("--web-port=") {
+            return rest.parse().ok();
+        }
+        if *part == "--web-port" {
+            return parts.get(i + 1).and_then(|p| p.parse().ok());
+        }
+    }
+    None
+}
+
+/// Extract the port from a web origin like "http://localhost:5005" or
+/// "http://127.0.0.1:5005/". Returns None if no explicit port is present.
+pub fn parse_origin_port(origin: &str) -> Option<u16> {
+    // Strip scheme.
+    let after_scheme = origin.split("://").nth(1).unwrap_or(origin);
+    // Take the authority (up to the first '/').
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Port is after the last ':'.
+    authority.rsplit(':').next().and_then(|p| p.parse().ok())
 }
 
 pub fn probe_vm_service_uri(pid: u32) -> Option<String> {
@@ -1479,26 +1597,67 @@ pub fn probe_port(port: u16) -> Option<String> {
     None
 }
 
-/// Call ext.flutter.flan.peekUserMessages via the VM service WebSocket and
-/// return the queue count, or 0 if unreachable / extension not registered.
+/// Result of probing a Flutter app's flan extension.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlanPeek {
+    /// Number of queued user messages awaiting the agent.
+    pub queue_count: usize,
+    /// Whether an agent is currently CONNECTED to this app — the steady
+    /// connection truth (true from `connect` until disconnect), as opposed to a
+    /// mere persisted association. Drives the TUI connector line.
+    pub connected: bool,
+}
+
+/// Backwards-compatible helper returning just the queue count.
 pub fn peek_flan_queue(ws_uri: &str) -> usize {
-    use tungstenite::connect;
+    peek_flan(ws_uri).queue_count
+}
+
+/// Call ext.flutter.flan.peekUserMessages via the VM service WebSocket and
+/// return the queue count and live listening state. Returns the default
+/// (count 0, not listening) if unreachable / extension not registered.
+pub fn peek_flan(ws_uri: &str) -> FlanPeek {
+    use std::net::ToSocketAddrs;
     use tungstenite::Message;
 
-    // ws_uri looks like ws://127.0.0.1:PORT/TOKEN/ws
-    let (mut socket, _) = match connect(ws_uri) {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-
     let timeout = Duration::from_secs(3);
+
+    // Connect with bounded timeouts. We do NOT use tungstenite's `connect()`
+    // helper because it has no connect/read timeout — a VM service that accepts
+    // the TCP connection but never completes the handshake or never replies
+    // (seen with native macOS apps whose auth-gated port stalls) would block
+    // `read()` forever, hanging the entire discovery cycle and taking down
+    // /api/flutter-apps. Instead, open the TCP stream with connect_timeout, set
+    // a read timeout so every read is bounded, then run the WS handshake on it.
+    //
+    // ws_uri looks like ws://127.0.0.1:PORT/TOKEN/ws
+    let host_port = ws_uri
+        .trim_start_matches("ws://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let addr = match host_port.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+        Some(a) => a,
+        None => return FlanPeek::default(),
+    };
+    let tcp = match TcpStream::connect_timeout(&addr, timeout) {
+        Ok(s) => s,
+        Err(_) => return FlanPeek::default(),
+    };
+    if tcp.set_read_timeout(Some(timeout)).is_err() {
+        return FlanPeek::default();
+    }
+    let (mut socket, _) = match tungstenite::client(ws_uri, tcp) {
+        Ok(v) => v,
+        Err(_) => return FlanPeek::default(),
+    };
 
     // 1. Get the isolate id.
     let get_vm = serde_json::json!({
         "jsonrpc": "2.0", "method": "getVM", "id": "1"
     })
     .to_string();
-    if socket.send(Message::Text(get_vm.into())).is_err() { return 0; }
+    if socket.send(Message::Text(get_vm.into())).is_err() { return FlanPeek::default(); }
 
     let isolate_id = 'outer: {
         let deadline = std::time::Instant::now() + timeout;
@@ -1520,37 +1679,45 @@ pub fn peek_flan_queue(ws_uri: &str) -> usize {
 
     let isolate_id = match isolate_id {
         Some(id) => id,
-        None => return 0,
+        None => return FlanPeek::default(),
     };
 
-    // 2. Call peekUserMessages.
+    // 2. Call peekUserMessages. Service extensions are invoked DIRECTLY by their
+    //    registered method name — NOT wrapped in `callServiceExtension` (that
+    //    yields -32601 "Unknown method" on this VM service, which silently
+    //    dropped count + connected to defaults).
     let peek = serde_json::json!({
         "jsonrpc": "2.0",
-        "method": "callServiceExtension",
+        "method": "ext.flutter.flan.peekUserMessages",
         "params": {
             "isolateId": isolate_id,
-            "method": "ext.flutter.flan.peekUserMessages",
         },
         "id": "2"
     })
     .to_string();
-    if socket.send(Message::Text(peek.into())).is_err() { return 0; }
+    if socket.send(Message::Text(peek.into())).is_err() { return FlanPeek::default(); }
 
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if std::time::Instant::now() > deadline { return 0; }
+        if std::time::Instant::now() > deadline { return FlanPeek::default(); }
         match socket.read() {
             Ok(Message::Text(t)) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
                     if v["id"] == "2" {
                         let count = v["result"]["count"].as_u64().unwrap_or(0) as usize;
+                        // Prefer the steady `connected` (isHostConnected). Fall
+                        // back to the transient `listening` for older app builds
+                        // that don't send `connected`. Missing both → false.
+                        let connected = v["result"]["connected"].as_bool()
+                            .or_else(|| v["result"]["listening"].as_bool())
+                            .unwrap_or(false);
                         let _ = socket.close(None);
-                        return count;
+                        return FlanPeek { queue_count: count, connected };
                     }
                 }
             }
             Ok(_) => continue,
-            Err(_) => return 0,
+            Err(_) => return FlanPeek::default(),
         }
     }
 }
@@ -2239,7 +2406,8 @@ pub fn resolve_trm_pane_for_pid(target_pid: u32, cwd_hint: Option<&str>) -> Opti
     // If target_login was matched to a surface, return it.
     if let Some((&raw_idx, _)) = surface_to_login.iter().find(|(_, &lp)| lp == target_login) {
         if let Some(pane) = panes.get(raw_idx) {
-            let sid = format!("trm:{}", pane.index);
+            // Key by stable pane_id, not positional index — see ClaudeEntry::id.
+            let sid = format!("trm:{}", pane.pane_id);
             tracing::info!("resolve_trm_pane_for_pid: pid {} → {} (title↔cwd)", target_pid, sid);
             return Some(sid);
         }
@@ -2254,7 +2422,8 @@ pub fn resolve_trm_pane_for_pid(target_pid: u32, cwd_hint: Option<&str>) -> Opti
             .map(|c| c.trim_end_matches('/') == effective_clean)
             .unwrap_or(false)
     }) {
-        let sid = format!("trm:{}", pane.index);
+        // Key by stable pane_id, not positional index — see ClaudeEntry::id.
+        let sid = format!("trm:{}", pane.pane_id);
         tracing::info!("resolve_trm_pane_for_pid: pid {} → {} (pane cwd exact)", target_pid, sid);
         return Some(sid);
     }
@@ -2577,4 +2746,24 @@ pub fn focus_macos_app() -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod web_identity_tests {
+    use super::*;
+
+    #[test]
+    fn extract_web_port_both_forms() {
+        assert_eq!(extract_web_port("dart flutter run -d chrome --web-port 5005 --foo"), Some(5005));
+        assert_eq!(extract_web_port("flutter run --web-port=3001 -d chrome"), Some(3001));
+        assert_eq!(extract_web_port("flutter run -d chrome"), None);
+    }
+
+    #[test]
+    fn parse_origin_port_variants() {
+        assert_eq!(parse_origin_port("http://localhost:5005"), Some(5005));
+        assert_eq!(parse_origin_port("http://127.0.0.1:3001/"), Some(3001));
+        assert_eq!(parse_origin_port("http://localhost"), None); // no explicit port
+        assert_eq!(parse_origin_port("https://example.com:8080/path"), Some(8080));
+    }
 }

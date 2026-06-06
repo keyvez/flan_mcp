@@ -15,3 +15,6 @@ build/
 
 # Logs
 *.log
+
+# Vendored GhosttyKit binary framework (784MB — do not commit)
+macos/

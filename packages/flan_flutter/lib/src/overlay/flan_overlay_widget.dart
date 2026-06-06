@@ -1379,11 +1379,23 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       var hasLinkedChannel = false;
       // If we don't have the URI yet, ask the TUI.
       if (wsUri == null) {
+        // On web we can't read our own vm_service_uri, so identify ourselves by
+        // our origin (http://host:web-port). The server maps the port to the
+        // flutter app's --web-port. Without this the server can't tell which app
+        // is flushing and returns no channel ("no linked receiver").
+        String? origin;
+        try {
+          origin = Uri.base.hasPort ? Uri.base.origin : null;
+        } catch (_) {
+          origin = null;
+        }
         try {
           final tuiRes = await http.post(
             Uri.parse('http://127.0.0.1:4050/api/flush'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode(<String, dynamic>{}),
+            body: jsonEncode(<String, dynamic>{
+              if (origin != null) 'origin': origin,
+            }),
           );
           if (tuiRes.statusCode == 200) {
             final tuiData = jsonDecode(tuiRes.body) as Map<String, dynamic>;

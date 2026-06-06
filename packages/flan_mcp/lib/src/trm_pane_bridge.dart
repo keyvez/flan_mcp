@@ -12,7 +12,7 @@ import 'package:logging/logging.dart' as logging;
 /// ```dart
 /// final bridge = TrmPaneBridge();
 /// await bridge.connect();
-/// await bridge.sendProcessQueue();
+/// await bridge.markConnected();
 /// ```
 class TrmPaneBridge {
   TrmPaneBridge({String? socketPath})
@@ -40,11 +40,6 @@ class TrmPaneBridge {
 
   /// How long to cache the detected pane index before re-detecting.
   static const _detectionCacheDuration = Duration(minutes: 5);
-
-  /// Debounce window: ignore rapid-fire sends within this duration.
-  static const _debounceDuration = Duration(milliseconds: 500);
-
-  DateTime? _lastSendTime;
 
   // Buffer for incoming data (newline-delimited JSON).
   final _incomingBuffer = StringBuffer();
@@ -190,51 +185,6 @@ class TrmPaneBridge {
   }
 
   bool get isConnected => _socket != null;
-
-  /// Send `process_queue\r` to the detected Claude pane.
-  ///
-  /// Debounces rapid calls. Silently returns if not connected or no
-  /// claude pane is found.
-  Future<void> sendProcessQueue() async {
-    await _sendInput('process_queue');
-  }
-
-  /// Send arbitrary text + CR to the Claude pane.
-  Future<void> _sendInput(String text) async {
-    // Debounce
-    final now = DateTime.now();
-    if (_lastSendTime != null &&
-        now.difference(_lastSendTime!) < _debounceDuration) {
-      _logger.fine('Debouncing send (too soon after last send)');
-      return;
-    }
-
-    try {
-      await _ensureConnected();
-
-      final pane = await _detectClaudePane();
-      if (pane == null) {
-        _logger.warning('No Claude pane detected, cannot send input');
-        return;
-      }
-
-      _lastSendTime = now;
-      await _sendMsg({'type': 'send', 'pane': pane, 'text': '$text\r'});
-      final resp = await _recvMsg();
-
-      if (resp?['status'] == 'queued') {
-        _logger.info('Sent "$text" to trm pane $pane');
-      } else {
-        _logger.warning('Failed to send to pane $pane: $resp');
-        // Invalidate cache so we re-detect next time.
-        _cachedClaudePane = null;
-        _lastDetectionTime = null;
-      }
-    } catch (err) {
-      _logger.warning('Error sending input to trm: $err');
-      _disconnect();
-    }
-  }
 
   Future<void> _ensureConnected() async {
     if (_socket == null) {

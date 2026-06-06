@@ -653,6 +653,18 @@ class FlanBinding extends WidgetsFlutterBinding {
           return <String, dynamic>{
             'status': 'Success',
             'count': consumableCount,
+            // Live connection state, so the TUI can show a connector line only
+            // when an agent is actually connected (not merely associated).
+            // Piggybacks on this existing probe to avoid a second round-trip.
+            //
+            // `connected` (isHostConnected) is the STEADY signal — true from
+            // when the agent calls `connect` until it disconnects. `listening`
+            // (isAgentListening) is transient (only while actively processing
+            // the queue) and self-clears on a heartbeat timeout, so it's not
+            // suitable for a persistent connector line. We expose both; the TUI
+            // uses `connected`.
+            'connected': _userMessageService.isHostConnected,
+            'listening': _userMessageService.isAgentListening,
           };
         } catch (err, st) {
           return <String, dynamic>{
