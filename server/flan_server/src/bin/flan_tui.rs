@@ -645,7 +645,16 @@ impl App {
         self.cmux_surfaces = surfaces;
         let mut trm = trm;
         // Attach registered channel ports to trm panes.
-        // Priority: 1) login PID (most reliable), 2) surface_id key, 3) cwd prefix match.
+        // Priority: 1) surface_id key, 2) login PID, 3) cwd prefix match.
+        //
+        // The surface_id key is authoritative: it is produced by
+        // resolve_trm_pane_for_pid, which anchors a channel to its pane via the
+        // PANE's login PID (a 1:1 identifier). The by-login map, by contrast, is
+        // keyed on the CHANNEL process's own self-resolved login PID, which can
+        // land on the wrong pane when several panes share a cwd (a Claude pane
+        // and sibling shell panes in the same repo) — that mis-key was routing
+        // app flushes to a Claude-less pane. Trust the surface key first so a
+        // stale/bad by-login entry can't override a correct surface resolution.
         {
             let ports = self.shared.channel_ports.read().await;
             let login_ports = self.shared.channel_ports_by_login.read().await;
@@ -653,17 +662,22 @@ impl App {
             let mut used_cwds: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             for pane in &mut trm {
-                // 1. Login PID match — most reliable, survives title changes.
+                // 1. Direct surface_id key match (keyed by stable pane_id).
+                //    Authoritative — see the block comment above.
+                let key = format!("trm:{}", pane.pane_id);
+                if let Some(&port) = ports.get(&key) {
+                    pane.channel_port = Some(port);
+                    continue;
+                }
+
+                // 2. Login PID match — fallback when the surface key is absent
+                //    (e.g. title-less pane the surface resolver couldn't map).
                 if let Some(login_pid) = pane.login_pid {
                     if let Some(&port) = login_ports.get(&login_pid) {
                         pane.channel_port = Some(port);
                         continue;
                     }
                 }
-
-                // 2. Direct surface_id key match (keyed by stable pane_id).
-                let key = format!("trm:{}", pane.pane_id);
-                pane.channel_port = ports.get(&key).copied();
 
                 // 3. Cwd prefix match (fallback for panes whose login wasn't resolved).
                 if pane.channel_port.is_none() && pane.has_claude && !cwd_ports.is_empty() {
@@ -1485,10 +1499,18 @@ async fn main() -> io::Result<()> {
                                 let surface_id = app.selected_claude_id();
 
                                 if let (Some(pid), Some(sid)) = (flutter_pid, surface_id) {
+                                    // Capture the app's cwd so the link survives a
+                                    // rebuild (new pid, same cwd) — the flush
+                                    // handler re-binds by cwd when the pid misses.
+                                    let flutter_cwd = app
+                                        .selected_flutter()
+                                        .map(|f| f.cwd.clone())
+                                        .filter(|c| !c.is_empty());
                                     let assoc = Association {
                                         id: new_association_id(),
                                         claude_surface_id: sid.clone(),
                                         flutter_pid: pid,
+                                        flutter_cwd,
                                     };
                                     // Update shared state
                                     {

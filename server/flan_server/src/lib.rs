@@ -202,6 +202,12 @@ pub struct Association {
     pub id: String,
     pub claude_surface_id: String,
     pub flutter_pid: u32,
+    /// The Flutter app's working directory at link time. Lets a rebuilt app
+    /// (same cwd, new pid) re-resolve its association even though `flutter_pid`
+    /// no longer matches. Optional for backward-compat with older persisted
+    /// associations that predate this field.
+    #[serde(default)]
+    pub flutter_cwd: Option<String>,
 }
 
 /// An annotated feedback message sent by a web (React) client over the
@@ -468,10 +474,27 @@ mod server {
         State(state): State<Arc<SharedState>>,
         Json(body): Json<CreateAssociation>,
     ) -> impl IntoResponse {
+        // Capture the app's cwd so the link survives a rebuild (new pid, same
+        // cwd). Resolved from the flutter cache when possible, else probed.
+        let flutter_cwd = {
+            let pid = body.flutter_pid;
+            let cached = state.flutter_cache.try_read().ok().and_then(|c| {
+                c.as_ref().and_then(|(_, apps)| {
+                    apps.iter().find(|a| a.pid == pid).map(|a| a.cwd.clone())
+                })
+            });
+            cached
+                .filter(|c| !c.is_empty())
+                .or_else(|| {
+                    let c = get_process_cwd(pid);
+                    if c.is_empty() { None } else { Some(c) }
+                })
+        };
         let assoc = Association {
             id: new_association_id(),
             claude_surface_id: body.claude_surface_id,
             flutter_pid: body.flutter_pid,
+            flutter_cwd,
         };
         let mut assocs = state.associations.write().await;
         assocs.retain(|a| a.flutter_pid != assoc.flutter_pid);
@@ -573,15 +596,32 @@ mod server {
             None
         });
 
-        // Only an EXACT pid match counts as an association here. We deliberately
+        // The flushing app's own cwd, used both for the cwd-keyed association
+        // fallback below and the surface-discovery fallback further down.
+        let flutter_cwd = resolved_pid
+            .map(get_process_cwd)
+            .filter(|c| !c.is_empty());
+
+        // Only an EXACT pid match counts as a primary association. We deliberately
         // do NOT fall back to `assocs.first()`: with multiple linked services
         // that would route every unmatched flush to whichever association sits
-        // first in the vector — the "all tests go to the first agent" bug. When
-        // there's no exact match (e.g. a re-launched Flutter app with a new
-        // pid), we leave `assoc` as None and let the cwd-based surface discovery
-        // below pick the correct Claude surface by matching working directories.
+        // first in the vector — the "all tests go to the first agent" bug.
+        //
+        // When the pid doesn't match (the common case after an app rebuild —
+        // new pid, same cwd), recover by matching the app's cwd against the cwd
+        // captured when the link was created. This re-binds a rebuilt app to its
+        // existing agent link automatically, no manual re-link needed. We still
+        // require an EXACT cwd equality (not prefix) so two apps under sibling
+        // dirs can't steal each other's link.
         let assoc = resolved_pid
-            .and_then(|pid| assocs.iter().find(|a| a.flutter_pid == pid).cloned());
+            .and_then(|pid| assocs.iter().find(|a| a.flutter_pid == pid).cloned())
+            .or_else(|| {
+                let cwd = flutter_cwd.as_ref()?;
+                assocs
+                    .iter()
+                    .find(|a| a.flutter_cwd.as_deref() == Some(cwd.as_str()))
+                    .cloned()
+            });
         let pruned = before - assocs.len();
         drop(assocs);
 
@@ -596,9 +636,7 @@ mod server {
             // Try to find the Claude Code surface whose cwd matches the
             // flutter app's cwd (or an ancestor/descendant), preferring an
             // exact match. Falls back to any Claude Code surface.
-            let flutter_cwd = resolved_pid
-                .map(get_process_cwd)
-                .unwrap_or_default();
+            let cwd = flutter_cwd.clone().unwrap_or_default();
 
             let cc_surfaces: Vec<&CmuxSurface> = surfaces
                 .iter()
@@ -608,10 +646,10 @@ mod server {
             cc_surfaces
                 .iter()
                 .find(|s| {
-                    if let (Some(ref scwd), false) = (&s.cwd, flutter_cwd.is_empty()) {
-                        scwd == &flutter_cwd
-                            || flutter_cwd.starts_with(&format!("{}/", scwd))
-                            || scwd.starts_with(&format!("{}/", flutter_cwd))
+                    if let (Some(ref scwd), false) = (&s.cwd, cwd.is_empty()) {
+                        scwd == &cwd
+                            || cwd.starts_with(&format!("{}/", scwd))
+                            || scwd.starts_with(&format!("{}/", cwd))
                     } else {
                         false
                     }
@@ -2403,28 +2441,10 @@ pub fn resolve_trm_pane_for_pid(target_pid: u32, cwd_hint: Option<&str>) -> Opti
     // Use discover_trm_panes for consistent index mapping.
     let panes = discover_trm_panes();
 
-    // If target_login was matched to a surface, return it.
-    if let Some((&raw_idx, _)) = surface_to_login.iter().find(|(_, &lp)| lp == target_login) {
-        if let Some(pane) = panes.get(raw_idx) {
-            // Key by stable pane_id, not positional index — see ClaudeEntry::id.
-            let sid = format!("trm:{}", pane.pane_id);
-            tracing::info!("resolve_trm_pane_for_pid: pid {} → {} (title↔cwd)", target_pid, sid);
-            return Some(sid);
-        }
-    }
-
-    // target_login wasn't matched via title. Try matching by cwd against
-    // discover_trm_panes results (which includes neighbor-derived cwds).
-    let effective_clean = effective_cwd.trim_end_matches('/');
-    // Exact match
-    if let Some(pane) = panes.iter().find(|p| {
-        p.has_claude && p.cwd.as_deref()
-            .map(|c| c.trim_end_matches('/') == effective_clean)
-            .unwrap_or(false)
-    }) {
-        // Key by stable pane_id, not positional index — see ClaudeEntry::id.
-        let sid = format!("trm:{}", pane.pane_id);
-        tracing::info!("resolve_trm_pane_for_pid: pid {} → {} (pane cwd exact)", target_pid, sid);
+    if let Some((sid, how)) =
+        pick_pane_for_login(&panes, target_login, effective_cwd, &surface_to_login)
+    {
+        tracing::info!("resolve_trm_pane_for_pid: pid {} → {} ({})", target_pid, sid, how);
         return Some(sid);
     }
 
@@ -2432,6 +2452,54 @@ pub fn resolve_trm_pane_for_pid(target_pid: u32, cwd_hint: Option<&str>) -> Opti
         "resolve_trm_pane_for_pid: pid {} — no match (login={}, cwd={}, claimed={:?})",
         target_pid, target_login, effective_cwd, claimed_logins
     );
+    None
+}
+
+/// Pure pane-selection ladder, factored out of `resolve_trm_pane_for_pid` so it
+/// can be unit-tested without spawning `ps`/`lsof`/`trm`. Given the discovered
+/// panes and a channel's resolved trm login PID, return the surface id
+/// (`trm:<pane_id>`) of the pane that owns the channel, plus a short tag naming
+/// which rule matched (for log breadcrumbs).
+///
+/// Priority — login PID first, by design:
+///   1. login PID — a 1:1 identifier for a pane. Authoritative even when
+///      several panes share one cwd (a Claude pane + sibling shell panes in the
+///      same repo). This is the regression fix: the cwd-based rules below are
+///      ambiguous there and would map a shell pane's channel onto the Claude
+///      pane's surface key, stealing the route so app flushes land on the wrong
+///      (or a Claude-less) pane.
+///   2. title↔cwd surface match (`surface_to_login`) — for panes the login walk
+///      couldn't place but whose title path matched a login's shell cwd.
+///   3. exact pane cwd — last-resort match against a has_claude pane.
+fn pick_pane_for_login(
+    panes: &[TrmPane],
+    target_login: u32,
+    effective_cwd: &str,
+    surface_to_login: &HashMap<usize, u32>,
+) -> Option<(String, &'static str)> {
+    // 1. Login PID — see the rationale above.
+    if let Some(pane) = panes.iter().find(|p| p.login_pid == Some(target_login)) {
+        return Some((format!("trm:{}", pane.pane_id), "login pid"));
+    }
+
+    // 2. title↔cwd surface match.
+    if let Some((&raw_idx, _)) = surface_to_login.iter().find(|(_, &lp)| lp == target_login) {
+        if let Some(pane) = panes.get(raw_idx) {
+            return Some((format!("trm:{}", pane.pane_id), "title↔cwd"));
+        }
+    }
+
+    // 3. Exact pane cwd against a has_claude pane.
+    let effective_clean = effective_cwd.trim_end_matches('/');
+    if let Some(pane) = panes.iter().find(|p| {
+        p.has_claude
+            && p.cwd.as_deref()
+                .map(|c| c.trim_end_matches('/') == effective_clean)
+                .unwrap_or(false)
+    }) {
+        return Some((format!("trm:{}", pane.pane_id), "pane cwd exact"));
+    }
+
     None
 }
 
@@ -2765,5 +2833,87 @@ mod web_identity_tests {
         assert_eq!(parse_origin_port("http://127.0.0.1:3001/"), Some(3001));
         assert_eq!(parse_origin_port("http://localhost"), None); // no explicit port
         assert_eq!(parse_origin_port("https://example.com:8080/path"), Some(8080));
+    }
+}
+
+#[cfg(test)]
+mod pane_routing_tests {
+    use super::*;
+
+    fn pane(pane_id: usize, login_pid: u32, cwd: &str, has_claude: bool) -> TrmPane {
+        TrmPane {
+            index: pane_id,
+            pane_id,
+            folder_name: None,
+            cwd: Some(cwd.to_string()),
+            has_claude,
+            agent_name: None,
+            surface_id: None,
+            title: None,
+            channel_port: None,
+            login_pid: Some(login_pid),
+            has_dev_channels: false,
+        }
+    }
+
+    // The regression: four panes share one cwd — a Claude pane plus sibling
+    // shell panes opened in the same repo. The cwd-only rule can't tell them
+    // apart, so resolving a channel by cwd could map a shell pane's channel onto
+    // the Claude pane's surface key, stealing the route. Anchoring on the login
+    // PID resolves each channel to the pane it actually runs in.
+    #[test]
+    fn shared_cwd_resolves_by_login_not_cwd() {
+        let repo = "/Users/gaurav/dev/fasmac";
+        let panes = vec![
+            pane(0, 44111, repo, true),   // the Claude pane
+            pane(20, 43392, repo, false), // sibling shell
+            pane(28, 43399, repo, false), // sibling shell (was stealing trm:0)
+        ];
+        let surface_to_login = HashMap::new();
+
+        // The shell pane's channel must resolve to its OWN pane, not the Claude
+        // pane — this is the exact mis-route that sent app flushes nowhere.
+        let (sid, how) = pick_pane_for_login(&panes, 43399, repo, &surface_to_login).unwrap();
+        assert_eq!(sid, "trm:28");
+        assert_eq!(how, "login pid");
+
+        // And the Claude pane's channel resolves to the Claude pane.
+        let (sid, _) = pick_pane_for_login(&panes, 44111, repo, &surface_to_login).unwrap();
+        assert_eq!(sid, "trm:0");
+    }
+
+    // When the login walk couldn't place the pane (no login_pid match), fall
+    // back to the title↔cwd surface map, then to an exact has_claude cwd match.
+    #[test]
+    fn falls_back_when_login_absent() {
+        let repo = "/Users/gaurav/dev/tow";
+        let panes = vec![
+            pane(14, 44112, repo, true),
+            pane(16, 43395, "/Users/gaurav/dev/tow/dispatch", false),
+        ];
+
+        // Unknown login → title↔cwd surface map points raw index 0 at it.
+        let mut surface_to_login = HashMap::new();
+        surface_to_login.insert(0usize, 99999u32);
+        let (sid, how) = pick_pane_for_login(&panes, 99999, repo, &surface_to_login).unwrap();
+        assert_eq!(sid, "trm:14");
+        assert_eq!(how, "title↔cwd");
+
+        // No login, no surface entry → exact has_claude cwd match (trailing
+        // slash tolerated).
+        let empty = HashMap::new();
+        let (sid, how) =
+            pick_pane_for_login(&panes, 99999, "/Users/gaurav/dev/tow/", &empty).unwrap();
+        assert_eq!(sid, "trm:14");
+        assert_eq!(how, "pane cwd exact");
+    }
+
+    // A shell-only repo (no has_claude pane) and an unmatched login resolves to
+    // nothing rather than silently grabbing an unrelated pane.
+    #[test]
+    fn no_match_returns_none() {
+        let panes = vec![pane(5, 12345, "/Users/gaurav/dev/x", false)];
+        let empty = HashMap::new();
+        assert!(pick_pane_for_login(&panes, 67890, "/Users/gaurav/dev/y", &empty).is_none());
     }
 }

@@ -14,6 +14,18 @@ class GitHubIssueService {
   static void Function()? _onAuthRequired;
   static void Function()? _onSessionExpired;
 
+  /// Optional provider of report metadata, set by the host app. Returns a map
+  /// that may include a `breadcrumb` (e.g. "Company > Settings") used in the
+  /// issue title, and version/env tags applied as issue labels — keys like
+  /// `build`, `flutter`, `backend`, `extraction`, `pdf-parser`, `rustc`,
+  /// `screen`. Evaluated at issue-creation time so values stay current.
+  static Map<String, String> Function()? metadataProvider;
+
+  /// Set the metadata provider.
+  static void configureMetadata(Map<String, String> Function()? provider) {
+    metadataProvider = provider;
+  }
+
   /// Whether the issue endpoint has been configured.
   static bool get isConfigured =>
       _endpointUrl != null && _headersBuilder != null;
@@ -71,7 +83,7 @@ class GitHubIssueService {
     final payload = <String, dynamic>{
       'title': title,
       'body': body,
-      'labels': ['flan', 'dev-site'],
+      'labels': _buildLabels(),
       'screenshots': screenshots,
       if (_userInfo != null) 'createdBy': _userInfo,
     };
@@ -87,16 +99,7 @@ class GitHubIssueService {
       body: jsonEncode(payload),
     );
 
-    if (response.statusCode == 401 && _onSessionExpired != null) {
-      _onSessionExpired!();
-      throw Exception('Session expired. Please log in again.');
-    }
-    if (response.statusCode == 403 && _onAuthRequired != null) {
-      _onAuthRequired!();
-      throw Exception(
-        'GitHub authentication required. Redirecting...',
-      );
-    }
+    _check403(response);
 
     if (response.statusCode != 200) {
       throw Exception(
@@ -109,6 +112,41 @@ class GitHubIssueService {
     return result['url'] as String;
   }
 
+  /// Handles the two distinct 403 cases (and 401) consistently:
+  ///   - session expired (401) → onSessionExpired, prompt re-login.
+  ///   - GitHub not connected (403, "connect"/"not connected") → onAuthRequired,
+  ///     redirect to GitHub OAuth.
+  ///   - not a repo collaborator (403, "collaborat") → DON'T redirect (re-OAuth
+  ///     won't grant repo access); surface an actionable message telling the
+  ///     user to request repo collaboration access.
+  /// Returns normally when the response is not one of these auth cases.
+  static void _check403(http.Response response) {
+    if (response.statusCode == 401 && _onSessionExpired != null) {
+      _onSessionExpired!();
+      throw Exception('Session expired. Please log in again.');
+    }
+    if (response.statusCode == 403) {
+      final body = response.body.toLowerCase();
+      final notCollaborator = body.contains('collaborat');
+      if (notCollaborator) {
+        // The user is authenticated but lacks repo write access. Re-OAuth
+        // can't fix this, so do not redirect — just tell them what to do.
+        throw Exception(
+          "You're signed in, but your GitHub account isn't a collaborator on "
+          'the issue repository, so you cannot file issues. Please request '
+          'repo collaboration access from an admin, then try again.',
+        );
+      }
+      if (_onAuthRequired != null) {
+        _onAuthRequired!();
+        throw Exception(
+          'GitHub authentication required. Connect your GitHub account to file '
+          'issues. Redirecting...',
+        );
+      }
+    }
+  }
+
   /// Creates a GitHub issue from a single error.
   static Future<String> createIssueFromError({
     required String summary,
@@ -118,7 +156,10 @@ class GitHubIssueService {
       throw StateError('Issue endpoint not configured');
     }
 
-    final title = '[Error] ${_truncate(summary, 80)}';
+    final meta = metadataProvider?.call() ?? const {};
+    final breadcrumb = (meta['breadcrumb'] ?? '').trim();
+    final prefix = breadcrumb.isNotEmpty ? breadcrumb : 'Flan';
+    final title = '[$prefix] ${_truncate(_cleanSummary(summary), 80)}';
     final body = StringBuffer()
       ..writeln('## Error')
       ..writeln()
@@ -128,6 +169,7 @@ class GitHubIssueService {
       ..writeln(details)
       ..writeln('```')
       ..writeln()
+      ..write(_buildEnvSection())
       ..writeln(
         '_Created automatically by ${_userInfo?['name'] ?? 'flan'} via flan on '
         '${DateTime.now().toIso8601String()}_',
@@ -136,7 +178,7 @@ class GitHubIssueService {
     final payload = <String, dynamic>{
       'title': title,
       'body': body.toString(),
-      'labels': ['flan', 'dev-site', 'bug'],
+      'labels': _buildLabels(['bug']),
       'screenshots': <Map<String, dynamic>>[],
       if (_userInfo != null) 'createdBy': _userInfo,
     };
@@ -152,16 +194,7 @@ class GitHubIssueService {
       body: jsonEncode(payload),
     );
 
-    if (response.statusCode == 401 && _onSessionExpired != null) {
-      _onSessionExpired!();
-      throw Exception('Session expired. Please log in again.');
-    }
-    if (response.statusCode == 403 && _onAuthRequired != null) {
-      _onAuthRequired!();
-      throw Exception(
-        'GitHub authentication required. Redirecting...',
-      );
-    }
+    _check403(response);
 
     if (response.statusCode != 200) {
       throw Exception(
@@ -175,27 +208,93 @@ class GitHubIssueService {
   }
 
   static String _buildTitle(List<Map<String, dynamic>> messages) {
-    // Use first error summary, annotation text, or generic title
+    // Breadcrumb (e.g. "Company > Settings") for the [...] prefix; falls back
+    // to "Flan" when the app didn't supply one.
+    final meta = metadataProvider?.call() ?? const {};
+    final breadcrumb = (meta['breadcrumb'] ?? '').trim();
+    final prefix = breadcrumb.isNotEmpty ? breadcrumb : 'Flan';
+
+    // Prefer an error summary, else the cleanest message/annotation text.
     for (final msg in messages) {
-      final type = msg['type']?.toString() ?? '';
-      if (type == 'error') {
-        final data = msg['data'] as Map<String, dynamic>?;
-        final summary = data?['summary']?.toString();
+      if ((msg['type']?.toString() ?? '') == 'error') {
+        final summary =
+            (msg['data'] as Map<String, dynamic>?)?['summary']?.toString();
         if (summary != null && summary.isNotEmpty) {
-          return '[Error] ${_truncate(summary, 80)}';
+          return '[$prefix] ${_truncate(_cleanSummary(summary), 80)}';
         }
       }
     }
 
     for (final msg in messages) {
-      final text = msg['text']?.toString();
-      if (text != null && text.isNotEmpty) {
-        return '[Flan] ${_truncate(text, 80)}';
-      }
+      final clean = _cleanSummary(msg['text']?.toString() ?? '');
+      if (clean.isNotEmpty) return '[$prefix] ${_truncate(clean, 80)}';
     }
 
-    return '[Flan] Dev site feedback '
+    return '[$prefix] Dev site feedback '
         '(${DateTime.now().toIso8601String().substring(0, 10)})';
+  }
+
+  /// Reduce a raw report blob to a clean one-line summary. Strips the
+  /// "N annotation(s):" wrapper, the leading "- ", surrounding quotes, and any
+  /// trailing "at (x, y) WxH" coordinate suffix so the title reads cleanly.
+  static String _cleanSummary(String raw) {
+    var s = raw.trim();
+    // Take the annotation label line if present.
+    final annLine = RegExp(r'-\s*"([^"]+)"').firstMatch(s);
+    if (annLine != null) {
+      s = annLine.group(1)!.trim();
+    } else {
+      // Drop a leading "N annotation(s):" header if it's the whole lead.
+      s = s.replaceFirst(RegExp(r'^\d+\s+annotation\(s\):\s*'), '').trim();
+      // First non-empty line only.
+      s = s.split('\n').firstWhere((l) => l.trim().isNotEmpty, orElse: () => s).trim();
+      s = s.replaceFirst(RegExp(r'^-\s*'), '').replaceAll('"', '').trim();
+    }
+    // Strip a trailing coordinate suffix: "... at (286, 341) 1555x101".
+    s = s.replaceFirst(RegExp(r'\s+at\s*\(\s*\d+.*$'), '').trim();
+    return s;
+  }
+
+  /// Issue labels: the base flan tags plus version/env tags from the metadata
+  /// provider (e.g. `build:1.0.0+1`, `flutter:3.x`, `backend:0.1.0`,
+  /// `extraction:0.1.0`, `pdf-parser:0.4.0`, `rustc:1.91`, `screen:settings`).
+  static List<String> _buildLabels([List<String> extra = const []]) {
+    final labels = <String>['flan', 'dev-site', ...extra];
+    final meta = metadataProvider?.call() ?? const {};
+    // Order matters for readability in the GitHub UI.
+    const tagKeys = [
+      'screen',
+      'frontend',
+      'flutter',
+      'backend',
+      'extraction',
+      'pdf-parser',
+      'rustc',
+    ];
+    for (final key in tagKeys) {
+      final v = meta[key]?.trim();
+      if (v != null && v.isNotEmpty) {
+        // Keep labels GitHub-friendly (no whitespace; cap length).
+        labels.add(_truncate('$key:${v.replaceAll(RegExp(r'\s+'), '-')}', 48));
+      }
+    }
+    return labels;
+  }
+
+  /// A markdown environment section for the issue body, mirroring the labels.
+  static String _buildEnvSection() {
+    final meta = metadataProvider?.call() ?? const {};
+    if (meta.isEmpty) return '';
+    final buf = StringBuffer()
+      ..writeln('### Environment')
+      ..writeln();
+    for (final e in meta.entries) {
+      if (e.key == 'breadcrumb') continue;
+      if (e.value.trim().isEmpty) continue;
+      buf.writeln('- **${e.key}:** ${e.value}');
+    }
+    buf.writeln();
+    return buf.toString();
   }
 
   static String _buildBody(List<Map<String, dynamic>> messages) {
@@ -280,6 +379,7 @@ class GitHubIssueService {
     }
 
     buf.writeln('---');
+    buf.write(_buildEnvSection());
     final createdBy = _userInfo?['name'] ?? 'flan';
     buf.writeln(
       '_Created by $createdBy via flan on '

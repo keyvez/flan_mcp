@@ -149,6 +149,61 @@ void main() {
       // Now shows 1
       expect(find.text('1'), findsOneWidget);
     });
+
+    // Returns the Positioned that places the draggable Q badge, located by
+    // walking up from the 'Q' text to the nearest enclosing Positioned.
+    Positioned badgePositioned(WidgetTester tester) {
+      final positioned = find
+          .ancestor(
+            of: find.text('Q'),
+            matching: find.byType(Positioned),
+          )
+          .evaluate()
+          .map((e) => e.widget as Positioned)
+          .firstWhere((p) => p.top != null && p.right != null);
+      return positioned;
+    }
+
+    testWidgets('restores a persisted fractional badge offset on launch',
+        (tester) async {
+      // Saved by a prior drag: viewPadding(0) + 16 +/- offset.
+      SharedPreferences.setMockInitialValues(<String, Object>{
+        'flan.badge_offset_dx': -120.5,
+        'flan.badge_offset_dy': 40.25,
+      });
+      _createServices();
+
+      await tester.pumpWidget(_app());
+      await tester.pumpAndSettle();
+
+      final p = badgePositioned(tester);
+      // top = 16 + dy, right = 16 - dx
+      expect(p.top, closeTo(16 + 40.25, 0.01));
+      expect(p.right, closeTo(16 - (-120.5), 0.01));
+    });
+
+    testWidgets(
+        'restores an integer-valued badge offset (does not reset to default)',
+        (tester) async {
+      // shared_preferences' web backend can round-trip a whole-number double
+      // back as an int; getDouble then throws on the int->double cast. Seeding
+      // ints reproduces that exact shape. The badge must still restore, not
+      // silently fall back to the default top-right corner.
+      SharedPreferences.setMockInitialValues(<String, Object>{
+        'flan.badge_offset_dx': -200,
+        'flan.badge_offset_dy': 48,
+      });
+      _createServices();
+
+      await tester.pumpWidget(_app());
+      await tester.pumpAndSettle();
+
+      final p = badgePositioned(tester);
+      expect(p.top, closeTo(16 + 48, 0.01));
+      expect(p.right, closeTo(16 - (-200), 0.01));
+      // Guard against the regression: default would be top:16, right:16.
+      expect(p.top, isNot(closeTo(16, 0.01)));
+    });
   });
 
   group('Error dot', () {
@@ -4520,6 +4575,80 @@ void main() {
       // Delete icon should be present
       expect(find.byIcon(Icons.delete_outline), findsOneWidget);
       expect(find.text('Delete me'), findsOneWidget);
+    });
+  });
+
+  group('Inline message text editing', () {
+    testWidgets('editing a queued message loads raw userMessage, not the '
+        '"User message:" display label', (tester) async {
+      await tester.pumpWidget(_app());
+      await tester.pumpAndSettle();
+
+      // Enqueue the way the command overlay does: display text is prefixed
+      // with "User message: " while data.userMessage holds the raw text.
+      await _runAsyncAndSettle(tester, () async {
+        userMessageService.warmUp();
+        await userMessageService.ensureHydrated();
+        userMessageService.sendMessage({
+          'type': 'user_feedback',
+          'text': 'User message: fix the login button',
+          'data': {'userMessage': 'fix the login button'},
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+
+      await tester.tap(find.text('Q'));
+      await tester.pumpAndSettle();
+
+      // Tap the displayed label to enter inline editing.
+      await tester.tap(find.textContaining('fix the login button'));
+      await tester.pumpAndSettle();
+
+      // The inline editor seeds the raw message, with no "User message: "
+      // prefix bleeding into the editable buffer.
+      final editable =
+          tester.widget<EditableText>(find.byType(EditableText).last);
+      expect(editable.controller.text, 'fix the login button');
+      expect(editable.controller.text, isNot(contains('User message:')));
+    });
+
+    testWidgets('inline editor survives a userMessageService rebuild mid-edit',
+        (tester) async {
+      await tester.pumpWidget(_app());
+      await tester.pumpAndSettle();
+
+      await _runAsyncAndSettle(tester, () async {
+        userMessageService.warmUp();
+        await userMessageService.ensureHydrated();
+        userMessageService.sendMessage({
+          'type': 'user_feedback',
+          'text': 'User message: hello',
+          'data': {'userMessage': 'hello'},
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+
+      await tester.tap(find.text('Q'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.textContaining('hello'));
+      await tester.pumpAndSettle();
+      expect(find.byType(EditableText), findsOneWidget);
+
+      // A background notify (server poll / heartbeat / state change) rebuilds
+      // the panel under Visibility(maintainState: true). This used to drop the
+      // EditableText's focus and auto-commit the edit after one keystroke.
+      // setHostConnectionState is a real public path that calls
+      // notifyListeners() without arming any timers.
+      userMessageService.setHostConnectionState(
+        connected: true,
+        pushCapable: false,
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 16));
+
+      // The editor must still be open after the rebuild.
+      expect(find.byType(EditableText), findsOneWidget);
     });
   });
 

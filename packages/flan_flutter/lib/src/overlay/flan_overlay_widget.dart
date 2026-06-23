@@ -516,13 +516,46 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   }
 
   Future<void> _loadBadgeOffset() async {
-    final prefs = await SharedPreferences.getInstance();
-    final dx = prefs.getDouble(_badgeDxKey);
-    final dy = prefs.getDouble(_badgeDyKey);
-    if (dx != null && dy != null && mounted) {
-      _badgeDragOffset = Offset(dx, dy);
-      _safeSetState();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final dx = _readPersistedCoord(prefs, _badgeDxKey);
+      final dy = _readPersistedCoord(prefs, _badgeDyKey);
+      if (dx != null && dy != null && mounted) {
+        _badgeDragOffset = Offset(dx, dy);
+        _safeSetState();
+      }
+    } catch (e) {
+      // Never let a bad read leave the badge silently parked at the default
+      // position — that reads to the user as "my drag didn't persist".
+      debugPrint('[flan] failed to restore badge offset: $e');
     }
+  }
+
+  /// Reads a persisted badge coordinate tolerantly.
+  ///
+  /// shared_preferences' web backend stores doubles via `json.encode`, so a
+  /// coordinate that happens to be a whole number (e.g. `48.0`) can round-trip
+  /// back through `json.decode` as an **int**. `getDouble` then does an
+  /// `int as double?` cast that throws, which previously aborted the whole
+  /// restore and dropped the badge back to its default spot. Fall back to
+  /// `getInt` (and a raw `get`) so an integer-valued coordinate still loads.
+  static double? _readPersistedCoord(SharedPreferences prefs, String key) {
+    try {
+      final d = prefs.getDouble(key);
+      if (d != null) return d;
+    } catch (_) {
+      // Stored value decoded as a non-double; fall through to the int read.
+    }
+    try {
+      final i = prefs.getInt(key);
+      if (i != null) return i.toDouble();
+    } catch (_) {
+      // Ignore and fall through.
+    }
+    final raw = prefs.get(key);
+    if (raw is num) return raw.toDouble();
+    if (raw is String) return double.tryParse(raw);
+    return null;
   }
 
   Future<void> _saveBadgeOffset(Offset offset) async {
@@ -887,7 +920,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
           widget.errorInterceptor.errors,
         );
         for (final error in errors) {
-          _sendErrorToAgent(error);
+          _reportError(error);
         }
         _showErrorPanel = false;
         _safeSetState();
@@ -1198,6 +1231,39 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     unawaited(_flushToServer(clearOnChannelDelivery: true));
   }
 
+  /// Reports an intercepted error to wherever it can actually go: the Claude
+  /// agent when one is connected (local dev), otherwise a GitHub issue when an
+  /// issue endpoint is configured (markup / deployed). Without the agent
+  /// fallback, "Send" on markup queues to a dead connection and nothing is
+  /// filed.
+  void _reportError(InterceptedError error) {
+    // When the host app disabled the agent (e.g. markup/deployed, where no
+    // agent ever connects), NEVER route to the agent — that just queues to a
+    // dead connection and shows "no Claude Code agent connected". Always try
+    // an issue; if the endpoint isn't configured yet, surface that instead of
+    // silently falling back to the agent.
+    if (FlanBinding.agentDisabled) {
+      if (GitHubIssueService.isConfigured) {
+        _createIssueFromError(error); // fire-and-forget; dismisses on success
+      } else {
+        _showNoReceiverError(
+          reason:
+              'Cannot file an issue — sign in (and connect GitHub) first, '
+              'then try again.',
+        );
+      }
+      return;
+    }
+
+    // Agent allowed (local dev): always route to the agent. `isAgentListening`
+    // is transient (true only while the agent is actively processing), so it
+    // must NOT gate this — the agent queue picks the error up even when idle.
+    // Falling back to a GitHub issue here (because an endpoint happens to be
+    // configured) wrongly filed local errors as issues instead of sending them
+    // to the connected agent.
+    _sendErrorToAgent(error);
+  }
+
   void _sendErrorToAgent(InterceptedError error) {
     final lines = error.details.split('\n');
     final truncated = lines.length > 20
@@ -1279,6 +1345,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     } catch (e) {
       _isSendingToAgent = false;
       debugPrint('[Flan] Failed to create issue: $e');
+      _showIssueError(e);
     }
   }
 
@@ -1293,7 +1360,18 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       widget.errorInterceptor.dismiss(error.id);
     } catch (e) {
       debugPrint('[Flan] Failed to create issue from error: $e');
+      _showIssueError(e);
     }
+  }
+
+  /// Surface a failed issue-creation to the user via the in-overlay banner.
+  /// Skips the benign "redirecting to GitHub OAuth" case (a redirect is already
+  /// happening). The not-a-collaborator / session-expired messages carry
+  /// actionable guidance and must be shown.
+  void _showIssueError(Object e) {
+    final msg = e.toString().replaceFirst(RegExp(r'^Exception:\s*'), '');
+    if (msg.contains('Redirecting')) return;
+    _showNoReceiverError(reason: msg);
   }
 
   void _removeQueuedMessage(int queueId) {
@@ -1495,9 +1573,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// [_FlushErrorBanner] in [build]) rather than via `showDialog`. The overlay
   /// lives above go_router's Navigator and tearing a dialog route in/out of
   /// that scope is fragile here, so we surface the error inline instead.
-  void _showNoReceiverError() {
+  void _showNoReceiverError({String? reason}) {
     if (!mounted) return;
-    _flushErrorMessage =
+    _flushErrorMessage = reason ??
         'Your message was not sent because no Claude Code agent is '
         'connected to receive it.\n\n'
         'The message is still queued — connect an agent, then send again.';
@@ -1899,7 +1977,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   }
                 },
                 onAddToQueue: (error) {
-                  _sendErrorToAgent(error);
+                  _reportError(error);
                   if (widget.errorInterceptor.errors.isEmpty) {
                     _showErrorPanel = false;
                     _safeSetState();
@@ -1910,7 +1988,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                     widget.errorInterceptor.errors,
                   );
                   for (final error in errors) {
-                    _sendErrorToAgent(error);
+                    _reportError(error);
                   }
                   _showErrorPanel = false;
                   _safeSetState();
@@ -2233,9 +2311,61 @@ class _InspectorOverlay extends StatefulWidget {
   State<_InspectorOverlay> createState() => _InspectorOverlayState();
 }
 
+/// Wire Cmd/Ctrl + V/C/X/A to a bare [EditableText]'s clipboard actions.
+///
+/// Bare EditableText (unlike TextField) ships no clipboard shortcuts — those
+/// come from the app-root text-editing actions, which the overlay sits above.
+/// So every overlay text field has to forward these keys to its
+/// EditableTextState itself. Returns true if the event was a handled clipboard
+/// shortcut. [controller] is used to guarantee a valid selection first, since
+/// EditableText's clipboard actions silently no-op on an invalid selection
+/// (offset -1) — which a field that was only focused, never tapped, has.
+bool handleClipboardShortcut(
+  KeyEvent event,
+  GlobalKey<EditableTextState> editableKey,
+  TextEditingController controller,
+) {
+  if (event is! KeyDownEvent) return false;
+  final isCmdHeld = HardwareKeyboard.instance.isMetaPressed ||
+      HardwareKeyboard.instance.isControlPressed;
+  if (!isCmdHeld) return false;
+  final state = editableKey.currentState;
+  if (state == null) return false;
+
+  void ensureValidSelection() {
+    if (!controller.selection.isValid) {
+      controller.selection =
+          TextSelection.collapsed(offset: controller.text.length);
+    }
+  }
+
+  if (event.logicalKey == LogicalKeyboardKey.keyV) {
+    ensureValidSelection();
+    state.pasteText(SelectionChangedCause.keyboard);
+    return true;
+  }
+  if (event.logicalKey == LogicalKeyboardKey.keyC) {
+    state.copySelection(SelectionChangedCause.keyboard);
+    return true;
+  }
+  if (event.logicalKey == LogicalKeyboardKey.keyX) {
+    ensureValidSelection();
+    state.cutSelection(SelectionChangedCause.keyboard);
+    return true;
+  }
+  if (event.logicalKey == LogicalKeyboardKey.keyA) {
+    ensureValidSelection();
+    state.selectAll(SelectionChangedCause.keyboard);
+    return true;
+  }
+  return false;
+}
+
 class _InspectorOverlayState extends State<_InspectorOverlay> {
   final FocusNode _focusNode = FocusNode();
   final TextEditingController _textController = TextEditingController();
+  final GlobalKey<EditableTextState> _editableKey =
+      GlobalKey<EditableTextState>();
   late final FocusNode _textFocusNode;
   bool _wasEnabled = false;
 
@@ -2250,6 +2380,9 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
   /// Intercepts Cmd+Enter in the command text field so it behaves the
   /// same as plain Enter (submit + send to agent).
   KeyEventResult _handleTextFieldKey(FocusNode node, KeyEvent event) {
+    if (handleClipboardShortcut(event, _editableKey, _textController)) {
+      return KeyEventResult.handled;
+    }
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
     if (event.logicalKey != LogicalKeyboardKey.enter) {
       return KeyEventResult.ignored;
@@ -2422,6 +2555,7 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
           child: EditableText(
+            key: _editableKey,
             controller: _textController,
             focusNode: _textFocusNode,
             style: const TextStyle(
@@ -2479,6 +2613,10 @@ class _AnnotationOverlay extends StatefulWidget {
 
 class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   final TextEditingController _textController = TextEditingController();
+  final GlobalKey<EditableTextState> _newEditableKey =
+      GlobalKey<EditableTextState>();
+  final GlobalKey<EditableTextState> _editEditableKey =
+      GlobalKey<EditableTextState>();
   late final FocusNode _textFocusNode;
   bool _wasEnabled = false;
 
@@ -2497,6 +2635,13 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
   /// a newline character for Cmd+Enter, so the TextInputFormatter never
   /// sees it.
   KeyEventResult _handleTextFieldKey(FocusNode node, KeyEvent event) {
+    final editableKey =
+        widget.service.drawState == AnnotationDrawState.editingExisting
+            ? _editEditableKey
+            : _newEditableKey;
+    if (handleClipboardShortcut(event, editableKey, _textController)) {
+      return KeyEventResult.handled;
+    }
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
     if (event.logicalKey != LogicalKeyboardKey.enter) {
       return KeyEventResult.ignored;
@@ -2704,6 +2849,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               child: EditableText(
+                key: _newEditableKey,
                 controller: _textController,
                 focusNode: _textFocusNode,
                 maxLines: null,
@@ -2776,6 +2922,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
                 children: [
                   Expanded(
                     child: EditableText(
+                      key: _editEditableKey,
                       controller: _textController,
                       focusNode: _textFocusNode,
                       maxLines: null,
@@ -2847,9 +2994,13 @@ class _TextMessageOverlay extends StatefulWidget {
 class _TextMessageOverlayState extends State<_TextMessageOverlay> {
   final TextEditingController _controller = TextEditingController();
   late final FocusNode _focusNode;
+  final GlobalKey<EditableTextState> _editableKey =
+      GlobalKey<EditableTextState>();
   final DrawingService _drawingService = DrawingService();
   final TextEditingController _floatingTextController = TextEditingController();
-  final FocusNode _floatingTextFocusNode = FocusNode();
+  late final FocusNode _floatingTextFocusNode;
+  final GlobalKey<EditableTextState> _floatingEditableKey =
+      GlobalKey<EditableTextState>();
   Offset? _offset; // null = centered
   bool _isDragging = false;
   Offset? _eraserPosition;
@@ -2864,6 +3015,15 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
     // the platform text-input layer as a shortcut and never reaches the
     // formatter, so the input field needs its own key handler to catch it.
     _focusNode = FocusNode(onKeyEvent: _handleTextFieldKey);
+    // The floating drawing-label field is a bare EditableText too, so wire its
+    // clipboard shortcuts (Cmd+V/C/X/A) the same way.
+    _floatingTextFocusNode = FocusNode(
+      onKeyEvent: (node, event) =>
+          handleClipboardShortcut(event, _floatingEditableKey,
+                  _floatingTextController)
+              ? KeyEventResult.handled
+              : KeyEventResult.ignored,
+    );
     widget.userMessageService.addListener(_onServiceChanged);
     _drawingService.addListener(_onDrawingChanged);
     // Only request focus if already visible on first build. When the
@@ -2930,15 +3090,26 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
   /// only fires on a '\n' insertion — never sees it.  Returning [handled]
   /// also stops the event from propagating, so no stray newline is inserted.
   KeyEventResult _handleTextFieldKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    if (event.logicalKey != LogicalKeyboardKey.enter) {
-      return KeyEventResult.ignored;
+    // Bare EditableText has no clipboard shortcuts (those come from TextField
+    // / the app-root text-editing actions, which this overlay sits above).
+    if (handleClipboardShortcut(event, _editableKey, _controller)) {
+      return KeyEventResult.handled;
     }
+
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+
     final isCmdHeld = HardwareKeyboard.instance.isMetaPressed ||
         HardwareKeyboard.instance.isControlPressed;
-    if (!isCmdHeld) return KeyEventResult.ignored;
-    _handleSubmit(andSend: true);
-    return KeyEventResult.handled;
+
+    // Cmd/Ctrl+Enter submits-and-sends. (Plain Enter is handled by the
+    // _SubmitOnEnterFormatter, which sees the '\n' insertion.)
+    if (event.logicalKey == LogicalKeyboardKey.enter) {
+      if (!isCmdHeld) return KeyEventResult.ignored;
+      _handleSubmit(andSend: true);
+      return KeyEventResult.handled;
+    }
+
+    return KeyEventResult.ignored;
   }
 
   Future<void> _handleSubmit({bool andSend = false}) async {
@@ -3161,6 +3332,7 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
           child: EditableText(
+            key: _floatingEditableKey,
             controller: _floatingTextController,
             focusNode: _floatingTextFocusNode,
             style: const TextStyle(
@@ -3304,6 +3476,7 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
           child: Padding(
             padding: const EdgeInsets.all(12),
             child: EditableText(
+              key: _editableKey,
               controller: _controller,
               focusNode: _focusNode,
               maxLines: null,
@@ -3423,10 +3596,13 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
           const SizedBox(height: 8),
           Row(
             children: [
-              Expanded(
-                  child: _ShortcutRow(
-                      keyCaps: [ctrlKey, shiftKey, enterKey],
-                      label: 'Send to agent')),
+              // The Send-to-agent shortcut only works with a connected agent;
+              // hide the hint on markup/deployed.
+              if (!FlanBinding.agentDisabled)
+                Expanded(
+                    child: _ShortcutRow(
+                        keyCaps: [ctrlKey, shiftKey, enterKey],
+                        label: 'Send to agent')),
               Expanded(
                   child: _ShortcutRow(
                       keyCaps: [scrollKey], label: 'Cycle widgets')),
@@ -3680,11 +3856,23 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
   /// Message text edits: "msg:queueId"
   String? _editingKey;
   final _editController = TextEditingController();
-  final _editFocusNode = FocusNode();
+  late final FocusNode _editFocusNode;
+  // Stable identity for the inline editor so rebuilds of the panel (driven by
+  // userMessageService timers) reconcile to the same element instead of
+  // tearing down the EditableText and dropping its focus mid-edit. Typed as
+  // EditableTextState so clipboard shortcuts can reach the state.
+  final _editFieldKey = GlobalKey<EditableTextState>();
 
   @override
   void initState() {
     super.initState();
+    // Bare EditableText: wire Cmd+V/C/X/A clipboard shortcuts.
+    _editFocusNode = FocusNode(
+      onKeyEvent: (node, event) =>
+          handleClipboardShortcut(event, _editFieldKey, _editController)
+              ? KeyEventResult.handled
+              : KeyEventResult.ignored,
+    );
     _editFocusNode.addListener(_onFocusLost);
   }
 
@@ -3697,9 +3885,21 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
   }
 
   void _onFocusLost() {
-    if (!_editFocusNode.hasFocus && _editingKey != null) {
+    if (_editFocusNode.hasFocus || _editingKey == null) return;
+    // The panel lives under a Visibility(maintainState: true) subtree and the
+    // overlay rebuilds it whenever userMessageService.notifyListeners() fires
+    // (the 10s server poll, the heartbeat timer, working/listening state
+    // transitions). Each rebuild can momentarily detach/reattach the inline
+    // EditableText's element, producing a *transient* hasFocus == false even
+    // though the user is still typing. Committing synchronously here closed the
+    // editor after a single keystroke. Defer one frame and re-check: if focus
+    // came back (or the field was torn down), the loss was a rebuild artifact —
+    // not a real tap-away — so leave the edit open.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _editingKey == null) return;
+      if (_editFocusNode.hasFocus) return;
       _commitEdit();
-    }
+    });
   }
 
   void _startEditingMessage(
@@ -4061,31 +4261,36 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 4),
-                  GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: () {
-                      debugPrint('[flan] Send button tapped (inside panel)');
-                      widget.onSend();
-                    },
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 6, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF00AAFF).withValues(alpha: 0.2),
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: const Text(
-                        'Send',
-                        style: TextStyle(
-                          color: Color(0xFF00AAFF),
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600,
-                          decoration: TextDecoration.none,
+                  // "Send" routes annotations to a connected Claude agent. On
+                  // markup/deployed no agent ever connects (agentDisabled), so
+                  // hide it there — "Create Issue" is the only valid path.
+                  if (!FlanBinding.agentDisabled) ...[
+                    const SizedBox(width: 4),
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () {
+                        debugPrint('[flan] Send button tapped (inside panel)');
+                        widget.onSend();
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF00AAFF).withValues(alpha: 0.2),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: const Text(
+                          'Send',
+                          style: TextStyle(
+                            color: Color(0xFF00AAFF),
+                            fontSize: 10,
+                            fontWeight: FontWeight.w600,
+                            decoration: TextDecoration.none,
+                          ),
                         ),
                       ),
                     ),
-                  ),
+                  ],
                 ],
               ],
             ),
@@ -4112,6 +4317,8 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                         queueId: queueId,
                         previewBytes: previewBytes,
                         summary: summary,
+                        editableText:
+                            _editableTextForMessage(message, summary),
                       );
 
                 return Padding(
@@ -4138,6 +4345,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
         borderRadius: BorderRadius.circular(4),
       ),
       child: EditableText(
+        key: _editFieldKey,
         controller: _editController,
         focusNode: _editFocusNode,
         maxLines: null,
@@ -4256,9 +4464,15 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     required int? queueId,
     required Uint8List? previewBytes,
     required String summary,
+    required String editableText,
   }) {
     final isEditing =
         queueId != null && _editingKey == 'msg:$queueId';
+    // Clicking a character only maps to a cursor offset when the displayed
+    // label IS the editable text. When they differ (the label carries a
+    // "User message: " prefix / selection lines that editing strips), the
+    // estimate is meaningless, so drop the cursor at the end instead.
+    final cursorTracksLabel = editableText == summary;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
@@ -4274,11 +4488,13 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                   onTapUp: queueId != null
                       ? (details) => _startEditingMessage(
                             queueId,
-                            summary,
-                            cursorOffset: _estimateCursorOffset(
-                              summary,
-                              details.localPosition.dx,
-                            ),
+                            editableText,
+                            cursorOffset: cursorTracksLabel
+                                ? _estimateCursorOffset(
+                                    summary,
+                                    details.localPosition.dx,
+                                  )
+                                : null,
                           )
                       : null,
                   child: Text(
@@ -4328,6 +4544,24 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
       return data.toString();
     }
     return 'Queued message';
+  }
+
+  /// The raw, user-authored text that inline editing should load and save —
+  /// i.e. just `data['userMessage']`, never the composed display summary
+  /// (which is prefixed with "User message: " and may also embed selection /
+  /// annotation lines). Editing the summary would round-trip those prefixes
+  /// back into the message. Falls back to the summary when there's no
+  /// userMessage field (e.g. a pure annotation/selection message).
+  static String _editableTextForMessage(
+    Map<String, dynamic> message,
+    String summaryFallback,
+  ) {
+    final data = message['data'];
+    if (data is Map) {
+      final userMessage = data['userMessage'];
+      if (userMessage is String) return userMessage;
+    }
+    return summaryFallback;
   }
 
   static Uint8List? _previewBytesForMessage(Map<String, dynamic> message) {
@@ -5056,11 +5290,14 @@ class _ErrorPanel extends StatelessWidget {
                       Clipboard.setData(ClipboardData(text: text));
                     },
                   ),
-                  const SizedBox(width: 4),
-                  _ErrorPanelButton(
-                    label: 'Send all',
-                    onTap: onSendAllToAgent,
-                  ),
+                  // Agent-only: hidden on markup/deployed (no agent connects).
+                  if (!FlanBinding.agentDisabled) ...[
+                    const SizedBox(width: 4),
+                    _ErrorPanelButton(
+                      label: 'Send all',
+                      onTap: onSendAllToAgent,
+                    ),
+                  ],
                   const SizedBox(width: 4),
                   _ErrorPanelButton(
                     label: 'Clear all',
@@ -5458,30 +5695,34 @@ class _RecordingResultSheet extends StatelessWidget {
                     ),
                   ),
                 ),
-                const SizedBox(height: 8),
-                // Primary action: send to agent for naming, comments, and filing.
-                GestureDetector(
-                  onTap: onSendToAgent,
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF1A4A8A),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: const Padding(
-                      padding: EdgeInsets.symmetric(vertical: 12),
-                      child: Text(
-                        'Send to agent — add name, comments & save file',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
-                          decoration: TextDecoration.none,
+                // Primary action: send to agent for naming, comments, and
+                // filing. Agent-only — hidden on markup/deployed, where the
+                // clipboard copy below is the available path.
+                if (!FlanBinding.agentDisabled) ...[
+                  const SizedBox(height: 8),
+                  GestureDetector(
+                    onTap: onSendToAgent,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1A4A8A),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 12),
+                        child: Text(
+                          'Send to agent — add name, comments & save file',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                            decoration: TextDecoration.none,
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
+                ],
                 const SizedBox(height: 8),
                 // Secondary: plain clipboard copy.
                 GestureDetector(

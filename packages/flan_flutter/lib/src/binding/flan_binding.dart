@@ -66,6 +66,21 @@ class FlanBinding extends WidgetsFlutterBinding {
   /// Whether the issue endpoint has been configured.
   static bool get issueEndpointConfigured => GitHubIssueService.isConfigured;
 
+  /// Supplies report metadata for issue titles/labels (breadcrumb + version
+  /// tags). Evaluated at issue-creation time. See [GitHubIssueService].
+  static void configureIssueMetadata(
+    Map<String, String> Function()? provider,
+  ) {
+    GitHubIssueService.configureMetadata(provider);
+  }
+
+  /// When true, the overlay never routes reports to the Claude agent — it
+  /// files a GitHub issue instead (when an issue endpoint is configured).
+  /// The host app sets this for environments where no agent ever connects
+  /// (e.g. markup/deployed), so error reports don't get queued to a dead
+  /// connection and surface "no Claude Code agent connected".
+  static bool agentDisabled = false;
+
   /// Attempts to enqueue a message for the connected agent.
   ///
   /// Returns `true` if Flan is initialized and the message was queued.
