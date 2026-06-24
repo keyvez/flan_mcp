@@ -4,7 +4,14 @@
       "mcp__flan__wait_for_user_message",
       "mcp__flan__connect",
       "mcp__flan__take_screenshots",
-      "mcp__flan__enable_annotations"
+      "mcp__flan__enable_annotations",
+      "Bash(dart analyze *)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "flan-channel"
+  ],
+  "disabledMcpjsonServers": [
+    "flan"
+  ]
 }
