@@ -1631,13 +1631,87 @@ async fn main() -> io::Result<()> {
                                     _ => None,
                                 });
 
-                                if let Some(port) = channel_port {
-                                    let payload = serde_json::json!({
-                                        "messages": [{
-                                            "type": "test",
-                                            "text": "TEST MESSAGE FROM FLAN",
-                                        }]
+                                // Useful routing context so the agent (and the
+                                // human watching the TUI) can confirm the test
+                                // landed in the right pane, plus an explicit ask
+                                // for the agent to reply confirming it can see
+                                // the linked Flutter app.
+                                let routing_info = match selected.as_ref() {
+                                    Some(ClaudeEntry::Trm(p)) => format!(
+                                        "Routed to trm pane_id={} (surface {}){}{}{}",
+                                        p.pane_id,
+                                        p.surface_id.as_deref().unwrap_or("?"),
+                                        p.cwd.as_deref()
+                                            .map(|c| format!(", cwd={}", c))
+                                            .unwrap_or_default(),
+                                        p.login_pid
+                                            .map(|l| format!(", login_pid={}", l))
+                                            .unwrap_or_default(),
+                                        channel_port
+                                            .map(|port| format!(", channel_port={}", port))
+                                            .unwrap_or_default(),
+                                    ),
+                                    Some(ClaudeEntry::Cmux(s)) => {
+                                        format!("Routed to cmux surface {}", s.id)
+                                    }
+                                    None => "Routed to <unknown>".to_string(),
+                                };
+
+                                // Resolve the linked Flutter app's VM service URI
+                                // up front so the test flush carries it (just like
+                                // the `x` flush does). Without it the agent gets
+                                // "not connected" with no URI and has to hand-hunt
+                                // the DDS auth token — slow and error-prone. We
+                                // look up agent → association → flutter app, using
+                                // the cached URI or re-probing by pid as a fallback.
+                                let test_vm_uri: Option<String> = selected.as_ref()
+                                    .map(|e| e.id())
+                                    .and_then(|sid| app.assoc_for_surface(&sid).cloned())
+                                    .and_then(|assoc| {
+                                        let fpid = assoc.flutter_pid;
+                                        let cached = app.flutter_apps.iter()
+                                            .find(|f| f.pid == fpid)
+                                            .and_then(|f| f.vm_service_uri.clone());
+                                        cached.or_else(|| {
+                                            tokio::task::block_in_place(|| probe_vm_service_uri(fpid))
+                                        })
                                     });
+
+                                if let Some(port) = channel_port {
+                                    let app_hint = if test_vm_uri.is_some() {
+                                        "A vm_uri for the linked Flutter app is attached — \
+                                         use the flan connect tool with it (don't go hunting \
+                                         for the VM service URI yourself), then report the \
+                                         app's current screen."
+                                    } else {
+                                        "No linked Flutter app was found for this agent, so \
+                                         no vm_uri is attached — just confirm you received \
+                                         this message."
+                                    };
+                                    let test_text = format!(
+                                        "Flan connectivity test from the TUI.\n{}\n\n\
+                                         If you can read this, the flan-channel is wired up \
+                                         correctly. {}",
+                                        routing_info, app_hint
+                                    );
+                                    // Include vm_service_uri so the channel surfaces
+                                    // a vm_uri attribute and the agent can connect in
+                                    // one step instead of discovering the URI itself.
+                                    let payload = match test_vm_uri.as_ref() {
+                                        Some(uri) => serde_json::json!({
+                                            "vm_service_uri": uri,
+                                            "messages": [{
+                                                "type": "test",
+                                                "text": test_text,
+                                            }]
+                                        }),
+                                        None => serde_json::json!({
+                                            "messages": [{
+                                                "type": "test",
+                                                "text": test_text,
+                                            }]
+                                        }),
+                                    };
                                     let body_str = payload.to_string();
                                     let req = format!(
                                         "POST /flush HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1670,7 +1744,12 @@ async fn main() -> io::Result<()> {
                                     app.set_toast(if ok { format!("Test → {} :{}", target_label, port) } else { detail.clone() });
                                 } else if let Some(entry) = selected {
                                     // No channel — inject text directly into the pane.
-                                    let text = "flan test message from TUI".to_string();
+                                    let text = format!(
+                                        "Flan connectivity test from the TUI (no channel — \
+                                         injected as text). {} Please reply confirming whether \
+                                         you can see the linked Flutter app and its current route.",
+                                        routing_info
+                                    );
                                     let t = text.clone();
                                     let label = target_label.clone();
                                     let ok = match entry {

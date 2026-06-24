@@ -861,6 +861,33 @@ mod server {
 
         let port = body.port;
 
+        // Evict stale mappings that point at this same port BEFORE inserting the
+        // fresh ones. A port belongs to exactly one live flan-channel process, so
+        // any *other* key (surface/login/cwd) still pointing at `port` is a
+        // leftover from a previous registration (pane closed, Claude restarted on
+        // a new port, surface IDs shifted). Without this, step-1 surface-key
+        // resolution in the TUI can hand one pane's port to a different pane —
+        // e.g. `trm:3` (a Claude-less pane) inheriting flan_mcp's `trm:2` port —
+        // and the test/flush lands on the wrong (or no) agent.
+        {
+            let mut surface_ports = state.channel_ports.write().await;
+            surface_ports.retain(|k, &mut v| {
+                let stale = v == port && surface_id.as_deref() != Some(k.as_str());
+                if stale {
+                    tracing::info!("Evicting stale surface mapping {} → {} (port reused)", k, port);
+                }
+                !stale
+            });
+        }
+        {
+            let mut login_ports = state.channel_ports_by_login.write().await;
+            login_ports.retain(|_, &mut v| v != port);
+        }
+        {
+            let mut cwd_ports = state.channel_ports_by_cwd.write().await;
+            cwd_ports.retain(|_, &mut v| v != port);
+        }
+
         if let Some(ref sid) = surface_id {
             tracing::info!("Channel registered: surface_id={} port={}", sid, port);
             state.channel_ports.write().await.insert(sid.clone(), port);
@@ -1126,6 +1153,49 @@ mod server {
 
     /// Build the Axum router using the given shared state.
     pub fn build_router(state: Arc<SharedState>) -> Router {
+        // Prune dead channel-port mappings every 2s. A flan-channel that has
+        // exited won't accept a loopback TCP connection, so any surface/login/
+        // cwd entry whose port refuses a connect is stale and gets dropped.
+        // This keeps the routing maps honest without waiting for the owning
+        // channel's 30s re-registration to evict collisions.
+        {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(2));
+                loop {
+                    tick.tick().await;
+
+                    // Snapshot the unique ports under lock, probe them outside it.
+                    let ports: std::collections::HashSet<u16> = {
+                        let surface = state.channel_ports.read().await;
+                        let login = state.channel_ports_by_login.read().await;
+                        let cwd = state.channel_ports_by_cwd.read().await;
+                        surface.values().chain(login.values()).chain(cwd.values())
+                            .copied().collect()
+                    };
+                    if ports.is_empty() { continue; }
+
+                    let dead: std::collections::HashSet<u16> =
+                        tokio::task::spawn_blocking(move || {
+                            ports.into_iter().filter(|&p| !port_is_live(p)).collect()
+                        })
+                        .await
+                        .unwrap_or_default();
+                    if dead.is_empty() { continue; }
+
+                    state.channel_ports.write().await
+                        .retain(|_, &mut v| !dead.contains(&v));
+                    state.channel_ports_by_login.write().await
+                        .retain(|_, &mut v| !dead.contains(&v));
+                    state.channel_ports_by_cwd.write().await
+                        .retain(|_, &mut v| !dead.contains(&v));
+                    for p in &dead {
+                        tracing::info!("Pruned dead channel port {} (no listener)", p);
+                    }
+                }
+            });
+        }
+
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -1599,6 +1669,18 @@ fn percent_decode(s: &str) -> String {
     out
 }
 
+/// Fast liveness check for a loopback channel port: just attempt a TCP
+/// connect with a short timeout. A live flan-channel accepts instantly; a
+/// dead one yields `ECONNREFUSED` immediately. No HTTP round-trip — kept cheap
+/// because the prune loop calls this every 2s for every registered port.
+pub fn port_is_live(port: u16) -> bool {
+    let addr = match format!("127.0.0.1:{}", port).parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+}
+
 pub fn probe_port(port: u16) -> Option<String> {
     let addr = format!("127.0.0.1:{}", port);
     let mut stream =
@@ -1864,7 +1946,15 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
         }).trim();
         let title_suggests_agent = title_has_agent(&title)
             || (starts_with_spinner && !clean.starts_with('~') && !clean.starts_with('/'));
-        let own_cwd = expand_title_path(&title);
+        // Prefer trm's authoritative per-surface `pwd` (Ghostty tracks it) over
+        // the unreliable title-derived path. This is the exact pane→cwd key, so
+        // a path-less "Claude Code" pane still resolves to its real repo and
+        // routes by cwd correctly — no tty/process-tree guessing. Older trm
+        // builds omit `pwd` (or send null); fall back to the title path then.
+        let pwd = s.get("pwd").and_then(|v| v.as_str())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string());
+        let own_cwd = pwd.or_else(|| expand_title_path(&title));
         Some(RawPane { surface_id, pane_id, window_id, title, title_suggests_agent, own_cwd })
     }).collect();
 
@@ -1934,38 +2024,24 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
             // login's shell_cwd. For panes with own_cwd this is done above. For
             // panes without own_cwd (spinner titles), we use tty matching.
             //
-            // Build login_pid → pane_id by checking: for each login, which raw
-            // pane has a process (via all_procs) on the same tty?
-            let login_pane_ids: HashMap<u32, usize> = {
-                // Get tty for ALL processes to find which pane each process is in.
-                // We look for Claude/agent processes whose tty matches a login's tty,
-                // then map to the raw pane whose pane_id we know from surface.list.
-                //
-                // Actually: we know each login's tty. We know each raw pane's pane_id.
-                // We need: login_tty → pane_id.
-                //
-                // Approach: look up tty for each shell (child of login). Then check
-                // which raw pane corresponds to that shell's cwd (already in shell_cwds_map).
-                // For panes with own_cwd that already matched, we skip.
-                // For remaining, we check if any raw pane has processes on the same tty.
-                //
-                // Fallback: match by inspecting which Claude process is on each tty,
-                // then map that Claude process's cwd to the matching raw pane.
-                let mut m: HashMap<u32, usize> = HashMap::new();
-                // For each login: get its tty, find a Claude/agent child on that tty,
-                // then find the raw pane by pane_id (if tty suffix matches).
-                for (&login_pid, tty) in &login_ttys {
-                    // tty is like "ttys003" — extract numeric suffix.
-                    let suffix_str = tty.trim_start_matches(|c: char| !c.is_numeric());
-                    if let Ok(n) = suffix_str.parse::<usize>() {
-                        // Find a raw pane whose pane_id matches this number.
-                        if let Some(raw_idx) = raw.iter().position(|rp| rp.pane_id == n) {
-                            m.insert(login_pid, raw_idx);
-                        }
+            // Map login → raw pane by matching the login's shell cwd against the
+            // pane's title-derived path, or — for path-less Claude panes — by
+            // pairing the login's claude-child cwd to the pane the agent_cwd_map
+            // already associates. The old `tty_number == pane_id` heuristic was a
+            // coincidence that mis-mapped sibling logins (all children of one trm
+            // process, tty numbers unrelated to pane_id), so it's now a LAST
+            // resort, applied only when nothing better claims the pane.
+            let mut login_pane_ids: HashMap<u32, usize> = HashMap::new();
+
+            // tty fallback (kept, but lowest priority — see loop below).
+            for (&login_pid, tty) in &login_ttys {
+                let suffix_str = tty.trim_start_matches(|c: char| !c.is_numeric());
+                if let Ok(n) = suffix_str.parse::<usize>() {
+                    if let Some(raw_idx) = raw.iter().position(|rp| rp.pane_id == n) {
+                        login_pane_ids.insert(login_pid, raw_idx);
                     }
                 }
-                m
-            };
+            }
 
             // For each login, find its shell child and get the cwd.
             // Also check if the shell has a claude descendant.
@@ -2047,23 +2123,38 @@ pub fn discover_trm_panes() -> Vec<TrmPane> {
                 })
                 .collect();
 
-            // Match path-bearing surfaces to logins by title↔cwd.
+            // Match surfaces to logins by cwd↔shell_cwd.
+            //
+            // Two passes so a Claude pane and a sibling shell pane that share a
+            // cwd (e.g. two `~/dev/fasmac` panes, one running the agent) don't
+            // fight over the wrong login: Claude-bearing panes claim
+            // Claude-bearing logins FIRST, then everything else fills in. This
+            // is what makes routing robust now that `own_cwd` comes from trm's
+            // authoritative `pwd` even for path-less "Claude Code" titles.
             let mut claimed_logins: HashSet<u32> = HashSet::new();
             let mut surface_to_login: HashMap<usize, usize> = HashMap::new(); // raw_idx → login_info idx
 
-            for (raw_idx, rp) in raw.iter().enumerate() {
-                if let Some(ref tp) = rp.own_cwd {
-                    let tp_clean = tp.trim_end_matches('/');
+            let cwd_matches = |tp: &str, li: &LoginInfo| -> bool {
+                let tp_clean = tp.trim_end_matches('/');
+                let cwd_clean = li.shell_cwd.trim_end_matches('/');
+                if tp_clean.starts_with('…') {
+                    let suffix = &tp_clean[tp_clean.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1)..];
+                    cwd_clean.ends_with(suffix)
+                } else {
+                    cwd_clean == tp_clean || cwd_clean.starts_with(&format!("{}/", tp_clean))
+                }
+            };
+
+            // (require_claude_login, only_agent_panes)
+            for &(require_claude, agent_panes_only) in &[(true, true), (false, false)] {
+                for (raw_idx, rp) in raw.iter().enumerate() {
+                    if surface_to_login.contains_key(&raw_idx) { continue; }
+                    if agent_panes_only && !rp.title_suggests_agent { continue; }
+                    let Some(ref tp) = rp.own_cwd else { continue };
                     let matched = login_infos.iter().enumerate().find(|(_, li)| {
                         if claimed_logins.contains(&li.login_pid) { return false; }
-                        let cwd_clean = li.shell_cwd.trim_end_matches('/');
-                        if tp_clean.starts_with('…') {
-                            let suffix = &tp_clean[tp_clean.char_indices().nth(1).map(|(i, _)| i).unwrap_or(1)..];
-                            cwd_clean.ends_with(suffix)
-                        } else {
-                            cwd_clean == tp_clean
-                                || cwd_clean.starts_with(&format!("{}/", tp_clean))
-                        }
+                        if require_claude && !li.has_claude_child { return false; }
+                        cwd_matches(tp, li)
                     });
                     if let Some((li_idx, li)) = matched {
                         claimed_logins.insert(li.login_pid);

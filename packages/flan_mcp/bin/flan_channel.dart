@@ -113,6 +113,16 @@ class FlanChannel {
   /// for retrieval via the `get_flushed_images` tool.
   final List<Map<String, dynamic>> _pendingImages = [];
 
+  /// Channel events that have been received from a flush but not yet
+  /// confirmed delivered to the Claude session. We hold them here and replay
+  /// them when the session connects/initializes, so a flush that arrives
+  /// before the MCP client is ready (or during a transient disconnect) is
+  /// never silently dropped — which previously forced the user to retype.
+  final List<_PendingEvent> _pendingEvents = [];
+
+  /// Guards [_drainPending] so two concurrent drains can't double-send.
+  bool _draining = false;
+
   /// Maximum number of ports to try when the preferred port is taken.
   static const _maxPortAttempts = 10;
 
@@ -267,16 +277,20 @@ class FlanChannel {
 
       final content = _formatMessages(messages);
       final route = _extractRouteAttribute(messages);
-      await _pushToClaudeSession(
+      final delivered = await _pushToClaudeSession(
         content: content,
         vmUri: vmUri,
         route: route,
       );
 
+      // Always 200/ok: the event is now durably queued and will be replayed
+      // when the session connects, so the app should treat it as accepted and
+      // NOT make the user retype. `delivered` distinguishes pushed-now from
+      // queued-for-replay for diagnostics.
       req.response
         ..statusCode = HttpStatus.ok
         ..headers.contentType = ContentType.json
-        ..write(jsonEncode({'ok': true}));
+        ..write(jsonEncode({'ok': true, 'delivered': delivered}));
     } catch (err, st) {
       _logger.warning('Error handling flush request', err, st);
       req.response
@@ -410,36 +424,85 @@ class FlanChannel {
     return null;
   }
 
-  Future<void> _pushToClaudeSession({
+  /// Queue a channel event for delivery and attempt to drain immediately.
+  ///
+  /// Returns `true` if the event was delivered to the MCP session now, or
+  /// `false` if it was queued for replay (because the session isn't connected
+  /// yet, or a send failed). Either way the event is retained until a send
+  /// succeeds, so nothing is lost.
+  Future<bool> _pushToClaudeSession({
     required String content,
     String? vmUri,
     String? route,
   }) async {
-    if (!mcpServer.isConnected) {
-      _logger.warning('MCP server not connected, cannot push channel event');
-      return;
-    }
-
-    final meta = <String, String>{
-      if (vmUri != null) 'vm_uri': vmUri,
-      if (route != null) 'route': route,
-    };
-
-    await mcpServer.server.notification(
-      JsonRpcNotification(
-        method: 'notifications/claude/channel',
-        params: {
-          'content': content,
-          if (meta.isNotEmpty) 'meta': meta,
-        },
-      ),
-    );
-
-    _logger.info(
-      'Channel event pushed to Claude (${content.length} chars, '
-      'route=${route ?? "-"}, vm_uri=${vmUri != null ? "set" : "-"})',
-    );
+    _pendingEvents.add(_PendingEvent(content: content, vmUri: vmUri, route: route));
+    await _drainPending();
+    return _pendingEvents.isEmpty;
   }
+
+  /// Replay any events that arrived while the session was unavailable. Wired
+  /// to the MCP server's `oninitialized` so a freshly-connected client gets
+  /// everything that queued up beforehand.
+  Future<void> replayPending() async {
+    if (_pendingEvents.isEmpty) return;
+    _logger.info('Replaying ${_pendingEvents.length} pending channel event(s)');
+    await _drainPending();
+  }
+
+  /// Send queued events in order, stopping at the first failure so ordering is
+  /// preserved and the failed event stays at the head of the queue for retry.
+  Future<void> _drainPending() async {
+    if (_draining) return;
+    _draining = true;
+    try {
+      while (_pendingEvents.isNotEmpty) {
+        if (!mcpServer.isConnected) {
+          _logger.warning(
+            'MCP server not connected; ${_pendingEvents.length} channel '
+            'event(s) held for replay',
+          );
+          return;
+        }
+        final event = _pendingEvents.first;
+        final meta = <String, String>{
+          if (event.vmUri != null) 'vm_uri': event.vmUri!,
+          if (event.route != null) 'route': event.route!,
+        };
+        try {
+          await mcpServer.server.notification(
+            JsonRpcNotification(
+              method: 'notifications/claude/channel',
+              params: {
+                'content': event.content,
+                if (meta.isNotEmpty) 'meta': meta,
+              },
+            ),
+          );
+        } catch (e, st) {
+          _logger.warning(
+            'Failed to push channel event; keeping it queued for replay', e, st);
+          return;
+        }
+        // Delivered — drop it from the queue.
+        _pendingEvents.removeAt(0);
+        _logger.info(
+          'Channel event pushed to Claude (${event.content.length} chars, '
+          'route=${event.route ?? "-"}, vm_uri=${event.vmUri != null ? "set" : "-"})',
+        );
+      }
+    } finally {
+      _draining = false;
+    }
+  }
+}
+
+/// A channel event awaiting (or retrying) delivery to the Claude session.
+class _PendingEvent {
+  _PendingEvent({required this.content, this.vmUri, this.route});
+
+  final String content;
+  final String? vmUri;
+  final String? route;
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +561,16 @@ Future<int> main(List<String> arguments) async {
 
     // Register tools before connecting (capabilities cannot be added after).
     channel.registerTools();
+
+    // When the client finishes initializing, replay any flush events that
+    // queued up before the session was ready — otherwise an early flush (or
+    // one during a reconnect) would be silently dropped and the user would
+    // have to retype it.
+    final priorOnInitialized = server.server.oninitialized;
+    server.server.oninitialized = () {
+      priorOnInitialized?.call();
+      unawaited(channel.replayPending());
+    };
 
     // Connect the MCP server to stdio first (Claude Code reads from here).
     final transport = CopilotCompatStdioServerTransport();
