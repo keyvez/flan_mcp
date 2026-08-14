@@ -4,21 +4,21 @@
       "command": "dart",
       "args": [
         "run",
-        "/Users/gaurav/dev/flan_mcp/packages/flan_mcp/bin/flan_mcp_trm.dart",
+        "packages/flan_mcp/bin/flan_mcp_trm.dart",
         "-l",
         "FINEST"
       ],
-      "cwd": "/Users/gaurav/dev/flan_mcp"
+      "cwd": "."
     },
     "flan-channel": {
       "command": "dart",
       "args": [
         "run",
-        "/Users/gaurav/dev/flan_mcp/packages/flan_mcp/bin/flan_channel.dart",
+        "packages/flan_mcp/bin/flan_channel.dart",
         "-l",
         "INFO"
       ],
-      "cwd": "/Users/gaurav/dev/flan_mcp"
+      "cwd": "."
     }
   }
 }

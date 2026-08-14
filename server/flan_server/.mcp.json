@@ -4,7 +4,7 @@
       "command": "dart",
       "args": [
         "run",
-        "/Users/gaurav/dev/flan_mcp/packages/flan_mcp/bin/flan_mcp.dart",
+        "../../packages/flan_mcp/bin/flan_mcp.dart",
         "-l",
         "INFO"
       ],
