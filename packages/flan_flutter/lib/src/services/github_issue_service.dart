@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import 'minified_name_resolver.dart';
+
 /// Formats queued flan messages into a GitHub issue and POSTs
 /// to the configured backend endpoint.
 class GitHubIssueService {
@@ -77,8 +79,13 @@ class GitHubIssueService {
       'first data keys: ${(messages.firstOrNull?['data'] as Map?)?.keys.toList()}',
     );
 
-    final title = _buildTitle(messages);
-    final body = _buildBody(messages);
+    // The one place a widget name is read by a human, and therefore the only
+    // place worth paying to resolve it. On a minified build the inspector has
+    // been carrying `minified:Hb` around; here it becomes `CorpConsoleScreen`.
+    // A no-op on any build that was not minified, and on any host that has not
+    // pointed the resolver at a source map.
+    final title = await MinifiedNameResolver.resolveIn(_buildTitle(messages));
+    final body = await MinifiedNameResolver.resolveIn(_buildBody(messages));
 
     final payload = <String, dynamic>{
       'title': title,
@@ -176,8 +183,8 @@ class GitHubIssueService {
       );
 
     final payload = <String, dynamic>{
-      'title': title,
-      'body': body.toString(),
+      'title': await MinifiedNameResolver.resolveIn(title),
+      'body': await MinifiedNameResolver.resolveIn(body.toString()),
       'labels': _buildLabels(['bug']),
       'screenshots': <Map<String, dynamic>>[],
       if (_userInfo != null) 'createdBy': _userInfo,
@@ -247,7 +254,10 @@ class GitHubIssueService {
       // Drop a leading "N annotation(s):" header if it's the whole lead.
       s = s.replaceFirst(RegExp(r'^\d+\s+annotation\(s\):\s*'), '').trim();
       // First non-empty line only.
-      s = s.split('\n').firstWhere((l) => l.trim().isNotEmpty, orElse: () => s).trim();
+      s = s
+          .split('\n')
+          .firstWhere((l) => l.trim().isNotEmpty, orElse: () => s)
+          .trim();
       s = s.replaceFirst(RegExp(r'^-\s*'), '').replaceAll('"', '').trim();
     }
     // Strip a trailing coordinate suffix: "... at (286, 341) 1555x101".
@@ -335,9 +345,8 @@ class GitHubIssueService {
 
       // Widget selection info — stored inside data
       final msgData = msg['data'] as Map<String, dynamic>?;
-      final selection =
-          (msgData?['inspectorSelection'] ?? msg['selection'])
-              as Map<String, dynamic>?;
+      final selection = (msgData?['inspectorSelection'] ?? msg['selection'])
+          as Map<String, dynamic>?;
       if (selection != null) {
         buf.writeln('### Widget Selection');
         buf.writeln();
