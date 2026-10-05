@@ -4641,6 +4641,10 @@ pub enum ToolVerdict {
     Failed(String),
     /// It said nothing we recognise before the deadline.
     Silent,
+    /// It started and hadn't finished when we stopped waiting. Distinct from
+    /// [Silent]: we know the signal landed, which rules out everything the
+    /// "requested" wording leaves open.
+    Pending,
 }
 
 /// Where a process's stdout goes, when it goes to a regular file.
@@ -4726,10 +4730,16 @@ pub fn verdict_from_output(output: &str) -> ToolVerdict {
     ToolVerdict::Silent
 }
 
+/// Whether the tool has at least acknowledged the request by starting work.
+fn output_shows_work_started(output: &str) -> bool {
+    output.contains("Performing hot reload") || output.contains("Performing hot restart")
+}
+
 /// Watch `log` from `offset` until it says what happened, or until `timeout`.
 pub fn await_tool_verdict(log: &std::path::Path, offset: u64, timeout: Duration) -> ToolVerdict {
     let deadline = Instant::now() + timeout;
     let mut seen = String::new();
+    let mut started = false;
     loop {
         if let Ok(mut file) = std::fs::File::open(log) {
             // A rotated or truncated log restarts the story rather than
@@ -4739,14 +4749,19 @@ pub fn await_tool_verdict(log: &std::path::Path, offset: u64, timeout: Duration)
             if len > from && file.seek(SeekFrom::Start(from)).is_ok() {
                 seen.clear();
                 let _ = file.take(256 * 1024).read_to_string(&mut seen);
+                started |= output_shows_work_started(&seen);
                 match verdict_from_output(&seen) {
-                    ToolVerdict::Silent => {}
+                    ToolVerdict::Silent | ToolVerdict::Pending => {}
                     verdict => return verdict,
                 }
             }
         }
         if Instant::now() >= deadline {
-            return ToolVerdict::Silent;
+            return if started {
+                ToolVerdict::Pending
+            } else {
+                ToolVerdict::Silent
+            };
         }
         std::thread::sleep(Duration::from_millis(150));
     }
@@ -4782,6 +4797,19 @@ pub fn hot_reload_local(pid: u32, vm_uri: Option<&str>, full_restart: bool) -> H
                     ok: false,
                     via: "signal".into(),
                     detail: line,
+                },
+                // It started and hadn't finished. Saying "requested" here would
+                // hide the one thing worth knowing — that the tool took the
+                // request and is stuck on it, which is what a broken debug
+                // client looks like from outside.
+                ToolVerdict::Pending => HotReloadOutcome {
+                    ok: false,
+                    via: "signal".into(),
+                    detail: format!(
+                        "{verb} started but hadn't finished after {}s — still \
+                         compiling, or the app's debug client isn't answering",
+                        SIGNAL_VERDICT_TIMEOUT.as_secs()
+                    ),
                 },
                 // Either stdout isn't a file we can read, or it said nothing we
                 // recognise. "Requested" is then the whole truth: the signal
@@ -7027,6 +7055,22 @@ dart:core                                            _Array.first
     fn unrelated_output_is_no_verdict_at_all() {
         assert_eq!(verdict_from_output(DWDS_NOISE), ToolVerdict::Silent);
         assert_eq!(verdict_from_output(""), ToolVerdict::Silent);
+    }
+
+    /// The case that prompted it: the tool takes the signal, prints that it is
+    /// working, and then never finishes. "Requested" would hide exactly the
+    /// fact that matters.
+    #[test]
+    fn work_that_starts_and_never_finishes_is_not_silence() {
+        let log = std::env::temp_dir().join(format!("flan-pending-{}.log", std::process::id()));
+        std::fs::write(&log, "").unwrap();
+        std::fs::write(&log, "Performing hot reload...      10.1s\n").unwrap();
+
+        assert_eq!(
+            await_tool_verdict(&log, 0, Duration::from_millis(300)),
+            ToolVerdict::Pending,
+        );
+        let _ = std::fs::remove_file(&log);
     }
 
     /// The offset is the whole reason this is trustworthy: a log full of
