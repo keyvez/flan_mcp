@@ -8,6 +8,7 @@ import 'package:flan_flutter/src/services/inspector_service.dart';
 import 'package:flan_flutter/src/services/macro_recorder_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
+import 'package:flan_flutter/src/utils/page_reloader.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -175,6 +176,48 @@ void main() {
       // claim: a signalled reload was requested, not verified.
       expect(find.textContaining('SIGUSR1'), findsOneWidget);
       expect(find.text('Hot restart'), findsNothing);
+    });
+
+    /// `flutter run -d web-server` owns no browser, so the host compiles and the
+    /// page keeps running the old build — "Recompile complete. No client
+    /// connected." The refresh is the last step and only the app can take it.
+    testWidgets('a recompile that reached no client offers a page refresh',
+        (tester) async {
+      var refreshed = 0;
+      PageReloader.debugOverride = () => refreshed++;
+      addTearDown(() => PageReloader.debugOverride = null);
+
+      final relay = FlanServerClient(
+        serverUrl: 'http://relay.test',
+        appId: 'app-under-test',
+        httpClient: http_testing.MockClient(
+          (_) async => http.Response(
+            jsonEncode({
+              'ok': false,
+              'via': 'signal',
+              'detail': 'Recompile complete. No client connected.',
+              'needs_page_refresh': true,
+            }),
+            200,
+          ),
+        ),
+      );
+
+      await tester.pumpWidget(_app(serverClient: relay));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Q'), buttons: kSecondaryButton);
+      await tester.pumpAndSettle();
+      await _runAsyncAndSettle(tester, () async {
+        await tester.tap(find.text('Hot reload'));
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+
+      expect(find.textContaining('No client connected'), findsOneWidget);
+      expect(refreshed, 0, reason: 'a reload must not refresh behind your back');
+
+      await tester.tap(find.text('Refresh page'));
+      await tester.pump();
+      expect(refreshed, 1);
     });
 
     testWidgets('a hot restart is reported as a restart, not a reload',

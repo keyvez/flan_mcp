@@ -2249,6 +2249,7 @@ async fn main() -> io::Result<()> {
                                         ok: false,
                                         via: "none".into(),
                                         detail: format!("Hot reload task failed: {}", error),
+                                        needs_page_refresh: false,
                                     });
                                     app.log(
                                         "out",

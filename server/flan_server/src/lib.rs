@@ -2465,6 +2465,7 @@ mod server {
             ok: false,
             via: "none".into(),
             detail: format!("{verb} task failed: {error}"),
+            needs_page_refresh: false,
         });
 
         state
@@ -4564,6 +4565,12 @@ pub struct HotReloadOutcome {
     /// a peer carried out.
     pub via: String,
     pub detail: String,
+    /// The code compiled and reached nobody: a web app whose page has no debug
+    /// client attached. Said as a field rather than left for the client to find
+    /// in the prose, because the app acts on it — refreshing the page is the
+    /// one step that finishes the job, and only the app can take it.
+    #[serde(default)]
+    pub needs_page_refresh: bool,
 }
 
 /// The flutter_tools service that performs each kind of reload.
@@ -4966,8 +4973,13 @@ pub fn hot_reload_local(pid: u32, vm_uri: Option<&str>, full_restart: bool) -> H
                     ok: true,
                     via: "signal".into(),
                     detail: line,
+                    needs_page_refresh: false,
                 },
                 ToolVerdict::Failed(line) => HotReloadOutcome {
+                    // The code compiled; nobody received it. The page is one
+                    // refresh away from running the new build, and the app is
+                    // the only thing that can do that.
+                    needs_page_refresh: line.contains("No client connected"),
                     ok: false,
                     via: "signal".into(),
                     detail: line,
@@ -4984,6 +4996,7 @@ pub fn hot_reload_local(pid: u32, vm_uri: Option<&str>, full_restart: bool) -> H
                          compiling, or the app's debug client isn't answering",
                         SIGNAL_VERDICT_TIMEOUT.as_secs()
                     ),
+                    needs_page_refresh: false,
                 },
                 // Either stdout isn't a file we can read, or it said nothing we
                 // recognise. "Requested" is then the whole truth: the signal
@@ -4992,6 +5005,7 @@ pub fn hot_reload_local(pid: u32, vm_uri: Option<&str>, full_restart: bool) -> H
                     ok: true,
                     via: "signal".into(),
                     detail: format!("{verb} requested — {signal} → pid {pid}"),
+                    needs_page_refresh: false,
                 },
             };
         }
@@ -5004,11 +5018,13 @@ pub fn hot_reload_local(pid: u32, vm_uri: Option<&str>, full_restart: bool) -> H
                 ok: true,
                 via: service.into(),
                 detail: format!("{verb} complete"),
+                needs_page_refresh: false,
             },
             Err(error) => HotReloadOutcome {
                 ok: false,
                 via: service.into(),
                 detail: error,
+                needs_page_refresh: false,
             },
         },
         None => HotReloadOutcome {
@@ -5017,6 +5033,7 @@ pub fn hot_reload_local(pid: u32, vm_uri: Option<&str>, full_restart: bool) -> H
             detail: format!(
                 "No signalable `flutter run` here (pid {pid}) and no VM service URI to ask"
             ),
+            needs_page_refresh: false,
         },
     }
 }
@@ -5037,6 +5054,7 @@ pub fn hot_reload_on_peer(
         ok: false,
         via: host.to_string(),
         detail,
+        needs_page_refresh: false,
     };
     let Some(peer) = load_peers()
         .into_iter()
@@ -5073,11 +5091,13 @@ fn hot_reload_via_peer(
                 .as_str()
                 .unwrap_or("peer gave no detail")
                 .to_string(),
+            needs_page_refresh: value["needs_page_refresh"].as_bool().unwrap_or(false),
         },
         Err(error) => HotReloadOutcome {
             ok: false,
             via: host.to_string(),
             detail: error,
+            needs_page_refresh: false,
         },
     }
 }
@@ -5125,6 +5145,7 @@ pub fn hot_reload_app(app: &FlutterApp, full_restart: bool) -> HotReloadOutcome 
             ok: false,
             via: "none".into(),
             detail,
+            needs_page_refresh: false,
         },
         None => outcome,
     }
@@ -7229,6 +7250,40 @@ dart:core                                            _Array.first
     fn unrelated_output_is_no_verdict_at_all() {
         assert_eq!(verdict_from_output(DWDS_NOISE), ToolVerdict::Silent);
         assert_eq!(verdict_from_output(""), ToolVerdict::Silent);
+    }
+
+    /// `flutter run -d web-server` owns no browser, so a reload reaches the page
+    /// only through a debug client. When there is none the code compiles and
+    /// nothing changes on screen — and the app, which is the only thing that can
+    /// refresh the page, needs to be told so in a field rather than by reading
+    /// the prose.
+    #[test]
+    fn a_recompile_with_no_client_asks_the_app_to_refresh() {
+        let log = std::env::temp_dir().join(format!("flan-noclient-{}.log", std::process::id()));
+        std::fs::write(&log, "").unwrap();
+        let verdict = verdict_from_output(
+            "Performing hot reload...\r\nRecompile complete. No client connected.",
+        );
+        let _ = std::fs::remove_file(&log);
+
+        let outcome = match verdict {
+            ToolVerdict::Failed(line) => HotReloadOutcome {
+                needs_page_refresh: line.contains("No client connected"),
+                ok: false,
+                via: "signal".into(),
+                detail: line,
+            },
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        assert!(outcome.needs_page_refresh);
+
+        // A compile error is NOT a refresh: the page would come back on the
+        // same old build and the user would think the reload worked.
+        let compile_error = match verdict_from_output(FAILED_RESTART) {
+            ToolVerdict::Failed(line) => line,
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        assert!(!compile_error.contains("No client connected"));
     }
 
     /// The case that prompted it: the tool takes the signal, prints that it is

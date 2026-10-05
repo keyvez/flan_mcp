@@ -20,6 +20,7 @@ import 'package:flan_flutter/src/services/github_issue_service.dart';
 import 'package:flan_flutter/src/services/macro_recorder_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
+import 'package:flan_flutter/src/utils/page_reloader.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void _noopAnnotationSubmittedCallback() {}
@@ -441,6 +442,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// Which of the two the banner is reporting. A restart said "Hot reload" in
   /// its own title before this existed.
   bool _reloadBannerRestart = false;
+  /// The code is compiled and only the page is behind — offer the refresh.
+  bool _reloadBannerOffersRefresh = false;
   Timer? _reloadBannerTimer;
   /// A second reload while one is in flight would be ignored by flutter_tools
   /// anyway ("Ignoring signal: we are busy"), and two banners would race.
@@ -1620,10 +1623,30 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     if (!mounted) return;
 
     // A signalled reload is fire-and-forget: flutter_tools answers nobody, so
-    // say "requested" rather than claiming the code is live. On web it may also
-    // have recompiled with no debug client attached, in which case the page
-    // needs a refresh — the relay's own wording covers it.
-    _showReloadBanner(result.detail, ok: result.ok, fullRestart: fullRestart);
+    // say "requested" rather than claiming the code is live.
+    //
+    // The exception is a web page with no debug client: the host compiled the
+    // new code and the page is still running the old one. A refresh is the last
+    // step, the app is the only thing that can take it, and for a RESTART it
+    // costs nothing — losing the state is what a restart does. A reload gets a
+    // button instead, because somebody asking for a reload asked to keep it.
+    final canRefresh = result.needsPageRefresh && PageReloader.isSupported;
+    if (canRefresh && fullRestart) {
+      _showReloadBanner(
+        'Recompiled on the host — refreshing the page to pick it up.',
+        ok: true,
+        fullRestart: fullRestart,
+        sticky: true,
+      );
+      PageReloader.reload();
+      return;
+    }
+    _showReloadBanner(
+      result.detail,
+      ok: result.ok,
+      fullRestart: fullRestart,
+      offerRefresh: canRefresh,
+    );
     debugPrint(
       '[flan] hot reload: ok=${result.ok} via=${result.via} '
       '${result.detail}',
@@ -1649,11 +1672,13 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     required bool ok,
     required bool fullRestart,
     bool sticky = false,
+    bool offerRefresh = false,
   }) {
     if (!mounted) return;
     _reloadBannerMessage = message;
     _reloadBannerOk = ok;
     _reloadBannerRestart = fullRestart;
+    _reloadBannerOffersRefresh = offerRefresh;
     // A real Timer rather than a Future.delayed, because this one has to be
     // cancellable: a pending timer that outlives the widget fires into a
     // disposed state — and in a test suite, into whichever test is running by
@@ -2336,6 +2361,12 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 message: _reloadBannerMessage!,
                 ok: _reloadBannerOk,
                 fullRestart: _reloadBannerRestart,
+                onRefreshPage: _reloadBannerOffersRefresh
+                    ? () {
+                        _dismissReloadBanner();
+                        PageReloader.reload();
+                      }
+                    : null,
                 onDismiss: _dismissReloadBanner,
               ),
             ),
@@ -5593,7 +5624,11 @@ class _HotReloadBanner extends StatelessWidget {
     required this.ok,
     required this.fullRestart,
     required this.onDismiss,
+    this.onRefreshPage,
   });
+
+  /// Shown when the host compiled the new code and the page never received it.
+  final VoidCallback? onRefreshPage;
 
   final String message;
   final bool ok;
@@ -5685,6 +5720,37 @@ class _HotReloadBanner extends StatelessWidget {
                 ),
               ),
             ),
+            if (onRefreshPage != null) ...[
+              const SizedBox(height: 8),
+              Padding(
+                padding: const EdgeInsets.only(left: 24),
+                child: Semantics(
+                  button: true,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: onRefreshPage,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: const Color(0x3300AAFF),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: const Color(0xFF00AAFF)),
+                      ),
+                      child: const Text(
+                        'Refresh page',
+                        style: TextStyle(
+                          color: Color(0xFF99DDFF),
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),

@@ -80,12 +80,14 @@ class FlanHotReloadResult {
     required this.ok,
     required this.detail,
     this.via,
+    this.needsPageRefresh = false,
   });
 
   const FlanHotReloadResult.failure(String message)
       : ok = false,
         detail = message,
-        via = null;
+        via = null,
+        needsPageRefresh = false;
 
   /// Whether the reload was carried out (or, for a signalled one, requested —
   /// see [via]).
@@ -101,6 +103,11 @@ class FlanHotReloadResult {
   final String? via;
 
   bool get wasSignalled => via == 'signal';
+
+  /// The code compiled and reached nobody — a web page with no debug client
+  /// attached, which is every `flutter run -d web-server` without the Dart
+  /// Debug Extension. Refreshing the page is what finishes the job.
+  final bool needsPageRefresh;
 }
 
 /// Association state reported by the local Flan relay.
@@ -279,6 +286,7 @@ class FlanServerClient {
           response.statusCode < 300;
       return (
         result: FlanHotReloadResult(
+          needsPageRefresh: decoded['needs_page_refresh'] == true,
           ok: ok,
           detail: detail is String && detail.isNotEmpty
               ? detail
