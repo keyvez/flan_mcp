@@ -387,6 +387,18 @@ type DiscoveryResult = (
     Vec<AgentSession>,
 );
 
+/// Ask every relay we can see what it can do.
+///
+/// Separate from discovery and much slower-paced: discovery runs every 5s off
+/// the process table, while this makes an HTTP call per relay and the answer
+/// only changes when somebody restarts one.
+fn spawn_relay_check(tx: mpsc::Sender<Vec<RelayCheck>>) {
+    tokio::task::spawn_blocking(move || {
+        let checks = check_all_relays(&load_peers());
+        let _ = tx.blocking_send(checks);
+    });
+}
+
 fn spawn_discovery(tx: mpsc::Sender<DiscoveryResult>) {
     tokio::task::spawn_blocking(move || {
         let result = (
@@ -510,6 +522,8 @@ struct App {
     log_state: ListState,
     log_visible: bool,
     toast: Option<(String, Instant)>,
+    /// Relays that answered with fewer capabilities than this binary has.
+    stale_relays: Vec<RelayCheck>,
     port: u16,
 }
 
@@ -535,6 +549,7 @@ impl App {
             log_state: ListState::default(),
             log_visible: true,
             toast: None,
+            stale_relays: Vec::new(),
             port,
         }
     }
@@ -752,6 +767,30 @@ impl App {
         let live: std::collections::HashSet<String> =
             peer_states().into_iter().map(|s| s.peer).collect();
         self.peer_reachable.retain(|peer, _| live.contains(peer));
+    }
+
+    /// Relays that are behind this binary, newest answer first seen.
+    ///
+    /// An app posts to exactly one relay and a stale one answers 404 for an
+    /// endpoint that shipped days ago; the symptom is always "the feature is
+    /// broken". Saying it here, where the link is made, is the whole point.
+    async fn apply_relay_checks(&mut self, checks: Vec<RelayCheck>) {
+        let stale: Vec<RelayCheck> = checks.into_iter().filter(RelayCheck::is_stale).collect();
+        let changed: Vec<&RelayCheck> = stale
+            .iter()
+            .filter(|check| {
+                !self
+                    .stale_relays
+                    .iter()
+                    .any(|known| known.endpoint == check.endpoint)
+            })
+            .collect();
+        for check in changed {
+            self.log("in", format!("Stale relay: {}", check.endpoint), Some(check.summary()), false)
+                .await;
+        }
+        self.stale_relays = stale;
+        self.sync_log_snapshot().await;
     }
 
     async fn apply_discovery(&mut self, result: DiscoveryResult) {
@@ -985,6 +1024,28 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
             ));
         }
+    }
+
+    // An app talks to exactly one relay, and a relay older than this binary
+    // answers 404 for whatever shipped since — which looks like a broken
+    // feature and nothing else. Name it where the links are made.
+    if !app.stale_relays.is_empty() {
+        let ports: Vec<String> = app
+            .stale_relays
+            .iter()
+            .map(|check| {
+                check
+                    .endpoint
+                    .rsplit(':')
+                    .next()
+                    .map(|port| format!(":{port}"))
+                    .unwrap_or_else(|| check.endpoint.clone())
+            })
+            .collect();
+        spans.push(Span::styled(
+            format!("  ⚠ stale relay {}  ", ports.join(" ")),
+            Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+        ));
     }
 
     let desktop_str = if app.desktop_target.is_some() {
@@ -1727,15 +1788,22 @@ async fn main() -> io::Result<()> {
 
     // Channel for background discovery results.
     let (discovery_tx, mut discovery_rx) = mpsc::channel::<DiscoveryResult>(1);
+    let (relay_tx, mut relay_rx) = mpsc::channel::<Vec<RelayCheck>>(1);
 
     // Kick off the initial discovery immediately.
     spawn_discovery(discovery_tx.clone());
+    // ...and ask the relays who they are, before the first link is made.
+    spawn_relay_check(relay_tx.clone());
 
     let mut event_stream = event::EventStream::new();
     let mut refresh_interval = tokio::time::interval(Duration::from_secs(5));
     refresh_interval.tick().await; // consume the immediate tick
     let mut log_poll = tokio::time::interval(Duration::from_millis(500));
     log_poll.tick().await;
+    // Relays only change when somebody restarts one, so this is a slow patrol
+    // rather than part of the discovery cycle.
+    let mut relay_poll = tokio::time::interval(Duration::from_secs(60));
+    relay_poll.tick().await;
 
     loop {
         if let Some((_, ts)) = &app.toast {
@@ -1834,6 +1902,11 @@ async fn main() -> io::Result<()> {
                                     app.log("in", format!("Link created: PID {} → {}", pid, &sid[..8.min(sid.len())]), None, true).await;
                                     app.sync_log_snapshot().await;
                                     app.set_toast("Link created");
+                                    // A link is the moment someone starts
+                                    // expecting the app's relay to answer, so
+                                    // re-check it now rather than up to a
+                                    // minute later.
+                                    spawn_relay_check(relay_tx.clone());
                                 } else {
                                     app.set_toast("Select both a Flutter app and Claude surface first");
                                 }
@@ -2305,6 +2378,12 @@ async fn main() -> io::Result<()> {
             }
             _ = refresh_interval.tick() => {
                 spawn_discovery(discovery_tx.clone());
+            }
+            Some(checks) = relay_rx.recv() => {
+                app.apply_relay_checks(checks).await;
+            }
+            _ = relay_poll.tick() => {
+                spawn_relay_check(relay_tx.clone());
             }
             _ = log_poll.tick() => {
                 let prev_len = app.log_snapshot.len();

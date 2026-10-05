@@ -2575,7 +2575,11 @@ mod server {
     }
 
     async fn get_health() -> Json<serde_json::Value> {
-        Json(serde_json::json!({"ok": true}))
+        Json(serde_json::json!({
+            "ok": true,
+            "version": RELAY_VERSION,
+            "features": RELAY_FEATURES,
+        }))
     }
 
     // ── Web channel (React clients) ─────────────────────────────────────
@@ -3463,6 +3467,24 @@ fn post_peer_json(
 /// doesn't justify a general-purpose HTTP client dependency, and the timeouts
 /// here have to be tight enough that a dead peer can't stall a discovery tick.
 fn peer_get(peer: &str, path: &str) -> Option<String> {
+    let response = peer_get_body(peer, path)?;
+    // The body is a JSON array; isolating it handles both Content-Length and
+    // chunked framing without parsing HTTP properly.
+    let start = response.find('[')?;
+    let end = response.rfind(']')?;
+    (start <= end).then(|| response[start..=end].to_string())
+}
+
+/// Like [peer_get], for an endpoint that answers a JSON object.
+fn peer_get_object(peer: &str, path: &str) -> Option<String> {
+    let response = peer_get_body(peer, path)?;
+    let start = response.find('{')?;
+    let end = response.rfind('}')?;
+    (start <= end).then(|| response[start..=end].to_string())
+}
+
+/// The response body of a bounded blocking GET, or None unless it answered 200.
+fn peer_get_body(peer: &str, path: &str) -> Option<String> {
     use std::net::ToSocketAddrs;
 
     let rest = peer.split_once("://").map(|(_, r)| r).unwrap_or(peer);
@@ -3495,11 +3517,7 @@ fn peer_get(peer: &str, path: &str) -> Option<String> {
         tracing::debug!("Peer {peer} returned a non-200 response for {path}");
         return None;
     }
-    // The body is a JSON array; isolating it handles both Content-Length and
-    // chunked framing without parsing HTTP properly.
-    let start = response.find('[')?;
-    let end = response.rfind(']')?;
-    (start <= end).then(|| response[start..=end].to_string())
+    Some(response)
 }
 
 pub fn has_listening_ports(pid: u32) -> bool {
@@ -4353,6 +4371,162 @@ pub fn peek_flan(ws_uri: &str) -> FlanPeek {
             Err(_) => return FlanPeek::default(),
         }
     }
+}
+
+// ── What this relay can do ──────────────────────────────────────────────
+//
+// Several flan-servers run at once — one per worktree, one systemd service per
+// host, one inside each TUI — and they are separate binaries that go stale
+// independently. A caller that only gets `{"ok": true}` from an old one learns
+// nothing until a request 404s, which reads as "the feature is broken" rather
+// than "this relay is three days old". So the relay says who it is.
+//
+// Add a name here when you add a capability a client can ask for; clients test
+// for the name, never for a version number.
+
+/// Build identity. The crate version plus the day it was built, because every
+/// one of these binaries reports 0.1.0.
+pub const RELAY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("FLAN_BUILD_DATE"));
+
+/// Capabilities a client can test for by name.
+pub const RELAY_FEATURES: &[&str] = &[
+    // POST /api/hot-reload exists at all.
+    "hot-reload",
+    // ...and takes `full_restart`.
+    "hot-restart",
+    // ...and resolves a web app by its `origin`, which is the only identity a
+    // page has.
+    "origin-match",
+    // ...and answers with what `flutter run` actually printed.
+    "reload-verdict",
+];
+
+// ── Relay version drift ─────────────────────────────────────────────────
+//
+// The reason this exists: an app posts to ONE relay — whichever
+// `FLAN_SERVER_URL` names, usually its own worktree's — and that relay is a
+// separate binary from the one in the TUI, from the host's systemd service,
+// and from every other worktree's. They go stale independently, and a stale
+// one answers 404 for an endpoint that shipped days ago. Every time, the
+// symptom is "hot reload is broken" and the cause is "that relay is old".
+//
+// So the TUI asks every relay it can see what it can do, and says which ones
+// are behind it. Nothing here restarts anything: which relay a worktree runs
+// is wt's business, and a TUI that silently replaced somebody's running
+// service would be worse than the problem.
+
+/// What one relay answered when asked who it is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayCheck {
+    /// `http://host:port`, as a caller would reach it.
+    pub endpoint: String,
+    pub reachable: bool,
+    pub version: Option<String>,
+    /// Capabilities this binary has and that one lacks. Empty means current.
+    pub missing: Vec<String>,
+}
+
+impl RelayCheck {
+    pub fn is_stale(&self) -> bool {
+        self.reachable && !self.missing.is_empty()
+    }
+
+    /// One line a human can act on.
+    pub fn summary(&self) -> String {
+        if !self.reachable {
+            return format!("{}: unreachable", self.endpoint);
+        }
+        if self.missing.is_empty() {
+            return format!("{}: current", self.endpoint);
+        }
+        format!(
+            "{} is behind this build ({}) — missing {}",
+            self.endpoint,
+            self.version.as_deref().unwrap_or("unknown build"),
+            self.missing.join(", "),
+        )
+    }
+}
+
+/// Ask one relay what it can do.
+pub fn check_relay(endpoint: &str) -> RelayCheck {
+    let parsed = peer_get_object(endpoint, "/api/health")
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
+    let Some(value) = parsed else {
+        return RelayCheck {
+            endpoint: endpoint.to_string(),
+            reachable: false,
+            version: None,
+            missing: Vec::new(),
+        };
+    };
+
+    let features: Vec<String> = value["features"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|f| f.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    // A relay old enough to predate this endpoint answers `{"ok": true}` and no
+    // features — which is itself the answer: it has none of them.
+    let missing = RELAY_FEATURES
+        .iter()
+        .filter(|ours| !features.iter().any(|theirs| theirs == *ours))
+        .map(|f| f.to_string())
+        .collect();
+
+    RelayCheck {
+        endpoint: endpoint.to_string(),
+        reachable: true,
+        version: value["version"].as_str().map(str::to_string),
+        missing,
+    }
+}
+
+/// Every flan-server listening on this machine, as `http://127.0.0.1:PORT`.
+///
+/// Found by process name rather than by a list of known ports: the whole point
+/// is the relays nobody remembered were running — a worktree's, a leftover from
+/// a branch deleted last week.
+pub fn local_relay_endpoints() -> Vec<String> {
+    let flan_pids: HashSet<u32> = relay_process_ids();
+    let mut ports: Vec<u16> = listening_sockets()
+        .into_iter()
+        .filter(|(pid, _)| flan_pids.contains(pid))
+        .map(|(_, port)| port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+        .into_iter()
+        .map(|port| format!("http://127.0.0.1:{port}"))
+        .collect()
+}
+
+/// PIDs of flan-server and flan-tui processes (the TUI embeds a relay).
+fn relay_process_ids() -> HashSet<u32> {
+    let Ok(output) = Command::new("ps").args(["-eo", "pid,comm"]).output() else {
+        return HashSet::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid: u32 = parts.next()?.parse().ok()?;
+            let comm = parts.next()?;
+            let name = comm.rsplit('/').next().unwrap_or(comm);
+            (name == "flan-server" || name == "flan-tui").then_some(pid)
+        })
+        .collect()
+}
+
+/// Check every relay we can see — this machine's, and each peer's.
+pub fn check_all_relays(peers: &[String]) -> Vec<RelayCheck> {
+    let mut endpoints = local_relay_endpoints();
+    endpoints.extend(peers.iter().cloned());
+    endpoints.into_iter().map(|e| check_relay(&e)).collect()
 }
 
 // ── Hot reload ──────────────────────────────────────────────────────────
@@ -7109,6 +7283,62 @@ dart:core                                            _Array.first
             matches!(verdict, ToolVerdict::Failed(line) if line.contains("withdraw")),
             "the new bytes are the verdict",
         );
+    }
+
+    /// Serve one /api/health response and return the port.
+    fn fake_relay(body: &'static str) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0_u8; 2048];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (port, server)
+    }
+
+    /// Every relay built before this feature answers exactly `{"ok": true}` —
+    /// which is the answer: it has none of the capabilities.
+    #[test]
+    fn a_relay_that_predates_the_feature_reports_as_stale() {
+        let (port, server) = fake_relay(r#"{"ok":true}"#);
+        let check = check_relay(&format!("http://127.0.0.1:{port}"));
+        server.join().unwrap();
+
+        assert!(check.reachable);
+        assert!(check.is_stale());
+        assert!(check.missing.contains(&"hot-reload".to_string()));
+        assert!(check.summary().contains("missing"), "{}", check.summary());
+    }
+
+    #[test]
+    fn a_relay_with_every_capability_is_not_stale() {
+        let (port, server) = fake_relay(
+            r#"{"ok":true,"version":"0.1.0+2026-10-05","features":["hot-reload","hot-restart","origin-match","reload-verdict"]}"#,
+        );
+        let check = check_relay(&format!("http://127.0.0.1:{port}"));
+        server.join().unwrap();
+
+        assert!(!check.is_stale(), "{}", check.summary());
+        assert_eq!(check.version.as_deref(), Some("0.1.0+2026-10-05"));
+    }
+
+    /// A relay that isn't listening is not a stale relay — nothing to restart,
+    /// and warning about it would cry wolf on every machine that is simply off.
+    #[test]
+    fn an_unreachable_relay_is_not_reported_as_stale() {
+        let check = check_relay("http://127.0.0.1:1");
+        assert!(!check.reachable);
+        assert!(!check.is_stale());
     }
 
     /// Serve the handshake a real VM service performs, and answer the reload

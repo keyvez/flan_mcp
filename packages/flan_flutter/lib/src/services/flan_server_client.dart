@@ -217,44 +217,101 @@ class FlanServerClient {
       );
     }
 
+    final body = jsonEncode(<String, dynamic>{
+      if (appId.isNotEmpty) 'app_id': appId,
+      if (vmServiceUri != null && vmServiceUri.isNotEmpty)
+        'vm_service_uri': vmServiceUri,
+      if (origin != null && origin.isNotEmpty) 'origin': origin,
+      'full_restart': fullRestart,
+    });
+
+    final primary = await _postHotReload(_endpoint('api/hot-reload'), body);
+    if (!primary.relayTooOld) return primary.result;
+
+    // This app's relay predates hot reload. Several flan-servers run at once —
+    // one per worktree, one per host — and they go stale independently, so the
+    // host's standing relay on the default port is very often current when the
+    // worktree's is not. Ask it: it is the same machine, so it can see the same
+    // `flutter run`.
+    final stable = _stableRelayEndpoint();
+    if (stable != null) {
+      final second = await _postHotReload(stable, body);
+      if (!second.relayTooOld) return second.result;
+    }
+
+    return FlanHotReloadResult.failure(
+      'This app\'s flan relay ($_serverUrl) is too old for hot reload. '
+      'Restart it (`./wt restart flan`) after updating the installed binary.',
+    );
+  }
+
+  /// POST one hot-reload request, separating "this relay cannot do it" from
+  /// "this relay says no".
+  Future<({FlanHotReloadResult result, bool relayTooOld})> _postHotReload(
+    Uri endpoint,
+    String body,
+  ) async {
     try {
       final response = await _httpClient
           .post(
-            _endpoint('api/hot-reload'),
+            endpoint,
             headers: const {'Content-Type': 'application/json'},
-            body: jsonEncode(<String, dynamic>{
-              if (appId.isNotEmpty) 'app_id': appId,
-              if (vmServiceUri != null && vmServiceUri.isNotEmpty)
-                'vm_service_uri': vmServiceUri,
-              if (origin != null && origin.isNotEmpty) 'origin': origin,
-              'full_restart': fullRestart,
-            }),
+            body: body,
           )
           // A reload compiles: the relay's own ceiling for one is 20s, and a
           // client that gave up sooner would report a failure for a reload that
           // then succeeded.
           .timeout(_reloadTimeout);
-      final body = _decodeBody(response);
-      final detail = body['detail'];
-      final via = body['via'];
-      final ok = body['ok'] == true &&
+      // 404 is the one answer that means the ENDPOINT is missing rather than
+      // the reload failing, and it is what every relay built before this
+      // feature says.
+      if (response.statusCode == 404) {
+        return (
+          result: const FlanHotReloadResult.failure('No hot reload on this relay.'),
+          relayTooOld: true,
+        );
+      }
+      final decoded = _decodeBody(response);
+      final detail = decoded['detail'];
+      final via = decoded['via'];
+      final ok = decoded['ok'] == true &&
           response.statusCode >= 200 &&
           response.statusCode < 300;
-      return FlanHotReloadResult(
-        ok: ok,
-        detail: detail is String && detail.isNotEmpty
-            ? detail
-            : ok
-                ? 'Hot reload requested.'
-                : 'Flan relay could not hot reload this app '
-                    '(HTTP ${response.statusCode}).',
-        via: via is String && via.isNotEmpty ? via : null,
+      return (
+        result: FlanHotReloadResult(
+          ok: ok,
+          detail: detail is String && detail.isNotEmpty
+              ? detail
+              : ok
+                  ? 'Hot reload requested.'
+                  : 'Flan relay could not hot reload this app '
+                      '(HTTP ${response.statusCode}).',
+          via: via is String && via.isNotEmpty ? via : null,
+        ),
+        relayTooOld: false,
       );
     } on TimeoutException {
-      return const FlanHotReloadResult.failure('Flan relay timed out.');
+      return (
+        result: const FlanHotReloadResult.failure('Flan relay timed out.'),
+        relayTooOld: false,
+      );
     } catch (error) {
-      return FlanHotReloadResult.failure('Flan relay is unavailable: $error');
+      return (
+        result: FlanHotReloadResult.failure('Flan relay is unavailable: $error'),
+        relayTooOld: false,
+      );
     }
+  }
+
+  /// The same host's relay on the standard port, or null when that is already
+  /// where we just asked.
+  Uri? _stableRelayEndpoint() {
+    final configured = Uri.tryParse(_serverUrl);
+    if (configured == null || configured.host.isEmpty) return null;
+    final port = configured.hasPort ? configured.port : kDefaultFlanRelayPort;
+    if (port == kDefaultFlanRelayPort) return null;
+    return configured
+        .replace(port: kDefaultFlanRelayPort, path: '/api/hot-reload');
   }
 
   Future<FlanServerStatus?> getStatus({int? processId}) async {

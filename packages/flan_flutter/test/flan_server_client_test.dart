@@ -143,6 +143,57 @@ void main() {
     expect(result.ok, isTrue);
   });
 
+  /// The support question this removes: an app's own relay is often a
+  /// per-worktree server that predates the feature and answers 404, while the
+  /// host's standing relay on :4050 is current and can see the same
+  /// `flutter run`.
+  test('a relay too old for hot reload falls back to the host relay', () async {
+    final asked = <String>[];
+    final relay = FlanServerClient(
+      serverUrl: 'http://m1.local:4350',
+      appId: 'fasmac:worktree-004',
+      httpClient: http_testing.MockClient((request) async {
+        asked.add(request.url.toString());
+        if (request.url.port == 4350) {
+          return http.Response('Not Found', 404);
+        }
+        return http.Response(
+          jsonEncode({
+            'ok': true,
+            'via': 'signal',
+            'detail': 'Reloaded application in 800ms.',
+          }),
+          200,
+        );
+      }),
+    );
+
+    final result = await relay.hotReload();
+
+    expect(asked, [
+      'http://m1.local:4350/api/hot-reload',
+      'http://m1.local:4050/api/hot-reload',
+    ]);
+    expect(result.ok, isTrue);
+    expect(result.detail, contains('800ms'));
+  });
+
+  test('when neither relay has the endpoint, it says which one to restart',
+      () async {
+    final relay = FlanServerClient(
+      serverUrl: 'http://m1.local:4350',
+      appId: 'app-a',
+      httpClient:
+          http_testing.MockClient((_) async => http.Response('Not Found', 404)),
+    );
+
+    final result = await relay.hotReload();
+
+    expect(result.ok, isFalse);
+    expect(result.detail, contains('http://m1.local:4350'));
+    expect(result.detail, contains('too old'));
+  });
+
   test('a relay that cannot reload is reported with its own reason', () async {
     final relay = FlanServerClient(
       serverUrl: 'http://relay.test',
