@@ -1,3 +1,4 @@
+import 'package:flan_flutter/src/binding/flan_binding.dart';
 import 'package:flan_flutter/src/overlay/flan_overlay_widget.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
 import 'package:flan_flutter/src/services/error_interceptor.dart';
@@ -6,6 +7,7 @@ import 'package:flan_flutter/src/services/macro_recorder_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -35,6 +37,30 @@ Widget _buildTestApp({
   );
 }
 
+/// The smallest thing that is a [Router], so the overlay has one to read a URL
+/// from. A go_router app is this shape: the route IS the URL, and there are no
+/// named routes for the binding's stack walk to find.
+class _StaticRouterDelegate extends RouterDelegate<Uri> with ChangeNotifier {
+  _StaticRouterDelegate(this.child);
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => child;
+
+  @override
+  Future<bool> popRoute() async => false;
+
+  @override
+  Future<void> setNewRoutePath(Uri configuration) async {}
+}
+
+class _UriRouteParser extends RouteInformationParser<Uri> {
+  @override
+  Future<Uri> parseRouteInformation(RouteInformation routeInformation) async =>
+      routeInformation.uri;
+}
+
 /// Runs [action] in a real async zone so that screenshot capture and other
 /// async work inside the overlay can complete, then pumps frames.
 Future<void> _runAsyncAndSettle(
@@ -50,6 +76,169 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+  });
+
+  /// The mechanism the fix rests on. In production the overlay is mounted ABOVE
+  /// the app, so `Router.maybeOf(overlayContext)` looks up the wrong branch and
+  /// finds nothing — which is why a go_router app, whose route is a URL and not
+  /// a stack of named routes, sent messages with no route at all. Walking down
+  /// from the root finds it.
+  testWidgets('the router URL is found by walking down from the root',
+      (tester) async {
+    await tester.pumpWidget(MaterialApp.router(
+      routerDelegate: _StaticRouterDelegate(const ColoredBox(color: Colors.black)),
+      routeInformationParser: _UriRouteParser(),
+      routeInformationProvider: PlatformRouteInformationProvider(
+        initialRouteInformation:
+            RouteInformation(uri: Uri.parse('/candidates/42?tab=notes')),
+      ),
+    ));
+
+    expect(
+      findRouterUrl(tester.binding.rootElement!),
+      '/candidates/42?tab=notes',
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    expect(findRouterUrl(tester.binding.rootElement!), isNull);
+  });
+
+  /// The report: an annotation reached the agent as a cropped screenshot with
+  /// no way to tell which screen it was. Every other message type collected the
+  /// navigation context; the annotation draft — the one you get by drawing —
+  /// never did.
+  testWidgets('a queued annotation carries the route it was drawn on',
+      (tester) async {
+    final annotations = AnnotationService();
+    final messages = UserMessageService();
+    final overlay = SizedBox.expand(
+      child: FlanOverlayWidget(
+        inspectorService: InspectorService(),
+        annotationService: annotations,
+        userMessageService: messages,
+        screenshotService: ScreenshotService(),
+        errorInterceptor: ErrorInterceptor(),
+        macroRecorderService: MacroRecorderService(),
+        child: const ColoredBox(color: Colors.black),
+      ),
+    );
+    await tester.pumpWidget(MaterialApp.router(
+      routerDelegate: _StaticRouterDelegate(overlay),
+      routeInformationParser: _UriRouteParser(),
+      routeInformationProvider: PlatformRouteInformationProvider(
+        initialRouteInformation:
+            RouteInformation(uri: Uri.parse('/candidates/42?tab=notes')),
+      ),
+    ));
+    annotations.enable();
+    await tester.pumpAndSettle();
+
+    final gesture = await tester.startGesture(const Offset(300, 200));
+    await gesture.moveTo(const Offset(400, 300));
+    await tester.pump();
+    await gesture.up();
+    await tester.pump();
+    await tester.enterText(find.byType(EditableText), 'this button');
+    await _runAsyncAndSettle(tester, () async {
+      tester
+          .widget<EditableText>(find.byType(EditableText))
+          .onSubmitted!('this button');
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    });
+
+    final data = messages.peekMessages().single['data'] as Map;
+    expect(data['url'], '/candidates/42?tab=notes');
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  /// Draw a box and leave the overlay in its editing state, with the label's
+  /// field focused — the state every bug below was reported from.
+  Future<AnnotationService> editingLabel(WidgetTester tester) async {
+    final annotations = AnnotationService();
+    await tester.pumpWidget(_buildTestApp(
+      inspectorService: InspectorService(),
+      annotationService: annotations,
+      userMessageService: UserMessageService(),
+      screenshotService: ScreenshotService(),
+      errorInterceptor: ErrorInterceptor(),
+    ));
+    annotations.enable();
+    await tester.pumpAndSettle();
+    final gesture = await tester.startGesture(const Offset(300, 200));
+    await gesture.moveTo(const Offset(400, 300));
+    await tester.pump();
+    await gesture.up();
+    await tester.pump();
+    expect(annotations.drawState, AnnotationDrawState.editing);
+    return annotations;
+  }
+
+  TextEditingController labelController(WidgetTester tester) =>
+      tester.widget<EditableText>(find.byType(EditableText)).controller;
+
+  /// The report: "typing in an annotation box that already has text closes it".
+  /// The submit-on-Enter formatter asked whether the text CONTAINED a newline,
+  /// which every keystroke satisfies once the label holds one — so the
+  /// keystroke was thrown away and the box submitted instead.
+  testWidgets('typing into a label that already has a line break keeps typing',
+      (tester) async {
+    final annotations = await editingLabel(tester);
+
+    await tester.enterText(find.byType(EditableText), 'first\nsecond');
+    await tester.pump();
+    // One more character, exactly as a keypress delivers it.
+    await tester.enterText(find.byType(EditableText), 'first\nsecondX');
+    await tester.pump();
+
+    expect(labelController(tester).text, 'first\nsecondX');
+    expect(
+      annotations.drawState,
+      AnnotationDrawState.editing,
+      reason: 'the label should still be open for editing',
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  /// The report: "Ctrl+C and Ctrl+V are broken". Both are two Ctrl presses
+  /// inside 500ms, which is also the double-tap gesture that toggles annotation
+  /// mode — so copying and pasting tore the editor down mid-edit.
+  testWidgets('copy then paste in a label does not toggle annotation mode',
+      (tester) async {
+    final annotations = await editingLabel(tester);
+    await tester.enterText(find.byType(EditableText), 'look here');
+    await tester.pump();
+
+    for (var i = 0; i < 2; i++) {
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    }
+    await tester.pump();
+
+    expect(annotations.enabled, isTrue);
+    expect(annotations.drawState, AnnotationDrawState.editing);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  /// The report: "selecting and regular text editing are broken". The overlay
+  /// is mounted above the app's WidgetsApp, which is what installs
+  /// DefaultTextEditingShortcuts — without it the arrow keys reach no intent at
+  /// all, so the caret could not even be moved.
+  testWidgets('shift-arrow extends the selection inside a label',
+      (tester) async {
+    await editingLabel(tester);
+    await tester.enterText(find.byType(EditableText), 'look here');
+    await tester.pump();
+    expect(labelController(tester).selection.isCollapsed, isTrue);
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.pump();
+
+    final selection = labelController(tester).selection;
+    expect(selection.isCollapsed, isFalse);
+    expect(selection.textInside('look here'), 'e');
+    await tester.pumpWidget(const SizedBox.shrink());
   });
 
   for (final shape in AnnotationShape.values) {

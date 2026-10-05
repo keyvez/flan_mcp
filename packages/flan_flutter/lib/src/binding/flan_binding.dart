@@ -23,6 +23,34 @@ import 'package:flan_flutter/src/utils/num_parser.dart';
 
 /// A custom binding that extends Flutter's default binding to provide
 /// integration points for the Flan MCP.
+/// The URL of the first [Router] at or below [root], or null if there is none.
+///
+/// Free function rather than a method so it can be pointed at any tree — in a
+/// test, at the test binding's root; in the app, at the real one.
+String? findRouterUrl(Element root) {
+  String? url;
+  void visit(Element element) {
+    if (url != null) return;
+    final widget = element.widget;
+    if (widget is Router) {
+      final asString = widget.routeInformationProvider?.value.uri.toString();
+      if (asString != null && asString.isNotEmpty) {
+        url = asString;
+        return;
+      }
+    }
+    element.visitChildren(visit);
+  }
+
+  final widget = root.widget;
+  if (widget is Router) {
+    final asString = widget.routeInformationProvider?.value.uri.toString();
+    if (asString != null && asString.isNotEmpty) return asString;
+  }
+  root.visitChildren(visit);
+  return url;
+}
+
 class FlanBinding extends WidgetsFlutterBinding {
   /// Creates and initializes the binding with the given configuration.
   ///
@@ -913,6 +941,24 @@ class FlanBinding extends WidgetsFlutterBinding {
     }
     renderViewElement?.visitChildElements(visitor);
     return routeName;
+  }
+
+  /// The URL of the app's [Router], read from the element tree rather than
+  /// from a [BuildContext].
+  ///
+  /// The overlay is mounted ABOVE the app (see [wrapWithDefaultView]), so
+  /// `Router.maybeOf(overlayContext)` looks the wrong way up the tree and finds
+  /// nothing — which is why a go_router app, whose routes are a URL and not a
+  /// stack of names, was sending messages with no route at all. The walk starts
+  /// where the app does and so sees its Router.
+  String? getCurrentRouterUrl() {
+    try {
+      final root = rootElement;
+      return root == null ? null : findRouterUrl(root);
+    } catch (_) {
+      // Mid-build or before the first frame — no route is better than a crash.
+      return null;
+    }
   }
 
   /// Returns the active route stack as a list of [RouteSettings.name]s,

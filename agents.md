@@ -25,6 +25,10 @@ When adding a new feature that bridges Flutter and MCP:
 
 ## Overlay Widget Concepts
 
+- **The overlay is mounted ABOVE the app's `WidgetsApp`** (`FlanBinding.wrapWithDefaultView`), and `WidgetsApp` is what installs `DefaultTextEditingShortcuts`. Without re-adding it, nothing in flan's own text fields responds to the arrow keys, shift-selection, word jumps, Home/End, undo or Ctrl/Cmd+A/C/V/X — `EditableText` brings the actions, but the shortcuts that invoke them are inherited, and there was nothing to inherit from. `handleClipboardShortcut` is the older hand-rolled patch for the clipboard subset and still runs first.
+- **Modifier double-taps are gestures and must not fire while typing.** Ctrl+C then Ctrl+V is two Ctrl presses inside 500ms, which is also the double-tap that toggles annotation mode — so copying and pasting in a label tore the editor down mid-edit. `_handleGlobalKey` checks for a focused `EditableTextState` first (anyone's, including the app's own fields).
+- **`_SubmitOnEnterFormatter` submits on the character just typed**, found by diffing old against new. Asking whether the text *contains* a newline meant every keystroke submitted once a label held a line break.
+
 - **Annotation draft**: When annotations are drawn, a draft message is auto-queued via `_upsertQueuedAnnotationDraft()`. The draft includes a cropped thumbnail captured asynchronously.
 - **Generation counters**: `_draftThumbnailGeneration` prevents stale async thumbnails; `_agentConsumeGeneration` detects when agent consumed messages.
 - **Suppression flags**: `_suppressAnnotationDraftUpsert` and `_isSendingToAgent` prevent re-entrant draft creation during edits/sends.
@@ -185,6 +189,40 @@ connected." and the page needs a refresh.
 here, so the request is handed to the peer's `/api/hot-reload` — stamped
 `relayed_from`, for the same reason a relayed flush is, and a relayed request is
 never relayed on.
+
+## Relay version drift (server/flan_server/src/lib.rs)
+
+Several flan-servers run at once — one per worktree (`wt` allocates a flan port
+each), one systemd service per host, one inside every TUI — and they are
+separate binaries that go stale independently. An app posts to exactly ONE of
+them, whichever `FLAN_SERVER_URL` names, so an old one answers 404 for an
+endpoint that shipped days ago. Every time, the symptom is "the feature is
+broken" and the cause is "that relay is old".
+
+Three things make that self-evident now:
+
+- **`/api/health` says who it is**: `{ok, version, features}`, where `version`
+  is the crate version plus the build date (`build.rs` stamps it, because every
+  one of these binaries is 0.1.0) and `features` names capabilities a client can
+  test for — `hot-reload`, `hot-restart`, `origin-match`, `reload-verdict`. Add
+  a name when you add a capability; clients test names, never version numbers.
+  A relay too old to have the list answers `{"ok": true}`, which is itself the
+  answer: it has none of them.
+- **The TUI patrols**: `check_all_relays` asks every flan-server listening on
+  this machine (found by process name, so a forgotten worktree's counts) plus
+  every peer, and anything missing a capability this binary has is logged and
+  shown as `⚠ stale relay :4350` in the title bar. On startup, every 60s, and
+  immediately when a link is made — the moment someone starts expecting that
+  relay to answer. It only reports; which relay a worktree runs is `wt`'s
+  business, and a TUI that silently restarted somebody's service would be worse
+  than the problem.
+- **The app heals around it**: a 404 from `/api/hot-reload` means the endpoint
+  is missing rather than the reload failing, so `FlanServerClient` retries the
+  same host's relay on the default port — usually the maintained one — and only
+  then gives up, naming the relay to restart.
+
+`fasmac`'s `run-flan-server.sh` now prefers `~/.local/bin/flan-server` over
+`cargo run` from a checkout, which is what stops new worktrees being born stale.
 
 ## Testing Notes
 

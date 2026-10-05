@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart' hide InspectorSelection;
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
@@ -235,6 +236,28 @@ _NavContext _collectNavigationContext(BuildContext? context) {
       }
     } catch (_) {
       // Router lookup is best-effort — fall through to the binding walk.
+    }
+  }
+
+  // The overlay sits ABOVE the app, so the lookup above searches the wrong
+  // branch and a go_router app — whose whole route IS the URL — reported no
+  // route at all. Ask the binding, which walks down from the app's own root.
+  if (url == null) {
+    try {
+      url = FlanBinding.instance.getCurrentRouterUrl();
+    } catch (_) {
+      // Binding may be uninitialised in tests.
+    }
+  }
+
+  // On web the address bar is the route, whatever router the app uses, and it
+  // is there even when the app has no Router at all.
+  if (url == null && kIsWeb) {
+    try {
+      final base = Uri.base.toString();
+      if (base.isNotEmpty) url = base;
+    } catch (_) {
+      // Uri.base throws off the web; this branch only runs on it.
     }
   }
 
@@ -645,6 +668,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     final data = <String, dynamic>{
       'annotations': enrichedAnnotations,
     };
+    // Where the user was when they drew it. Captured now rather than at flush
+    // time, because by then they may have navigated away — and without it the
+    // agent gets a cropped screenshot of a screen it cannot identify, which is
+    // exactly what happened.
+    _collectNavigationContext(context).applyTo(data);
     final text = _rebuildQueuedMessageText(
       fallback: 'Annotation',
       data: data,
@@ -832,12 +860,33 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// Double-tap Ctrl toggles annotation mode.
   /// Ctrl+Shift+Enter sends current data to the LLM agent.
   /// Escape exits the active mode.
+  /// Whether the keystroke is going into a text field — anyone's, including the
+  /// app's own.
+  ///
+  /// The focused node of an [EditableText] sits inside it, so its context finds
+  /// the state above itself.
+  bool get _isTypingInATextField {
+    final context = FocusManager.instance.primaryFocus?.context;
+    return context != null &&
+        context.findAncestorStateOfType<EditableTextState>() != null;
+  }
+
   bool _handleGlobalKey(KeyEvent event) {
     if (event is! KeyDownEvent) return false;
 
+    // The modifier double-taps below are GESTURES, and a gesture must not fire
+    // while someone is typing. Ctrl+C followed by Ctrl+V is two Ctrl presses
+    // inside 500ms, so copying and pasting in an annotation label toggled
+    // annotation mode and tore the editor down mid-edit — "copy/paste closes
+    // the box". Alt has the same problem: on macOS it is how you type half the
+    // special characters. Chords like Ctrl+Shift+Enter are unambiguous and
+    // stay live; so does Escape, which is below.
+    final typing = _isTypingInATextField;
+
     // Double-tap Alt/Option to open text message overlay.
-    if (event.logicalKey == LogicalKeyboardKey.altLeft ||
-        event.logicalKey == LogicalKeyboardKey.altRight) {
+    if (!typing &&
+        (event.logicalKey == LogicalKeyboardKey.altLeft ||
+            event.logicalKey == LogicalKeyboardKey.altRight)) {
       final now = DateTime.now();
       if (_lastAltPressTime != null &&
           now.difference(_lastAltPressTime!).inMilliseconds < 500) {
@@ -850,8 +899,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     }
 
     // Double-tap Ctrl to toggle annotation mode.
-    if (event.logicalKey == LogicalKeyboardKey.controlLeft ||
-        event.logicalKey == LogicalKeyboardKey.controlRight) {
+    if (!typing &&
+        (event.logicalKey == LogicalKeyboardKey.controlLeft ||
+            event.logicalKey == LogicalKeyboardKey.controlRight)) {
       final now = DateTime.now();
       if (_lastCtrlPressTime != null &&
           now.difference(_lastCtrlPressTime!).inMilliseconds < 500) {
@@ -1297,15 +1347,19 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     final truncated = lines.length > 20
         ? '${lines.take(20).join('\n')}…'
         : error.details;
+    final data = <String, dynamic>{
+      'kind': 'app_error',
+      'summary': error.summary,
+      'details': truncated,
+      'timestamp': error.timestamp.toIso8601String(),
+    };
+    // Which screen threw it. A stack trace names the code; the route names the
+    // way back to it.
+    _collectNavigationContext(context).applyTo(data);
     widget.userMessageService.sendMessage({
       'type': 'app_error',
       'text': 'App error intercepted — please investigate:\n$truncated',
-      'data': <String, dynamic>{
-        'kind': 'app_error',
-        'summary': error.summary,
-        'details': truncated,
-        'timestamp': error.timestamp.toIso8601String(),
-      },
+      'data': data,
     });
     widget.errorInterceptor.dismiss(error.id);
   }
@@ -1814,7 +1868,17 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
     return Directionality(
       textDirection: TextDirection.ltr,
-      child: Stack(
+      // Flan's own fields live ABOVE the app's WidgetsApp (see
+      // FlanBinding.wrapWithDefaultView), and WidgetsApp is what installs
+      // DefaultTextEditingShortcuts — so inside an annotation label the arrow
+      // keys, shift-selection, word jumps, Home/End, undo and
+      // Ctrl/Cmd+A/C/V/X all did nothing at all. EditableText brings the
+      // actions; only the shortcuts that invoke them were missing.
+      //
+      // The app's own WidgetsApp still provides these closer to its own
+      // fields, so this outer copy only ever reaches ours.
+      child: DefaultTextEditingShortcuts(
+          child: Stack(
         children: [
           _appContent,
           // Inspector layer — wrapped in its own FocusScope to isolate
@@ -2276,7 +2340,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               ),
             ),
         ],
-      ),
+      )),
     );
   }
 
@@ -4968,14 +5032,35 @@ class _SubmitOnEnterFormatter extends TextInputFormatter {
   /// Called on Cmd/Ctrl+Enter. If null, falls through to [onSubmit].
   final VoidCallback? onCmdSubmit;
 
+  /// The one character this edit inserted, or null if it was anything else —
+  /// a deletion, a paste, a replacement, an IME composition.
+  ///
+  /// Found by diffing the two strings rather than trusting
+  /// `newValue.selection`, which is not reliably updated on web or mid-IME.
+  static String? insertedCharacter(
+    TextEditingValue oldValue,
+    TextEditingValue newValue,
+  ) {
+    if (newValue.text.length != oldValue.text.length + 1) return null;
+    var i = 0;
+    while (i < oldValue.text.length &&
+        oldValue.text.codeUnitAt(i) == newValue.text.codeUnitAt(i)) {
+      i++;
+    }
+    return newValue.text[i];
+  }
+
   @override
   TextEditingValue formatEditUpdate(
     TextEditingValue oldValue,
     TextEditingValue newValue,
   ) {
-    // Detect a newline insertion that wasn't caused by Shift being held.
-    if (newValue.text.length == oldValue.text.length + 1 &&
-        newValue.text.contains('\n') &&
+    // Submit when the character just typed is a newline — NOT when the text
+    // merely contains one. The old test was `newValue.text.contains('\n')`,
+    // which every keystroke satisfies once the label holds a line break, so
+    // typing into an annotation that already had one threw the keystroke away
+    // and submitted the box instead.
+    if (insertedCharacter(oldValue, newValue) == '\n' &&
         !HardwareKeyboard.instance.isShiftPressed) {
       // Strip the newline and schedule submission.
       final isCmdHeld = HardwareKeyboard.instance.isMetaPressed ||
