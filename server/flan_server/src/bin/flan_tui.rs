@@ -70,8 +70,12 @@ fn build_rows(app: &App) -> Vec<Row> {
         .iter()
         .map(|e| match e {
             ClaudeEntry::Trm(p) => p.channel_port.is_some(),
+            // A session is reachable only if it has a flan-channel. Sessions
+            // without one are listed but can't be messaged.
+            ClaudeEntry::Session(a) => a.channel_port.is_some(),
             // cmux/cloud agents reachability isn't tracked on the synced
-            // snapshot yet; trm panes are the linkable agents in practice.
+            // snapshot yet; trm panes and channels are the linkable agents in
+            // practice.
             ClaudeEntry::Cmux(_) => false,
         })
         .collect();
@@ -375,15 +379,33 @@ fn build_connector_glyphs(
 
 // ── Background refresh ───────────────────────────────────────────────────
 
-type DiscoveryResult = (Vec<FlutterApp>, Vec<CmuxSurface>, Vec<TrmPane>, DesktopTarget);
+type DiscoveryResult = (
+    Vec<FlutterApp>,
+    Vec<CmuxSurface>,
+    Vec<TrmPane>,
+    DesktopTarget,
+    Vec<AgentSession>,
+);
 
 fn spawn_discovery(tx: mpsc::Sender<DiscoveryResult>) {
     tokio::task::spawn_blocking(move || {
         let result = (
-            discover_flutter_apps(),
+            {
+                // A statically-served release bundle has no Flutter process to
+                // find; it is discovered by what it serves.
+                let mut apps = discover_flutter_apps();
+                merge_remote_apps(&mut apps, discover_static_web_apps());
+                // An app on the build host is on no process table here. Its own
+                // flan server can see it, so ask. Peers go in before the remote
+                // registry merge in `apply_discovery`, so a full peer row wins
+                // over the pid-0 stub the same app left when it last flushed.
+                merge_peer_apps(&mut apps, discover_peer_apps(&load_peers()));
+                apps
+            },
             cmux_surface_list(),
             discover_trm_panes(),
             discover_desktop_target(),
+            discover_agent_sessions(),
         );
         let _ = tx.blocking_send(result);
     });
@@ -408,6 +430,11 @@ enum Focus {
 enum ClaudeEntry {
     Cmux(CmuxSurface),
     Trm(TrmPane),
+    /// A running agent session with no pane behind it. This is what a headless
+    /// host looks like: detached `zmx`/`screen`/ssh sessions expose no trm RPC
+    /// surface, so pane discovery finds nothing, while the session registry and
+    /// the process table describe every agent on the box.
+    Session(AgentSession),
 }
 
 impl ClaudeEntry {
@@ -421,18 +448,40 @@ impl ClaudeEntry {
             // would collapse onto whatever sits at the low indices — "the first
             // agent"). pane_id is assigned per-pane by trm and is stable.
             ClaudeEntry::Trm(p) => format!("trm:{}", p.pane_id),
+            // See AgentSession::entry_id — the server resolves links by the
+            // same string, so both sides must agree on it.
+            ClaudeEntry::Session(a) => a.entry_id(),
         }
     }
     fn is_claude(&self) -> bool {
         match self {
             ClaudeEntry::Cmux(s) => title_has_agent(&s.title),
             ClaudeEntry::Trm(p) => p.has_claude,
+            ClaudeEntry::Session(_) => true,
         }
     }
     fn cwd(&self) -> Option<&str> {
         match self {
             ClaudeEntry::Cmux(s) => s.cwd.as_deref(),
             ClaudeEntry::Trm(p) => p.cwd.as_deref(),
+            ClaudeEntry::Session(a) => a.cwd.as_deref(),
+        }
+    }
+}
+
+/// Append discovered agent sessions, skipping any whose channel is already
+/// shown as a pane's `channel_port` — that is the same agent seen twice, and
+/// the pane is the better row (it can be focused and text-injected, a bare
+/// session can't).
+fn append_session_entries(entries: &mut Vec<ClaudeEntry>, sessions: &[AgentSession]) {
+    for session in sessions {
+        let claimed = session.channel_port.is_some()
+            && entries.iter().any(|e| match e {
+                ClaudeEntry::Trm(p) => p.channel_port == session.channel_port,
+                _ => false,
+            });
+        if !claimed {
+            entries.push(ClaudeEntry::Session(session.clone()));
         }
     }
 }
@@ -440,8 +489,12 @@ impl ClaudeEntry {
 struct App {
     shared: Arc<SharedState>,
     flutter_apps: Vec<FlutterApp>,
+    /// Last reported reachability per peer, so only CHANGES reach the log.
+    peer_reachable: std::collections::HashMap<String, bool>,
     cmux_surfaces: Vec<CmuxSurface>,
     trm_panes: Vec<TrmPane>,
+    /// Every agent session on the host, pane or no pane.
+    agent_sessions: Vec<AgentSession>,
     associations: Vec<Association>,
     desktop_target: Option<DesktopTarget>,
     /// Snapshot of shared log for rendering (avoids async read during draw)
@@ -465,8 +518,10 @@ impl App {
         Self {
             shared,
             flutter_apps: Vec::new(),
+            peer_reachable: std::collections::HashMap::new(),
             cmux_surfaces: Vec::new(),
             trm_panes: Vec::new(),
+            agent_sessions: Vec::new(),
             associations: Vec::new(),
             desktop_target: None,
             log_snapshot: Vec::new(),
@@ -585,6 +640,7 @@ impl App {
                 entries.push(ClaudeEntry::Trm(pane.clone()));
             }
         }
+        append_session_entries(&mut entries, &self.agent_sessions);
         entries
     }
 
@@ -634,14 +690,81 @@ impl App {
             .find(|a| a.claude_surface_id == id)
     }
 
+    /// The flan-channel port that reaches the agent behind `id`, whether it was
+    /// discovered as a trm pane or registered itself as a bare channel.
+    fn channel_port_for_id(&self, id: &str) -> Option<u16> {
+        if let Some(pane_id) = id.strip_prefix("trm:").and_then(|n| n.parse::<usize>().ok()) {
+            return self
+                .trm_panes
+                .iter()
+                .find(|p| p.pane_id == pane_id)
+                .and_then(|p| p.channel_port);
+        }
+        // Resolve through the live list rather than trusting the id: a link
+        // persisted against a session that has since exited — or whose channel
+        // was rebound on a new port — must not look reachable.
+        self.agent_sessions
+            .iter()
+            .find(|a| {
+                ClaudeEntry::Session((*a).clone()).id() == id
+            })
+            .and_then(|a| a.channel_port)
+    }
+
     fn set_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
-    async fn apply_discovery(&mut self, result: DiscoveryResult) {
-        let (flutter, surfaces, trm, desktop) = result;
+    /// Say something the first time a peer stops answering, and again when it
+    /// comes back.
+    ///
+    /// An unreachable peer and a peer running nothing both produce an empty
+    /// list. Without this the TUI looks identical in both cases, so a peer whose
+    /// flan server isn't running reads as "the feature is broken" — which is
+    /// exactly how this was first reported.
+    async fn report_peer_changes(&mut self) {
+        for state in peer_states() {
+            let was = self.peer_reachable.insert(state.peer.clone(), state.reachable);
+            if was == Some(state.reachable) {
+                continue; // nothing changed; don't refill the log every tick
+            }
+            let host = peer_host(&state.peer).unwrap_or_else(|| state.peer.clone());
+            if state.reachable {
+                self.log(
+                    "peer",
+                    format!("{host}: {} app(s)", state.app_count),
+                    None,
+                    true,
+                )
+                .await;
+            } else {
+                let detail = format!(
+                    "No flan server answered at {}. Apps running there can't be \
+                     discovered until one does.",
+                    state.peer
+                );
+                self.log("peer", format!("{host} unreachable"), Some(detail), false)
+                    .await;
+                self.set_toast(format!("peer {host} unreachable"));
+            }
+        }
+        // A peer removed from the config stops being tracked.
+        let live: std::collections::HashSet<String> =
+            peer_states().into_iter().map(|s| s.peer).collect();
+        self.peer_reachable.retain(|peer, _| live.contains(peer));
+    }
 
+    async fn apply_discovery(&mut self, result: DiscoveryResult) {
+        let (flutter, surfaces, trm, desktop, discovered_sessions) = result;
+
+        // Apps this host can't see as processes are known only from the
+        // flushes they send. They must join the list here too — the TUI
+        // overwrites the shared cache below, so merging only inside the HTTP
+        // layer would leave them out of both the column and the API.
+        let mut flutter = flutter;
+        merge_remote_apps(&mut flutter, self.shared.remote_apps().await);
         self.flutter_apps = flutter.clone();
+        self.report_peer_changes().await;
         self.cmux_surfaces = surfaces;
         let mut trm = trm;
         // Attach registered channel ports to trm panes.
@@ -700,13 +823,27 @@ impl App {
             }
         }
         self.trm_panes = trm;
+        self.agent_sessions = self.shared.agent_sessions(discovered_sessions).await;
         self.desktop_target = if desktop.alive { Some(desktop.clone()) } else { None };
         *self.shared.desktop_cache.write().await = Some((Instant::now(), desktop));
 
         // Prune stale associations where the Flutter process is gone
         let mut assocs = load_associations(&self.shared.persistence_path);
         let before = assocs.len();
-        assocs.retain(|a| self.flutter_apps.iter().any(|f| f.pid == a.flutter_pid));
+        // Keep a link while its app's process is alive, even when this pass of
+        // discovery didn't see it — a probe can time out, and dropping the link
+        // on that would quietly unlink a running app.
+        assocs.retain(|a| {
+            // A link made against an app id is kept unconditionally. Such an
+            // app has no process to check and is invisible between flushes, so
+            // "not currently listed" says nothing about whether it still
+            // exists — dropping it there silently unlinks a working app.
+            if a.flutter_app_id.is_some() {
+                return true;
+            }
+            self.flutter_apps.iter().any(|f| f.pid == a.flutter_pid)
+                || (a.flutter_pid != 0 && pid_is_alive(a.flutter_pid))
+        });
         if assocs.len() < before {
             save_associations(&self.shared.persistence_path, &assocs);
         }
@@ -1149,13 +1286,29 @@ fn build_flutter_lines(app: &App, idx: usize) -> Vec<(String, Style)> {
     let mut lines = Vec::new();
 
     let device = fl.device.as_deref().unwrap_or("?");
+    // Where it is, then how to open it. The host answers the question a
+    // two-machine setup asks first — mini or m1 — and without it two apps on
+    // two machines differ only by a port number, which reads as one project
+    // built twice. An app found locally reports no host, so it gets this
+    // machine's name: "not remote" is a fact about this machine, not a blank.
+    let host = fl.host.clone().unwrap_or_else(local_hostname);
+    let where_ = match fl.web_port {
+        Some(port) => format!("  {host}:{port}"),
+        None => format!("  {host}"),
+    };
     lines.push((
-        format!("{}  ({})", fl.folder_name, device),
+        format!("{}  ({}){}", fl.folder_name, device, where_),
         Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
     ));
 
     lines.push((
-        shorten_path(&fl.cwd),
+        if fl.cwd.is_empty() {
+            // No local process to read a cwd from — the id it flushes with is
+            // the only thing that names it.
+            fl.app_id.clone().unwrap_or_else(|| "(remote app)".into())
+        } else {
+            shorten_path(&fl.cwd)
+        },
         Style::default().fg(TEXT2),
     ));
 
@@ -1167,6 +1320,44 @@ fn build_flutter_lines(app: &App, idx: usize) -> Vec<(String, Style)> {
     }
 
     lines
+}
+
+/// A short marker for what the session is doing right now, from Claude Code's
+/// own registry. Blank when it reports nothing rather than guessing.
+fn status_tag(agent: &AgentSession) -> String {
+    match agent.status.as_deref() {
+        Some("busy") => "  \u{25cf} busy".into(),
+        Some("idle") => "  \u{25cb} idle".into(),
+        Some(other) if !other.is_empty() => format!("  \u{b7} {other}"),
+        _ => String::new(),
+    }
+}
+
+/// The artifacts a session has published, as Claude Code's own status line
+/// names them. Two sessions on one repo often differ only in what they've
+/// produced, so this is frequently the line that tells them apart when
+/// choosing which one to link.
+fn artifact_tag(agent: &AgentSession) -> Option<String> {
+    if agent.artifacts.is_empty() {
+        return None;
+    }
+    // Publication order, oldest first — the same order Claude Code's status
+    // line uses, so a name spotted there is in the same place here. Showing the
+    // newest first instead hid the oldest artifact behind the overflow count,
+    // which is the one a long-running session is most likely known by.
+    const SHOWN: usize = 4;
+    let total = agent.artifacts.len();
+    let shown: Vec<&str> = agent
+        .artifacts
+        .iter()
+        .take(SHOWN)
+        .map(|s| s.as_str())
+        .collect();
+    let mut tag = format!("\u{229e} {}", shown.join(" \u{b7} "));
+    if total > SHOWN {
+        tag.push_str(&format!(" +{}", total - SHOWN));
+    }
+    Some(tag)
 }
 
 fn build_entry_lines(app: &App, entry: &ClaudeEntry) -> Vec<(String, Style)> {
@@ -1232,6 +1423,51 @@ fn build_entry_lines(app: &App, entry: &ClaudeEntry) -> Vec<(String, Style)> {
                 }
             } else {
                 lines.push(("(empty pane)".into(), Style::default().fg(TEXT2)));
+            }
+            lines
+        }
+        ClaudeEntry::Session(agent) => {
+            let mut lines = Vec::new();
+            // Several sessions routinely share one repo, so the cwd alone can't
+            // tell them apart. Lead with the identifiers that can: the session's
+            // own name and its tty.
+            let where_ = agent.tty.clone()
+                .or_else(|| agent.agent_pid.map(|p| format!("pid {}", p)))
+                .unwrap_or_else(|| "headless".into());
+            let name = agent.session_name.clone()
+                .unwrap_or_else(|| agent.agent_name.clone().unwrap_or_else(|| "agent".into()));
+            // An unreachable session (no flan-channel) is worth showing but
+            // must not look linkable — say so instead of leaving a blank.
+            let reach = match agent.channel_port {
+                Some(port) => format!("ch:{port}"),
+                None => "no channel".to_string(),
+            };
+            let head_style = if agent.channel_port.is_some() {
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT2).add_modifier(Modifier::BOLD)
+            };
+            lines.push((
+                format!("{}  {}  {}{}", name, where_, reach, status_tag(agent)),
+                head_style,
+            ));
+
+            // Path plus branch — or the worktree name, which is what actually
+            // distinguishes sibling sessions on one repo.
+            let mut place = agent.cwd.as_deref().map(shorten_path)
+                .unwrap_or_else(|| "(unknown path)".into());
+            if let Some(ref worktree) = agent.worktree {
+                place.push_str(&format!("  \u{2442} {worktree}"));
+            } else if let Some(ref branch) = agent.branch {
+                place.push_str(&format!("  \u{2442} {branch}"));
+            }
+            lines.push((place, Style::default().fg(TEXT2)));
+
+            if let Some(ref summary) = agent.summary {
+                lines.push((format!("\u{201c}{summary}\u{201d}"), Style::default().fg(TEXT2)));
+            }
+            if let Some(artifacts) = artifact_tag(agent) {
+                lines.push((artifacts, Style::default().fg(ACCENT2)));
             }
             lines
         }
@@ -1369,6 +1605,8 @@ fn render_help_bar(f: &mut Frame, area: Rect) {
         Span::styled("est ", Style::default().fg(TEXT2)),
         Span::styled("[x]", Style::default().fg(ACCENT2)),
         Span::styled("flush ", Style::default().fg(TEXT2)),
+        Span::styled("[R]", Style::default().fg(ACCENT2)),
+        Span::styled("eload ", Style::default().fg(TEXT2)),
         Span::styled("[g]", Style::default().fg(ACCENT2)),
         Span::styled("log ", Style::default().fg(TEXT2)),
         Span::styled("[←→]", Style::default().fg(ACCENT2)),
@@ -1400,18 +1638,72 @@ async fn main() -> io::Result<()> {
         })
         .unwrap_or(4050);
 
+    // `--watch 9689[,3000]` names web dev servers to instrument; see the
+    // `watch` module. Persisted, so it only has to be said once.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        for (i, arg) in args.iter().enumerate() {
+            let list = match arg.strip_prefix("--watch=") {
+                Some(list) => Some(list.to_string()),
+                None if arg == "--watch" => args.get(i + 1).cloned(),
+                None => None,
+            };
+            for port in list.as_deref().map(watch::parse_port_list).unwrap_or_default() {
+                watch::add_watched_port(port);
+            }
+        }
+    }
+
+    // Send tracing to the same log file the standalone server uses. Without a
+    // subscriber every tracing::info! in the request path is discarded, which
+    // makes a misrouted flush impossible to diagnose after the fact.
+    if let Ok(log_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(flan_dir().join("server.log"))
+    {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "flan_server=info".parse().unwrap()),
+            )
+            .with_writer(std::sync::Mutex::new(log_file))
+            .with_ansi(false)
+            .try_init();
+    }
+
     // Shared state between TUI and HTTP server
     let shared = Arc::new(SharedState::new());
 
-    // Spawn the HTTP server in the background
+    // Bind BEFORE taking over the terminal.
+    //
+    // A busy port is the common failure — a flan-server or a second TUI
+    // already owns 4050 — and binding inside the spawned task made it a
+    // silent trap: the task panicked, the panic hook below ran
+    // `disable_raw_mode()` on the tty, and the TUI carried on drawing over a
+    // cooked terminal. Keystrokes echoed instead of being delivered, so `q`
+    // printed a `q` and never quit. Fail here, while the terminal is still
+    // plainly ours, and say what to do about it.
+    let listener = match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("flan-tui: cannot listen on port {port}: {err}");
+            eprintln!(
+                "Another flan-tui or flan-server already has it. Stop that process, \n\
+                 or start this one on a free port with FLAN_SERVER_PORT=<port>."
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Serve in the background. The TUI and the HTTP API share one state, so
+    // agents register with whichever process holds the port — running both a
+    // TUI and a standalone server splits that state in two.
     let server_state = shared.clone();
     tokio::spawn(async move {
-        let router = build_router(server_state);
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
-            .await
-            .expect("failed to bind HTTP server");
-        axum::serve(listener, router).await.ok();
+        axum::serve(listener, build_router(server_state)).await.ok();
     });
+    watch::spawn_watch_proxies(shared.clone(), port).await;
 
     // Terminal setup — open /dev/tty directly so raw mode works even when
     // launched inside trm or another terminal emulator in debug mode.
@@ -1506,16 +1798,31 @@ async fn main() -> io::Result<()> {
                                         .selected_flutter()
                                         .map(|f| f.cwd.clone())
                                         .filter(|c| !c.is_empty());
+                                    // An app with no local process reports pid
+                                    // 0, so its FLAN_APP_ID is the only thing
+                                    // that identifies it — and for a local app
+                                    // it outlives a rebuild.
+                                    let flutter_app_id = app
+                                        .selected_flutter()
+                                        .and_then(|f| f.app_id.clone())
+                                        .filter(|id| !id.is_empty());
                                     let assoc = Association {
                                         id: new_association_id(),
                                         claude_surface_id: sid.clone(),
                                         flutter_pid: pid,
                                         flutter_cwd,
+                                        flutter_app_id: flutter_app_id.clone(),
                                     };
                                     // Update shared state
                                     {
                                         let mut assocs = app.shared.associations.write().await;
-                                        assocs.retain(|a| a.flutter_pid != pid);
+                                        // Replace this app's link only. Matching
+                                        // on pid alone would drop every other
+                                        // remote app's link, since they share 0.
+                                        assocs.retain(|a| match (&a.flutter_app_id, &flutter_app_id) {
+                                            (Some(existing), Some(new)) => existing != new,
+                                            _ => a.flutter_pid != pid || pid == 0,
+                                        });
                                         assocs.push(assoc);
                                         save_associations(&app.shared.persistence_path, &assocs);
                                     }
@@ -1610,6 +1917,16 @@ async fn main() -> io::Result<()> {
                                                 app.sync_log_snapshot().await;
                                                 app.set_toast(if ok { format!("Focused {}", label) } else { format!("Failed {}", label) });
                                             }
+                                            Some(ClaudeEntry::Session(agent)) => {
+                                                // No pane means nothing to raise —
+                                                // the agent lives in a detached
+                                                // session on some other display.
+                                                app.set_toast(format!(
+                                                    "{} has no pane to focus ({})",
+                                                    agent.session_name.as_deref().unwrap_or("session"),
+                                                    agent.tty.as_deref().unwrap_or("headless"),
+                                                ));
+                                            }
                                             None => {
                                                 app.set_toast("No surface to focus");
                                             }
@@ -1628,7 +1945,8 @@ async fn main() -> io::Result<()> {
                                 // Otherwise, fall back to text injection via trm socket.
                                 let channel_port = selected.as_ref().and_then(|e| match e {
                                     ClaudeEntry::Trm(p) => p.channel_port,
-                                    _ => None,
+                                    ClaudeEntry::Session(a) => a.channel_port,
+                                    ClaudeEntry::Cmux(_) => None,
                                 });
 
                                 // Useful routing context so the agent (and the
@@ -1654,6 +1972,14 @@ async fn main() -> io::Result<()> {
                                     Some(ClaudeEntry::Cmux(s)) => {
                                         format!("Routed to cmux surface {}", s.id)
                                     }
+                                    Some(ClaudeEntry::Session(a)) => format!(
+                                        "Routed to session {} (no pane){}{}{}{}",
+                                        a.session_name.as_deref().unwrap_or("?"),
+                                        a.agent_pid.map(|p| format!(", agent_pid={}", p)).unwrap_or_default(),
+                                        a.tty.as_deref().map(|t| format!(", tty={}", t)).unwrap_or_default(),
+                                        a.cwd.as_deref().map(|c| format!(", cwd={}", c)).unwrap_or_default(),
+                                        a.channel_port.map(|p| format!(", channel_port={}", p)).unwrap_or_default(),
+                                    ),
                                     None => "Routed to <unknown>".to_string(),
                                 };
 
@@ -1677,17 +2003,68 @@ async fn main() -> io::Result<()> {
                                         })
                                     });
 
-                                if let Some(port) = channel_port {
-                                    let app_hint = if test_vm_uri.is_some() {
-                                        "A vm_uri for the linked Flutter app is attached — \
-                                         use the flan connect tool with it (don't go hunting \
-                                         for the VM service URI yourself), then report the \
-                                         app's current screen."
-                                    } else {
-                                        "No linked Flutter app was found for this agent, so \
-                                         no vm_uri is attached — just confirm you received \
-                                         this message."
+                                let app_hint = if test_vm_uri.is_some() {
+                                    "A vm_uri for the linked Flutter app is attached — \
+                                     use the flan connect tool with it (don't go hunting \
+                                     for the VM service URI yourself), then report the \
+                                     app's current screen."
+                                } else {
+                                    "No linked Flutter app was found for this agent, so \
+                                     no vm_uri is attached — just confirm you received \
+                                     this message."
+                                };
+
+                                // A Codex target takes the same road a real flush
+                                // does: `codex queue` into its open thread. Its
+                                // flan-channel (if any) would only reject the batch.
+                                let codex_pid: Option<u32> = match selected.as_ref() {
+                                    Some(ClaudeEntry::Session(a))
+                                        if a.agent_name.as_deref() == Some("Codex") =>
+                                    {
+                                        a.agent_pid
+                                    }
+                                    Some(ClaudeEntry::Trm(p))
+                                        if p.agent_name.as_deref() == Some("Codex") =>
+                                    {
+                                        let target = format!("trm:{}", p.pane_id);
+                                        tokio::task::spawn_blocking(move || codex_pid_for_target(&target))
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                    }
+                                    _ => None,
+                                };
+
+                                if let Some(pid) = codex_pid {
+                                    let test_text = format!(
+                                        "Flan connectivity test from the TUI (relayed with \
+                                         `codex queue`).\n{}\n\n\
+                                         If you can read this, the Flan → Codex relay is wired \
+                                         up correctly. {}",
+                                        routing_info, app_hint
+                                    );
+                                    let (text, images) = format_codex_message(
+                                        &[serde_json::json!({"type": "test", "text": test_text})],
+                                        test_vm_uri.as_deref(),
+                                        None,
+                                    );
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        let thread = codex_threads_for_pid(pid)
+                                            .into_iter()
+                                            .next()
+                                            .ok_or_else(|| format!("Codex pid {pid} has no open thread"))?;
+                                        relay_codex_queue(&thread, &text, &images).map(|_| thread)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| Err(e.to_string()));
+                                    let (ok, detail) = match result {
+                                        Ok(thread) => (true, format!("codex queue → thread {}", thread)),
+                                        Err(e) => (false, e),
                                     };
+                                    app.log("out", format!("Test codex → pid {}", pid), Some(detail.clone()), ok).await;
+                                    app.sync_log_snapshot().await;
+                                    app.set_toast(if ok { format!("Test → {} (codex queue)", target_label) } else { detail });
+                                } else if let Some(port) = channel_port {
                                     let test_text = format!(
                                         "Flan connectivity test from the TUI.\n{}\n\n\
                                          If you can read this, the flan-channel is wired up \
@@ -1763,12 +2140,54 @@ async fn main() -> io::Result<()> {
                                             tokio::task::spawn_blocking(move || cmux_send_text(&sid, &t) && cmux_send_text(&sid, "\n"))
                                                 .await.unwrap_or(false)
                                         }
+                                        // A session with a channel took the
+                                        // branch above; one without has no pane
+                                        // to type into either, so there is
+                                        // nowhere to deliver this.
+                                        ClaudeEntry::Session(_) => false,
                                     };
                                     app.log("out", format!("Test text → {}", label), Some(text), ok).await;
                                     app.sync_log_snapshot().await;
                                     app.set_toast(if ok { format!("Test → {} (text)", target_label) } else { "Test failed".to_string() });
                                 } else {
                                     app.set_toast("No agent selected");
+                                }
+                            }
+
+                            // Shift-R: hot reload the selected app. Lower
+                            // case `r` is taken by refresh, and a reload is
+                            // the more consequential of the two — it should
+                            // not be a neighbour of `q` on the home row.
+                            KeyCode::Char('R') => {
+                                if let Some(flutter) = app.selected_flutter().cloned() {
+                                    let label = if flutter.folder_name.is_empty() {
+                                        format!("pid {}", flutter.pid)
+                                    } else {
+                                        flutter.folder_name.clone()
+                                    };
+                                    // Signalling a local app is a syscall; only
+                                    // the VM-service and peer paths actually
+                                    // wait, and those are bounded.
+                                    let outcome = tokio::task::spawn_blocking(move || {
+                                        hot_reload_app(&flutter, false)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|error| HotReloadOutcome {
+                                        ok: false,
+                                        via: "none".into(),
+                                        detail: format!("Hot reload task failed: {}", error),
+                                    });
+                                    app.log(
+                                        "out",
+                                        format!("Hot reload {} via {}", label, outcome.via),
+                                        Some(outcome.detail.clone()),
+                                        outcome.ok,
+                                    )
+                                    .await;
+                                    app.sync_log_snapshot().await;
+                                    app.set_toast(&outcome.detail);
+                                } else {
+                                    app.set_toast("Select a Flutter app first");
                                 }
                             }
 
@@ -1808,14 +2227,10 @@ async fn main() -> io::Result<()> {
                                         let sid = assoc.claude_surface_id.clone();
                                         let label = sid[..8.min(sid.len())].to_string();
 
-                                        // Check if the target pane has a channel port (Claude w/ flan-channel).
-                                        let channel_port = if sid.starts_with("trm:") {
-                                            sid["trm:".len()..].parse::<usize>().ok()
-                                                .and_then(|pane_id| app.trm_panes.iter().find(|p| p.pane_id == pane_id))
-                                                .and_then(|p| p.channel_port)
-                                        } else {
-                                            None
-                                        };
+                                        // Check whether the target agent has a live
+                                        // flan-channel (a pane's registered port,
+                                        // or a pane-less registration).
+                                        let channel_port = app.channel_port_for_id(&sid);
 
                                         if let Some(port) = channel_port {
                                             // Channel push — the flan-channel MCP server will
@@ -1911,8 +2326,144 @@ async fn main() -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn sess(port: Option<u16>, name: &str, cwd: &str) -> AgentSession {
+        AgentSession {
+            session_id: Some(format!("id-{name}")),
+            agent_pid: Some(port.unwrap_or(1) as u32),
+            agent_name: Some("Claude".into()),
+            session_name: Some(name.into()),
+            status: Some("idle".into()),
+            tty: Some("ttys006".into()),
+            cwd: Some(cwd.into()),
+            branch: Some("main".into()),
+            worktree: None,
+            summary: None,
+            artifacts: Vec::new(),
+            channel_port: port,
+            channel_pid: None,
+            surface_id: None,
+            age_secs: 0,
+        }
+    }
+
+    fn pane(pane_id: usize, cwd: &str, channel_port: Option<u16>) -> TrmPane {
+        TrmPane {
+            index: pane_id,
+            pane_id,
+            folder_name: None,
+            cwd: Some(cwd.into()),
+            has_claude: true,
+            agent_name: Some("Claude".into()),
+            surface_id: None,
+            title: None,
+            channel_port,
+            login_pid: None,
+            has_dev_channels: false,
+        }
+    }
+
+    /// The headless case this whole entry kind exists for: no panes at all
+    /// (trm's RPC is absent), so every agent must come from the session
+    /// registry or the column is empty.
+    #[test]
+    fn sessions_become_entries_when_there_are_no_panes() {
+        let mut entries: Vec<ClaudeEntry> = Vec::new();
+        let sessions = vec![
+            sess(Some(60365), "flan-mcp-8f", "/Users/g/dev/flan_mcp"),
+            sess(Some(60604), "fasmac-40", "/Users/g/dev/fasmac"),
+        ];
+
+        append_session_entries(&mut entries, &sessions);
+
+        let ids: Vec<String> = entries.iter().map(|e| e.id()).collect();
+        assert_eq!(ids, vec!["sess:60365", "sess:60604"]);
+        assert!(entries.iter().all(|e| e.is_claude()));
+        assert_eq!(entries[1].cwd(), Some("/Users/g/dev/fasmac"));
+    }
+
+    /// A session with no flan-channel is listed but not reachable. Filtering
+    /// these out is what hid half the running agents.
+    #[test]
+    fn a_session_without_a_channel_is_listed_but_unreachable() {
+        let mut entries: Vec<ClaudeEntry> = Vec::new();
+        let sessions = vec![sess(None, "trm-34", "/Users/g/dev/trm")];
+
+        append_session_entries(&mut entries, &sessions);
+
+        assert_eq!(entries.len(), 1);
+        let reachable: Vec<bool> = entries
+            .iter()
+            .map(|e| match e {
+                ClaudeEntry::Session(a) => a.channel_port.is_some(),
+                _ => true,
+            })
+            .collect();
+        assert_eq!(reachable, vec![false]);
+    }
+
+    /// Two live agents CAN report the same Claude session id — resuming one
+    /// session twice does it — so identity must not be the session id, or the
+    /// two would collapse onto one link.
+    #[test]
+    fn two_agents_resuming_one_session_keep_separate_identities() {
+        let mut a = sess(Some(60365), "pe-2a", "/Users/g/dev/pe");
+        let mut b = sess(Some(60391), "pe-49", "/Users/g/dev/pe");
+        a.session_id = Some("877cf911".into());
+        b.session_id = Some("877cf911".into());
+        a.agent_pid = Some(44254);
+        b.agent_pid = Some(6947);
+        let mut entries: Vec<ClaudeEntry> = Vec::new();
+
+        append_session_entries(&mut entries, &[a, b]);
+
+        assert_ne!(entries[0].id(), entries[1].id());
+    }
+
+    /// Two agents in the same repo — routine here, since several sessions run
+    /// against one checkout. They must stay separate entries; keying on cwd
+    /// would silently merge them and route both apps to one agent.
+    #[test]
+    fn sessions_sharing_a_cwd_stay_distinct_entries() {
+        let mut entries: Vec<ClaudeEntry> = Vec::new();
+        let sessions = vec![
+            sess(Some(60365), "flan-mcp-8f", "/Users/g/dev/flan_mcp"),
+            sess(Some(60391), "flan-mcp-a9", "/Users/g/dev/flan_mcp"),
+        ];
+
+        append_session_entries(&mut entries, &sessions);
+
+        assert_eq!(entries.len(), 2);
+        assert_ne!(entries[0].id(), entries[1].id());
+    }
+
+    /// A pane whose channel port is already known is the SAME agent seen from
+    /// both sides. It must render once — as the pane, which can also be
+    /// focused and text-injected.
+    #[test]
+    fn a_session_already_bound_to_a_pane_is_not_listed_twice() {
+        let mut entries = vec![
+            ClaudeEntry::Trm(pane(19, "/Users/g/dev/flan_mcp", Some(60365))),
+            ClaudeEntry::Trm(pane(20, "/Users/g/dev/trm", None)),
+        ];
+        let sessions = vec![
+            sess(Some(60365), "flan-mcp-8f", "/Users/g/dev/flan_mcp"), // same agent as pane 19
+            sess(Some(60604), "fasmac-40", "/Users/g/dev/fasmac"),     // pane-less
+        ];
+
+        append_session_entries(&mut entries, &sessions);
+
+        let ids: Vec<String> = entries.iter().map(|e| e.id()).collect();
+        assert_eq!(ids, vec!["trm:19", "trm:20", "sess:60604"]);
+    }
+
     fn assoc(pid: u32, sid: &str) -> Association {
-        Association { id: format!("{pid}"), claude_surface_id: sid.into(), flutter_pid: pid }
+        Association {
+            id: format!("{pid}"),
+            claude_surface_id: sid.into(),
+            flutter_pid: pid,
+            flutter_cwd: None,
+            flutter_app_id: None,
+        }
     }
 
     // Reproduces the live state: 3 chrome Flutter apps, 4 trm agents, with two

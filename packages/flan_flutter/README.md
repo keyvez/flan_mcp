@@ -34,6 +34,22 @@ void main() {
 }
 ```
 
+For command-center messages, supply the Flan relay endpoint through the host
+environment rather than embedding a local port in application code:
+
+```bash
+flutter run \
+  --dart-define=FLAN_SERVER_URL="$FLAN_SERVER_URL" \
+  --dart-define=FLAN_APP_ID="$FLAN_APP_ID"
+```
+
+`FLAN_SERVER_URL` must be reachable by the app. In particular, a Flutter web
+page opened from another tailnet device cannot use that device's loopback
+address. `FLAN_APP_ID` is an opaque identity that keeps parallel Flutter
+worktrees routable even when a reverse proxy changes the browser-visible port.
+The relay forwards messages to the agent's loopback-only channel server-side;
+the browser never discovers or calls a channel port directly.
+
 ## In-App Command Center
 
 Once initialized, the command center is available via keyboard shortcuts:
@@ -53,7 +69,7 @@ Use the **scroll wheel** or **arrow keys** to cycle through overlapping widgets.
 
 ### Annotations (`Ctrl+Shift+A`)
 
-Draw rectangles on the app and label them. Each annotation is paired with the widget underneath it. Send all annotations to the agent with `Ctrl+Shift+Enter` — the agent receives your visual markup correlated with source code locations.
+Choose Box, Arrow, or Circle in the annotation toolbar, then drag on the app and label the shape. Arrows point from where you start dragging to where you release; circles can be stretched into ovals. Each annotation is paired with the widget underneath it. Send all annotations to the agent with `Ctrl+Shift+Enter` — the agent receives your visual markup correlated with source code locations.
 
 Click an existing annotation to edit or delete it.
 

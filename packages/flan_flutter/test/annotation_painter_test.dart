@@ -6,6 +6,62 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  for (final state in [
+    AnnotationDrawState.drawing,
+    AnnotationDrawState.editing,
+    AnnotationDrawState.normal,
+    AnnotationDrawState.editingExisting,
+  ]) {
+    for (final shape in [AnnotationShape.arrow, AnnotationShape.circle]) {
+      test('renders $shape in $state', () {
+        const start = Offset(150, 100);
+        const end = Offset(50, 50);
+        final bounds = Rect.fromPoints(start, end);
+        final painter = AnnotationPainter(
+          annotations: state == AnnotationDrawState.normal ||
+                  state == AnnotationDrawState.editingExisting
+              ? [
+                  Annotation(
+                      id: '1',
+                      bounds: bounds,
+                      text: '',
+                      shape: shape,
+                      start: start,
+                      end: end)
+                ]
+              : [],
+          shape: shape,
+          dragStart: start,
+          dragCurrent: end,
+          pendingRect: bounds,
+          drawState: state,
+          editingIndex: state == AnnotationDrawState.editingExisting ? 0 : null,
+        );
+        void paint(Canvas canvas) =>
+            painter.paint(canvas, const Size(200, 200));
+        if (shape == AnnotationShape.arrow) {
+          expect(
+              paint,
+              paints
+                ..line(p1: start, p2: end)
+                ..something((method, args) =>
+                    method == #drawPath &&
+                    (args.first as Path)
+                        .getBounds()
+                        .contains(const Offset(55, 55))));
+        } else {
+          expect(
+              paint,
+              paints
+                ..something((method, args) =>
+                    method == #drawOval && args.first == bounds)
+                ..something((method, args) =>
+                    method == #drawOval && args.first == bounds));
+        }
+      });
+    }
+  }
+
   group('AnnotationPainter shouldRepaint', () {
     test('returns false for identical delegates', () {
       final painter1 = AnnotationPainter(

@@ -105,10 +105,17 @@ Press **Enter** to send. If you've drawn anything, the sketch is captured as an 
 | `Ctrl+Shift+H` | Toggle widget inspector |
 | `Ctrl+Shift+A` | Toggle annotation mode |
 | `Ctrl+Shift+Enter` | Send current selection/annotations to agent |
+| `Ctrl+Shift+L` | Hot reload the app (add `Alt` for a hot restart) |
 | `Alt+Alt` (double-tap) | Open text message overlay |
 | `Escape` | Dismiss active mode or unlock selection |
 | `Scroll wheel` | Cycle through overlapping widgets (in inspector) |
 | `Arrow Up/Down` | Cycle through overlapping widgets (in inspector) |
+
+Hot reload is also on the **Q badge's right-click menu**, next to hot restart.
+Neither happens in the app — the overlay asks the local flan server, which
+signals the `flutter run` that owns the compiler. On web the page itself has no
+VM service, so the recompile only reaches the browser if the Dart debug client
+is attached; otherwise refresh the page.
 
 ### The Feedback Loop
 

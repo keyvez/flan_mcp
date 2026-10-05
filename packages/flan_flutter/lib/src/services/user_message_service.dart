@@ -5,13 +5,24 @@ import 'dart:io' show pid;
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:flan_flutter/src/services/flan_server_client.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Service that queues messages from the user in the Flutter app
 /// to be sent to the LLM agent via the MCP server.
 class UserMessageService extends ChangeNotifier {
-  UserMessageService({http.Client? httpClient, bool pollServer = false})
-      : _httpClient = httpClient ?? http.Client() {
+  UserMessageService({
+    http.Client? httpClient,
+    FlanServerClient? serverClient,
+    String serverUrl = const String.fromEnvironment('FLAN_SERVER_URL'),
+    String appId = const String.fromEnvironment('FLAN_APP_ID'),
+    bool pollServer = false,
+  }) : _serverClient = serverClient ??
+            FlanServerClient(
+              serverUrl: serverUrl,
+              appId: appId,
+              httpClient: httpClient,
+            ) {
     if (pollServer) {
       _startServerPolling();
     }
@@ -25,7 +36,7 @@ class UserMessageService extends ChangeNotifier {
 
   static const _serverPollInterval = Duration(seconds: 10);
 
-  final http.Client _httpClient;
+  final FlanServerClient _serverClient;
   final List<Map<String, dynamic>> _pendingMessages = [];
   int _nextQueueId = 1;
 
@@ -288,7 +299,9 @@ class UserMessageService extends ChangeNotifier {
   }
 
   /// Returns all pending messages and removes them from the queue.
-  List<Map<String, dynamic>> consumeMessages() {
+  List<Map<String, dynamic>> consumeMessages({
+    bool markAgentWorking = true,
+  }) {
     warmUp();
     if (_pendingMessages.isEmpty) return [];
     final consumed = _pendingMessages
@@ -296,7 +309,9 @@ class UserMessageService extends ChangeNotifier {
         .toList();
     _pendingMessages.clear();
     _agentConsumeGeneration++;
-    isAgentWorking = true;
+    if (markAgentWorking) {
+      isAgentWorking = true;
+    }
     unawaited(_persistQueueState());
     notifyListeners();
     return consumed;
@@ -551,24 +566,17 @@ class UserMessageService extends ChangeNotifier {
 
   @visibleForTesting
   Future<void> pollServerStatus() async {
-    try {
-      final response = await _httpClient
-          .get(Uri.parse('http://localhost:4050/api/status?pid=$pid'))
-          .timeout(const Duration(seconds: 3));
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body) as Map<String, dynamic>;
-        final has = data['has_association'] == true;
-        final label = has ? data['linked_label'] as String? : null;
-        if (_hasServerAssociation != has || _linkedLabel != label) {
-          _hasServerAssociation = has;
-          _linkedLabel = label;
-          notifyListeners();
-        }
-      } else {
-        _setServerAssociation(false);
-      }
-    } catch (_) {
+    final status = await _serverClient.getStatus(processId: pid);
+    if (status == null) {
       _setServerAssociation(false);
+      return;
+    }
+    final has = status.hasAssociation;
+    final label = status.linkedLabel;
+    if (_hasServerAssociation != has || _linkedLabel != label) {
+      _hasServerAssociation = has;
+      _linkedLabel = label;
+      notifyListeners();
     }
   }
 

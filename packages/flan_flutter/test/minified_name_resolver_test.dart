@@ -155,4 +155,58 @@ void main() {
       );
     });
   });
+
+  // An annotation reaches an agent as prose AND as a JSON `data` map, and the
+  // widget names live at several depths inside the second. The overlay
+  // resolves that map by running the resolver over the ENCODED json, which is
+  // only safe because a minified token can never contain a quote or a brace.
+  group('resolving over encoded json', () {
+    setUp(MinifiedNameResolver.reset);
+    tearDown(MinifiedNameResolver.reset);
+
+    test('nested widget names resolve and the structure survives', () async {
+      MinifiedNameResolver.seed({'Q0': 'SimpleShortlistView', 'alL': 'AppShell'});
+      final payload = {
+        'annotations': [
+          {
+            'text': 'simplify this view',
+            'widget': {
+              'widgetType': 'minified:Q0',
+              'widgetPath': 'minified:alL > minified:Q0',
+            },
+          },
+        ],
+      };
+
+      final resolved = jsonDecode(
+        await MinifiedNameResolver.resolveIn(jsonEncode(payload)),
+      ) as Map<String, dynamic>;
+
+      final widget =
+          (resolved['annotations'] as List).first['widget'] as Map;
+      expect(widget['widgetType'], 'SimpleShortlistView');
+      expect(widget['widgetPath'], 'AppShell > SimpleShortlistView');
+      // Untouched text stays exactly as the user typed it.
+      expect(
+        (resolved['annotations'] as List).first['text'],
+        'simplify this view',
+      );
+    });
+
+    test('an unknown name is left alone rather than guessed at', () async {
+      MinifiedNameResolver.seed({'Q0': 'SimpleShortlistView'});
+      final resolved = jsonDecode(
+        await MinifiedNameResolver.resolveIn(
+          jsonEncode({'widgetType': 'minified:zZ9'}),
+        ),
+      ) as Map<String, dynamic>;
+      expect(resolved['widgetType'], 'minified:zZ9');
+    });
+
+    test('a payload with nothing minified comes back identical', () async {
+      MinifiedNameResolver.seed({'Q0': 'SimpleShortlistView'});
+      const encoded = '{"widgetType":"SimpleShortlistView"}';
+      expect(await MinifiedNameResolver.resolveIn(encoded), same(encoded));
+    });
+  });
 }

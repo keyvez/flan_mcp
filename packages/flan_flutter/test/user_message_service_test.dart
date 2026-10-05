@@ -60,6 +60,17 @@ void main() {
       expect(consumed, isEmpty);
     });
 
+    test('accepted queued messages do not mark the agent working', () async {
+      final service = UserMessageService();
+      await service.ensureHydrated();
+      service.sendMessage({'type': 'test', 'text': 'queued'});
+
+      service.consumeMessages(markAgentWorking: false);
+
+      expect(service.pendingMessageCount, 0);
+      expect(service.isAgentWorking, isFalse);
+    });
+
     test('clearMessages clears all', () async {
       final service = UserMessageService();
       await service.ensureHydrated();
@@ -588,7 +599,10 @@ void main() {
           200,
         );
       });
-      final service = UserMessageService(httpClient: client);
+      final service = UserMessageService(
+        httpClient: client,
+        serverUrl: 'http://relay.test',
+      );
       await service.pollServerStatus();
       expect(service.hasServerAssociation, isTrue);
     });
@@ -601,7 +615,10 @@ void main() {
           200,
         );
       });
-      final service = UserMessageService(httpClient: client);
+      final service = UserMessageService(
+        httpClient: client,
+        serverUrl: 'http://relay.test',
+      );
       await service.pollServerStatus();
       expect(service.hasServerAssociation, isFalse);
     });
@@ -610,7 +627,10 @@ void main() {
       final client = http_testing.MockClient((request) async {
         throw Exception('Connection refused');
       });
-      final service = UserMessageService(httpClient: client);
+      final service = UserMessageService(
+        httpClient: client,
+        serverUrl: 'http://relay.test',
+      );
       await service.pollServerStatus();
       expect(service.hasServerAssociation, isFalse);
     });
@@ -626,7 +646,10 @@ void main() {
           200,
         );
       });
-      final service = UserMessageService(httpClient: client);
+      final service = UserMessageService(
+        httpClient: client,
+        serverUrl: 'http://relay.test',
+      );
       var notifications = 0;
       service.addListener(() => notifications++);
 

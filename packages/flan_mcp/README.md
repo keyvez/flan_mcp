@@ -113,6 +113,8 @@ claude mcp add --transport stdio flan -- flan_mcp
 
 > **Note:** `process_queue` is not triggered automatically — the agent must call it explicitly to consume pending messages. Flan emits notifications when new messages arrive, but the agent still needs to invoke `process_queue` (or `get_user_message`) to retrieve them.
 
+The `flan-channel` push server uses Claude Code’s `notifications/claude/channel` protocol, which Codex does not speak. When the linked agent is a Codex session, the Flan server (and the TUI’s test send) bypass the channel and relay each batch with `codex queue --remote unix:// --thread <id> --message <text>`, where the thread id is read from the rollout file the Codex process has open. Screenshots are written to `~/.flan/codex-images/` and attached with `--image`. Set `FLAN_CODEX_BIN` if the `codex` binary is not on the server’s PATH or in `~/.local/bin`.
+
 `connect` also accepts an optional `sampling_push` boolean to enable server-initiated `sampling/createMessage` nudges when user messages arrive (capability-gated by client support).
 
 ### Development

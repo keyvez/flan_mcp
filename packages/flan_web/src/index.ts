@@ -16,7 +16,7 @@
  * Shortcuts: double-tap Alt (message), Ctrl+Shift+A (annotations),
  * Ctrl+Shift+H (inspector), Esc (close).
  */
-export { FlanProvider, useFlan } from './context.js';
+export { FlanProvider, useFlan, httpBaseFrom, wsUrlFrom } from './context.js';
 export type {
   FlanContextValue,
   FlanMode,
@@ -29,6 +29,8 @@ export { InspectorOverlay } from './InspectorOverlay.js';
 export { useFlanShortcuts } from './useFlanShortcuts.js';
 export { FlanTransport } from './transport.js';
 export type { FlanTransportOptions } from './transport.js';
+export { FlanFlushTransport } from './flush_transport.js';
+export type { FlanFlushTransportOptions } from './flush_transport.js';
 export {
   cssSelectorFor,
   describeElement,

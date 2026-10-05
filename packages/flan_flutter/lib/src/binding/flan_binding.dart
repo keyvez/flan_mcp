@@ -9,6 +9,7 @@ import 'package:flan_flutter/src/services/element_tree_finder.dart';
 import 'package:flan_flutter/src/services/gesture_dispatcher.dart';
 import 'package:flan_flutter/src/services/inspector_service.dart';
 import 'package:flan_flutter/src/services/error_interceptor.dart';
+import 'package:flan_flutter/src/services/flan_server_client.dart';
 import 'package:flan_flutter/src/services/github_issue_service.dart';
 import 'package:flan_flutter/src/services/log_collector.dart';
 import 'package:flan_flutter/src/services/macro_recorder_service.dart';
@@ -154,6 +155,7 @@ class FlanBinding extends WidgetsFlutterBinding {
   late final InspectorService _inspectorService;
   late final AnnotationService _annotationService;
   late final UserMessageService _userMessageService;
+  late final FlanServerClient _serverClient;
   late final ErrorInterceptor _errorInterceptor;
   late final MacroRecorderService _macroRecorderService;
 
@@ -174,7 +176,20 @@ class FlanBinding extends WidgetsFlutterBinding {
     _textInputSimulator = TextInputSimulator(_widgetFinder);
     _inspectorService = InspectorService();
     _annotationService = AnnotationService();
-    _userMessageService = UserMessageService(pollServer: true);
+    _serverClient = FlanServerClient(
+      // Resolve against the page origin: on web the browser may be on another
+      // machine, where a loopback relay URL points at nothing.
+      serverUrl: resolveRelayUrl(
+        configured: configuration.serverUrl,
+        pageOrigin: Uri.base,
+        isWeb: kIsWeb,
+      ),
+      appId: configuration.appId,
+    );
+    _userMessageService = UserMessageService(
+      pollServer: true,
+      serverClient: _serverClient,
+    );
     _userMessageService.warmUp();
     _errorInterceptor = ErrorInterceptor();
     _errorInterceptor.install();
@@ -194,6 +209,7 @@ class FlanBinding extends WidgetsFlutterBinding {
         screenshotService: _screenshotService,
         errorInterceptor: _errorInterceptor,
         macroRecorderService: _macroRecorderService,
+        serverClient: _serverClient,
         child: rootWidget,
       ),
     );

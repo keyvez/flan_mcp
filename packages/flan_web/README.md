@@ -51,6 +51,37 @@ function Root() {
 default port). Pass `enabled={false}` to disable the command center in
 production builds.
 
+## Any web app, no code changes: watched ports
+
+The Flan server (and `flan-tui`) can instrument a plain dev server —
+wrangler, vite, Rails, anything that serves HTML — without the app
+importing `flan_web` at all. Name its port once:
+
+```sh
+flan-tui --watch 9689            # or: FLAN_WATCH_PORTS=9689 flan-tui
+curl -X POST localhost:4050/api/watch-ports -d '{"port":9689}'   # at runtime
+```
+
+Ports persist in `~/.flan/watched_ports.json`. For each one the server:
+
+- lists the listener as an app row (`career-site (web:9689) :49689`), so
+  it can be linked to an agent like a Flutter app;
+- opens a reverse proxy on the port plus 40000 (`:9689` → `:49689`) that
+  injects the standalone overlay bundle (`/flan.js`) into every HTML page
+  and strips `Content-Security-Policy` in dev.
+
+Open the app through the proxy URL — only pages loaded that way carry the
+overlay. Messages flush with the app id `web:<port>:<folder>` and reach the
+agent linked to that row. WebSocket upgrades (HMR, live reload) are
+tunnelled through untouched.
+
+The bundle lives at `server/flan_server/static/flan.js` and is embedded at
+compile time. Rebuild it after changing `flan_web`:
+
+```sh
+cd packages/flan_web && npm run build:standalone
+```
+
 ## Shortcuts
 
 | Shortcut          | Action                                          |

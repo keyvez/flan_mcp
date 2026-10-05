@@ -10,7 +10,18 @@ class FlanConfiguration {
     this.shouldStopTraversal,
     this.extractText,
     this.maxScreenshotSize = const Size(2000, 2000),
+    this.serverUrl = const String.fromEnvironment('FLAN_SERVER_URL'),
+    this.appId = const String.fromEnvironment('FLAN_APP_ID'),
   });
+
+  /// Stable relay endpoint resolved by the host environment.
+  ///
+  /// This must be reachable by the app itself. For Flutter web opened from a
+  /// tailnet device, it therefore cannot be a loopback URL on that device.
+  final String serverUrl;
+
+  /// Opaque environment-provided identity used to distinguish parallel apps.
+  final String appId;
 
   /// Determines if an app-specific widget type is interactive.
   ///

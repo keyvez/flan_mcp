@@ -52,6 +52,54 @@ void main() {
     SharedPreferences.setMockInitialValues({});
   });
 
+  for (final shape in AnnotationShape.values) {
+    testWidgets('toolbar draws and queues ${shape.name} with geometry',
+        (tester) async {
+      final annotations = AnnotationService();
+      final messages = UserMessageService();
+      await tester.pumpWidget(_buildTestApp(
+        inspectorService: InspectorService(),
+        annotationService: annotations,
+        userMessageService: messages,
+        screenshotService: ScreenshotService(),
+        errorInterceptor: ErrorInterceptor(),
+      ));
+      annotations.enable();
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(ValueKey('annotation-tool-${shape.name}')));
+      await tester.pumpAndSettle();
+      expect(annotations.shape, shape);
+      const start = Offset(300, 200);
+      final end = shape == AnnotationShape.arrow
+          ? const Offset(100, 200)
+          : const Offset(400, 300);
+      final gesture = await tester.startGesture(start);
+      await gesture.moveTo(end);
+      await tester.pump();
+      await gesture.up();
+      await tester.pump();
+      expect(annotations.drawState, AnnotationDrawState.editing);
+      await tester.enterText(find.byType(EditableText), 'look here');
+      await _runAsyncAndSettle(tester, () async {
+        tester
+            .widget<EditableText>(find.byType(EditableText))
+            .onSubmitted!('look here');
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+      });
+      expect(annotations.annotations.single.shape, shape);
+      final data = messages.peekMessages().single['data'] as Map;
+      final queued = (data['annotations'] as List).single as Map;
+      expect(queued['shape'], shape.name);
+      expect(queued['text'], 'look here');
+      if (shape == AnnotationShape.arrow) {
+        expect(queued['start'], {'x': 300.0, 'y': 200.0});
+        expect(queued['end'], {'x': 100.0, 'y': 200.0});
+      }
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+  }
+
   testWidgets('programmatic annotation creates exactly one queued draft',
       (tester) async {
     final inspectorService = InspectorService();

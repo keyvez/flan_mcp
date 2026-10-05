@@ -22,12 +22,14 @@ async fn main() {
         .init();
 
     let state = Arc::new(SharedState::new());
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     let port: u16 = std::env::var("FLAN_SERVER_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(4050);
+
+    watch::spawn_watch_proxies(state, port).await;
 
     tracing::info!("Flan server on http://localhost:{}", port);
 

@@ -1,10 +1,10 @@
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
 
-/// CustomPainter that draws completed annotation boxes, the pending
-/// drag rectangle, and the editing rectangle.
+/// CustomPainter that draws completed annotations and previews while drawing or editing.
 class AnnotationPainter extends CustomPainter {
   AnnotationPainter({
     required this.annotations,
@@ -13,8 +13,10 @@ class AnnotationPainter extends CustomPainter {
     this.pendingRect,
     required this.drawState,
     this.editingIndex,
+    this.shape = AnnotationShape.box,
   });
 
+  final AnnotationShape shape;
   final List<Annotation> annotations;
   final Offset? dragStart;
   final Offset? dragCurrent;
@@ -35,7 +37,10 @@ class AnnotationPainter extends CustomPainter {
     // Draw completed annotations
     for (var i = 0; i < annotations.length; i++) {
       if (i == editingIndex) {
-        _drawEditingRect(canvas, annotations[i].bounds);
+        final annotation = annotations[i];
+        _drawShape(canvas, annotation.bounds, annotation.shape, _annotationFill,
+            _editingBorder, 2,
+            start: annotation.arrowStart, end: annotation.arrowEnd);
       } else {
         _drawAnnotation(canvas, annotations[i]);
       }
@@ -46,29 +51,24 @@ class AnnotationPainter extends CustomPainter {
         dragStart != null &&
         dragCurrent != null) {
       final rect = Rect.fromPoints(dragStart!, dragCurrent!);
-      _drawPendingRect(canvas, rect);
+      _drawShape(canvas, rect, shape, _pendingFill, _pendingBorder, 1.5,
+          start: dragStart, end: dragCurrent);
     }
 
     // Draw the editing rectangle
     if (drawState == AnnotationDrawState.editing && pendingRect != null) {
-      _drawEditingRect(canvas, pendingRect!);
+      _drawShape(
+          canvas, pendingRect!, shape, _annotationFill, _editingBorder, 2,
+          start: dragStart, end: dragCurrent);
     }
   }
 
   void _drawAnnotation(Canvas canvas, Annotation annotation) {
     final rect = annotation.bounds;
 
-    // Fill
-    canvas.drawRect(rect, Paint()..color = _annotationFill);
-
-    // Border
-    canvas.drawRect(
-      rect,
-      Paint()
-        ..color = _annotationBorder
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.0,
-    );
+    _drawShape(
+        canvas, rect, annotation.shape, _annotationFill, _annotationBorder, 2,
+        start: annotation.arrowStart, end: annotation.arrowEnd);
 
     // Label
     if (annotation.text.isNotEmpty) {
@@ -76,28 +76,41 @@ class AnnotationPainter extends CustomPainter {
     }
   }
 
-  void _drawPendingRect(Canvas canvas, Rect rect) {
-    canvas.drawRect(rect, Paint()..color = _pendingFill);
-    canvas.drawRect(
-      rect,
-      Paint()
-        ..color = _pendingBorder
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.5,
-    );
-  }
-
-  void _drawEditingRect(Canvas canvas, Rect rect) {
-    canvas.drawRect(rect, Paint()..color = _annotationFill);
-
-    // Dashed-style border (solid with different color to indicate editing)
-    canvas.drawRect(
-      rect,
-      Paint()
-        ..color = _editingBorder
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.0,
-    );
+  void _drawShape(Canvas canvas, Rect rect, AnnotationShape shape, Color fill,
+      Color border, double width,
+      {Offset? start, Offset? end}) {
+    final paint = Paint()
+      ..color = border
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = width
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    switch (shape) {
+      case AnnotationShape.box:
+        canvas.drawRect(rect, Paint()..color = fill);
+        canvas.drawRect(rect, paint);
+      case AnnotationShape.circle:
+        canvas.drawOval(rect, Paint()..color = fill);
+        canvas.drawOval(rect, paint);
+      case AnnotationShape.arrow:
+        final tail = start ?? rect.topLeft;
+        final tip = end ?? rect.bottomRight;
+        final delta = tip - tail;
+        if (delta.distance == 0) return;
+        final direction = delta / delta.distance;
+        final normal = Offset(-direction.dy, direction.dx);
+        final headLength = math.min(14.0, delta.distance * 0.35);
+        final base = tip - direction * headLength;
+        final left = base + normal * headLength * 0.5;
+        final right = base - normal * headLength * 0.5;
+        canvas.drawLine(tail, tip, paint);
+        canvas.drawPath(
+            Path()
+              ..moveTo(left.dx, left.dy)
+              ..lineTo(tip.dx, tip.dy)
+              ..lineTo(right.dx, right.dy),
+            paint);
+    }
   }
 
   void _drawLabel(Canvas canvas, String text, Rect bounds) {
@@ -134,7 +147,8 @@ class AnnotationPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(AnnotationPainter oldDelegate) {
-    return oldDelegate.annotations != annotations ||
+    return oldDelegate.shape != shape ||
+        oldDelegate.annotations != annotations ||
         oldDelegate.dragStart != dragStart ||
         oldDelegate.dragCurrent != dragCurrent ||
         oldDelegate.pendingRect != pendingRect ||

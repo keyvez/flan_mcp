@@ -5,15 +5,16 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart' hide InspectorSelection;
 import 'package:flutter/scheduler.dart';
-import 'package:http/http.dart' as http;
 import 'package:flutter/services.dart';
 import 'package:flan_flutter/src/overlay/annotation_painter.dart';
 import 'package:flan_flutter/src/overlay/drawing_painter.dart';
 import 'package:flan_flutter/src/binding/flan_binding.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
 import 'package:flan_flutter/src/services/drawing_service.dart';
+import 'package:flan_flutter/src/services/minified_name_resolver.dart';
 import 'package:flan_flutter/src/services/inspector_service.dart';
 import 'package:flan_flutter/src/services/error_interceptor.dart';
+import 'package:flan_flutter/src/services/flan_server_client.dart';
 import 'package:flan_flutter/src/services/github_issue_service.dart';
 import 'package:flan_flutter/src/services/macro_recorder_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
@@ -382,6 +383,7 @@ class FlanOverlayWidget extends StatefulWidget {
     required this.screenshotService,
     required this.errorInterceptor,
     required this.macroRecorderService,
+    this.serverClient,
     required this.child,
   });
 
@@ -391,6 +393,7 @@ class FlanOverlayWidget extends StatefulWidget {
   final ScreenshotService screenshotService;
   final ErrorInterceptor errorInterceptor;
   final MacroRecorderService macroRecorderService;
+  final FlanServerClient? serverClient;
   final Widget child;
 
   @override
@@ -408,6 +411,17 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// when no error is showing.
   String? _flushErrorMessage;
   int _flushErrorGeneration = 0;
+  /// The badge's right-click menu.
+  bool _showBadgeMenu = false;
+  String? _reloadBannerMessage;
+  bool _reloadBannerOk = true;
+  /// Which of the two the banner is reporting. A restart said "Hot reload" in
+  /// its own title before this existed.
+  bool _reloadBannerRestart = false;
+  Timer? _reloadBannerTimer;
+  /// A second reload while one is in flight would be ignored by flutter_tools
+  /// anyway ("Ignoring signal: we are busy"), and two banners would race.
+  bool _hotReloadInFlight = false;
   List<Map<String, dynamic>> _queuedMessagesSnapshot = const [];
   int? _annotationDraftQueueId;
   String _lastQueuedAnnotationsSignature = '';
@@ -448,6 +462,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// reconciling widget.child (which contains the Navigator), avoiding
   /// "dirty widget in wrong build scope" assertions from go_router.
   late Widget _appContent;
+  late final FlanServerClient _serverClient;
 
 
   /// Monotonically increasing counter to detect stale async thumbnail
@@ -489,6 +504,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   @override
   void initState() {
     super.initState();
+    _serverClient = widget.serverClient ??
+        FlanServerClient(
+          serverUrl: const String.fromEnvironment('FLAN_SERVER_URL'),
+          appId: const String.fromEnvironment('FLAN_APP_ID'),
+        );
     _lastSeenConsumeGeneration =
         widget.userMessageService.agentConsumeGeneration;
     widget.inspectorService.addListener(_onServiceChanged);
@@ -566,6 +586,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
   @override
   void dispose() {
+    _reloadBannerTimer?.cancel();
     HardwareKeyboard.instance.removeHandler(_handleGlobalKey);
     widget.inspectorService.removeListener(_onServiceChanged);
     widget.annotationService.removeListener(_onAnnotationServiceChanged);
@@ -851,6 +872,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
     // Escape exits whichever mode is active (no modifiers needed).
     if (event.logicalKey == LogicalKeyboardKey.escape) {
+      if (_showBadgeMenu) {
+        _showBadgeMenu = false;
+        _safeSetState();
+        return true;
+      }
       if (_showErrorPanel) {
         _showErrorPanel = false;
         _safeSetState();
@@ -911,6 +937,15 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     // Ctrl+Shift+R — toggle recording mode.
     if (event.logicalKey == LogicalKeyboardKey.keyR) {
       _toggleRecording();
+      return true;
+    }
+
+    // Ctrl+Shift+L — hot reload; hold Alt as well for a hot restart. `R` would
+    // be the obvious letter and recording has it; `L` is for reLoad. Pointless
+    // in a deployed/markup build, where there is no `flutter run` to ask.
+    if (event.logicalKey == LogicalKeyboardKey.keyL &&
+        !FlanBinding.agentDisabled) {
+      unawaited(_hotReload(fullRestart: HardwareKeyboard.instance.isAltPressed));
       return true;
     }
 
@@ -1008,7 +1043,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       'data': data,
     });
 
-    unawaited(_flushToServer(clearOnChannelDelivery: true));
+    unawaited(_flushToServer(clearOnAcceptance: true));
     _lastGeneratedTest = null;
     _lastRecordedStepLabels = const [];
     _safeSetState();
@@ -1060,7 +1095,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       return;
     }
     _enqueueTextMessage(text, drawingBase64);
-    unawaited(_flushToServer(clearOnChannelDelivery: true));
+    unawaited(_flushToServer(clearOnAcceptance: true));
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _showTextMessageOverlay = false;
@@ -1143,30 +1178,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       data['annotations'] = annotations;
       parts.add('${annotations.length} annotation(s):');
       for (final a in annotations) {
-        final bounds = a['bounds'] as Map<String, dynamic>;
-        final widgetInfo = a['widget'] as Map<String, dynamic>?;
-        final annotationLine = StringBuffer(
-          '  - "${a['text']}" at '
-          '(${(bounds['x'] as num).round()}, '
-          '${(bounds['y'] as num).round()}) '
-          '${(bounds['width'] as num).round()}x'
-          '${(bounds['height'] as num).round()}',
-        );
-        if (widgetInfo != null) {
-          annotationLine.write(
-            '\n    Widget: ${widgetInfo['widgetType']}'
-            ' at ${widgetInfo['widgetPath']}',
-          );
-          if (widgetInfo['sourceLocation'] != null) {
-            annotationLine.write(
-              '\n    Source: ${widgetInfo['sourceLocation']}',
-            );
-          }
-          if (widgetInfo['text'] != null) {
-            annotationLine.write('\n    Text: "${widgetInfo['text']}"');
-          }
-        }
-        parts.add(annotationLine.toString());
+        parts.add(_formatAnnotationLine(a));
       }
     }
 
@@ -1186,11 +1198,27 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     // the new message (e.g. drafts from earlier annotation sessions).
     widget.userMessageService.promoteDrafts();
 
+    // Put real widget names on a release build before this leaves the app.
+    //
+    // MinifiedNameResolver was written for issue filing, on the reasoning that
+    // a widget name is read by a human exactly once, in the issue. An
+    // annotation sent to an agent is that same moment: it is the one thing
+    // naming what the user drew a box around, and `minified:Q0 > minified:alL`
+    // tells the agent nothing it can act on. Resolving here covers every
+    // builder feeding `parts`, including the synchronous ones that cannot
+    // await.
+    //
+    // Cheap by construction: `resolveIn` returns immediately when the text has
+    // no `minified:` in it — every debug and profile build — and the map is
+    // fetched at most once per session.
+    final resolvedText = await MinifiedNameResolver.resolveIn(parts.join('\n'));
+    final resolvedData = await _resolveMinifiedNames(data);
+
     // Enqueue immediately so the item appears in the queue without delay.
     widget.userMessageService.sendMessage({
       'type': 'user_feedback',
-      'text': parts.join('\n'),
-      'data': data,
+      'text': resolvedText,
+      'data': resolvedData,
     });
     final queueId = widget.userMessageService.lastQueueId;
     _isSendingToAgent = false;
@@ -1228,7 +1256,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// to the agent via flan server flush.
   Future<void> _sendToAgentAndFlush() async {
     await _sendToAgent();
-    unawaited(_flushToServer(clearOnChannelDelivery: true));
+    unawaited(_flushToServer(clearOnAcceptance: true));
   }
 
   /// Reports an intercepted error to wherever it can actually go: the Claude
@@ -1416,153 +1444,74 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     _safeSetState();
   }
 
-  Future<void> _flushToServer({
-    List<Map<String, dynamic>>? messages,
-    bool clearOnChannelDelivery = false,
-  }) async {
-    String? wsUri;
+  /// This isolate's VM service URI as a WebSocket URL, or null on web (where
+  /// there is no VM service in the page) and in release builds.
+  ///
+  /// It is how the relay recognises a native app: the one name such an app
+  /// always has, with or without `FLAN_APP_ID`.
+  Future<String?> _vmServiceWsUri() async {
     try {
       final info = await developer.Service.getInfo();
-      if (info.serverUri != null) {
-        var uri = info.serverUri
-            .toString()
-            .replaceFirst('http://', 'ws://');
-        if (uri.endsWith('/')) {
-          uri = '${uri}ws';
-        } else {
-          uri = '$uri/ws';
-        }
-        wsUri = uri;
-      }
+      if (info.serverUri == null) return null;
+      final uri = info.serverUri.toString().replaceFirst('http://', 'ws://');
+      return uri.endsWith('/') ? '${uri}ws' : '$uri/ws';
     } catch (e) {
       debugPrint('[flan] failed to get VM service URI: $e');
+      return null;
     }
+  }
 
-    // Use provided messages or peek from the queue.
+  /// The page's own origin on web, and null everywhere else.
+  ///
+  /// `Uri.base` throws off the web, and a web page has neither a pid nor a VM
+  /// service — so this is the only thing that places it for the relay.
+  String? _pageOrigin() {
+    try {
+      return Uri.base.origin;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _flushToServer({
+    List<Map<String, dynamic>>? messages,
+    bool clearOnAcceptance = false,
+  }) async {
+    final wsUri = await _vmServiceWsUri();
+
     final msgs = messages ?? widget.userMessageService.peekMessages();
-    debugPrint('[flan] flushing ${msgs.length} message(s), vm_service_uri=$wsUri');
+    debugPrint(
+      '[flan] flushing ${msgs.length} message(s), vm_service_uri=$wsUri',
+    );
 
     if (msgs.isEmpty) return;
 
-    // Fire-and-forget: ask TUI for the VM URI (it can resolve it even on
-    // web where dart:developer is unavailable), then forward messages + URI
-    // to the channel server.
-    unawaited(() async {
-      int channelPort = 4051; // default
-      // Whether the flan server resolved a *real* linked channel for this app.
-      // The server only returns a channel_port when it found a Claude Code
-      // surface with a registered channel — i.e. an actual receiver. Without it
-      // there is no link, and pushing to the default port would hit a stale or
-      // unrelated channel that returns 200 while delivering nowhere.
-      var hasLinkedChannel = false;
-      // If we don't have the URI yet, ask the TUI.
-      if (wsUri == null) {
-        // On web we can't read our own vm_service_uri, so identify ourselves by
-        // our origin (http://host:web-port). The server maps the port to the
-        // flutter app's --web-port. Without this the server can't tell which app
-        // is flushing and returns no channel ("no linked receiver").
-        String? origin;
-        try {
-          origin = Uri.base.hasPort ? Uri.base.origin : null;
-        } catch (_) {
-          origin = null;
-        }
-        try {
-          final tuiRes = await http.post(
-            Uri.parse('http://127.0.0.1:4050/api/flush'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode(<String, dynamic>{
-              if (origin != null) 'origin': origin,
-            }),
-          );
-          if (tuiRes.statusCode == 200) {
-            final tuiData = jsonDecode(tuiRes.body) as Map<String, dynamic>;
-            wsUri = tuiData['vm_service_uri'] as String?;
-            final port = tuiData['channel_port'] as int?;
-            if (port != null) {
-              channelPort = port;
-              hasLinkedChannel = true;
-            }
-          }
-        } catch (_) {}
-      } else {
-        // Still notify TUI for association tracking and get channel port.
-        try {
-          final tuiRes = await http.post(
-            Uri.parse('http://127.0.0.1:4050/api/flush'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode(<String, dynamic>{
-              'vm_service_uri': wsUri,
-            }),
-          );
-          if (tuiRes.statusCode == 200) {
-            final tuiData = jsonDecode(tuiRes.body) as Map<String, dynamic>;
-            final port = tuiData['channel_port'] as int?;
-            if (port != null) {
-              channelPort = port;
-              hasLinkedChannel = true;
-            }
-          }
-        } catch (_) {}
-      }
+    final origin = _pageOrigin();
 
-      debugPrint('[flan] resolved vm_service_uri=$wsUri '
-          'channelPort=$channelPort hasLinkedChannel=$hasLinkedChannel');
+    final result = await _serverClient.flush(
+      messages: msgs,
+      vmServiceUri: wsUri,
+      origin: origin,
+    );
+    debugPrint(
+      '[flan] relay response: accepted=${result.accepted} '
+      'delivered=${result.delivered} error=${result.error}',
+    );
 
-      // The flan channel is the only delivery path: fast, predictable, and
-      // reliable. We deliberately do NOT fall back to the legacy process_queue
-      // nudge. If no linked channel was resolved, there is no receiver — keep
-      // the message queued so it isn't lost and tell the user.
-      if (!hasLinkedChannel) {
-        debugPrint('[flan] flush undelivered: no linked receiver');
-        _showNoReceiverError();
-        return;
-      }
+    if (!result.accepted) {
+      _showNoReceiverError(reason: result.error);
+      return;
+    }
 
-      var channelOk = false;
-      try {
-        final channelBody = jsonEncode(<String, dynamic>{
-          if (wsUri != null) 'vm_service_uri': wsUri,
-          'messages': msgs,
-        });
-        final res = await http.post(
-          Uri.parse('http://127.0.0.1:$channelPort/flush'),
-          headers: {'Content-Type': 'application/json'},
-          body: channelBody,
-        );
-        debugPrint('[flan] channel response: ${res.statusCode} ${res.body}');
-        // The channel reports {"ok": true} only when it actually pushed the
-        // message to its Claude session; "no messages" or errors come back
-        // ok:false. Treat anything else as undelivered.
-        if (res.statusCode == 200) {
-          try {
-            final body = jsonDecode(res.body) as Map<String, dynamic>;
-            channelOk = body['ok'] == true;
-          } catch (_) {
-            channelOk = false;
-          }
-        }
-      } catch (e) {
-        debugPrint('[flan] channel not available: $e');
-      }
-
-
-      if (channelOk) {
-        widget.userMessageService.suppressVmEvents = true;
-        if (clearOnChannelDelivery) {
-          // Channel delivered the messages — consume them from the app queue
-          // (not just clear) so agentConsumeGeneration increments and the
-          // overlay clears annotations as it would on a process_queue call.
-          widget.userMessageService.consumeMessages();
-        }
-      } else {
-        // We had a linked channel but the push failed, so the message reached
-        // no live receiver. Keep it queued (do not consume) so it isn't lost
-        // and tell the user why via a dialog. No process_queue fallback.
-        debugPrint('[flan] flush undelivered: linked channel push failed');
-        _showNoReceiverError();
-      }
-    }());
+    widget.userMessageService.suppressVmEvents = true;
+    if (clearOnAcceptance) {
+      // The relay now owns the batch. A connected agent means genuine active
+      // work; an accepted-but-not-yet-delivered batch must not start the long
+      // working timeout that previously made the overlay appear stuck.
+      widget.userMessageService.consumeMessages(
+        markAgentWorking: result.delivered,
+      );
+    }
   }
 
   /// Shows an in-overlay error banner explaining that the message couldn't be
@@ -1589,6 +1538,89 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       _flushErrorMessage = null;
       _safeSetState();
     });
+  }
+
+  /// Asks the relay to hot reload the `flutter run` behind this app.
+  ///
+  /// Nothing in this process can do it — there is no compiler here. The relay
+  /// is beside the tool that has one.
+  Future<void> _hotReload({bool fullRestart = false}) async {
+    // Logged on the way in, not just on the way out: when a shortcut appears to
+    // do nothing, the question is whether the key reached us at all.
+    debugPrint('[flan] hot ${fullRestart ? 'restart' : 'reload'} requested');
+    if (_hotReloadInFlight) return;
+    _hotReloadInFlight = true;
+    _showReloadBanner(
+      fullRestart ? 'Hot restarting…' : 'Hot reloading…',
+      ok: true,
+      sticky: true,
+      fullRestart: fullRestart,
+    );
+
+    final result = await _serverClient.hotReload(
+      fullRestart: fullRestart,
+      vmServiceUri: await _vmServiceWsUri(),
+      origin: _pageOrigin(),
+    );
+    _hotReloadInFlight = false;
+    if (!mounted) return;
+
+    // A signalled reload is fire-and-forget: flutter_tools answers nobody, so
+    // say "requested" rather than claiming the code is live. On web it may also
+    // have recompiled with no debug client attached, in which case the page
+    // needs a refresh — the relay's own wording covers it.
+    _showReloadBanner(result.detail, ok: result.ok, fullRestart: fullRestart);
+    debugPrint(
+      '[flan] hot reload: ok=${result.ok} via=${result.via} '
+      '${result.detail}',
+    );
+  }
+
+  void _toggleBadgeMenu() {
+    // Everything in the menu asks the relay to act on this app's `flutter run`.
+    // A deployed/markup build has none, so there is nothing to open.
+    if (FlanBinding.agentDisabled) return;
+    _showBadgeMenu = !_showBadgeMenu;
+    if (_showBadgeMenu) {
+      // One panel under the badge at a time, or they draw on top of each other.
+      _showErrorPanel = false;
+      _showQueuedMessagesPanel = false;
+      _queuedMessagesSnapshot = const [];
+    }
+    _safeSetState();
+  }
+
+  void _showReloadBanner(
+    String message, {
+    required bool ok,
+    required bool fullRestart,
+    bool sticky = false,
+  }) {
+    if (!mounted) return;
+    _reloadBannerMessage = message;
+    _reloadBannerOk = ok;
+    _reloadBannerRestart = fullRestart;
+    // A real Timer rather than a Future.delayed, because this one has to be
+    // cancellable: a pending timer that outlives the widget fires into a
+    // disposed state — and in a test suite, into whichever test is running by
+    // then.
+    _reloadBannerTimer?.cancel();
+    _reloadBannerTimer = null;
+    _safeSetState();
+    if (sticky) return;
+    _reloadBannerTimer = Timer(const Duration(seconds: 6), () {
+      _reloadBannerTimer = null;
+      if (!mounted) return;
+      _reloadBannerMessage = null;
+      _safeSetState();
+    });
+  }
+
+  void _dismissReloadBanner() {
+    _reloadBannerTimer?.cancel();
+    _reloadBannerTimer = null;
+    _reloadBannerMessage = null;
+    _safeSetState();
   }
 
   void _dismissFlushError() {
@@ -1803,7 +1835,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   service: widget.inspectorService,
                   userMessageService: widget.userMessageService,
                   screenshotService: widget.screenshotService,
-                  onMessageSent: () => unawaited(_flushToServer(clearOnChannelDelivery: true)),
+                  onMessageSent: () =>
+                      unawaited(_flushToServer(clearOnAcceptance: true)),
                 ),
               ),
             ),
@@ -1827,7 +1860,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                     _sendToAgentAndFlush();
                   },
                   onFlushRequested: () {
-                    unawaited(_flushToServer(clearOnChannelDelivery: true));
+                    unawaited(_flushToServer(clearOnAcceptance: true));
                   },
                 ),
               ),
@@ -1853,17 +1886,53 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   child: Padding(
                     padding:
                         const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
+                    child: Wrap(
+                      alignment: WrapAlignment.center,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      runSpacing: 4,
                       children: [
                         const Text(
-                          'Annotation mode ON  •  Drag to draw, Enter to save',
+                          'Annotation mode ON • Drag to draw, Enter to save',
                           style: TextStyle(
                             color: Color(0xFFFFC8A0),
                             fontSize: 12,
                             fontWeight: FontWeight.w600,
                           ),
                         ),
+                        const SizedBox(width: 8),
+                        for (final shape in AnnotationShape.values)
+                          Semantics(
+                            button: true,
+                            selected: widget.annotationService.shape == shape,
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onTap: () =>
+                                  widget.annotationService.selectShape(shape),
+                              child: Container(
+                                key: ValueKey('annotation-tool-${shape.name}'),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 8, vertical: 6),
+                                decoration: BoxDecoration(
+                                  color: widget.annotationService.shape == shape
+                                      ? const Color(0x66FF6600)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Text(
+                                  switch (shape) {
+                                    AnnotationShape.box => 'Box',
+                                    AnnotationShape.arrow => 'Arrow',
+                                    AnnotationShape.circle => 'Circle',
+                                  },
+                                  style: const TextStyle(
+                                    color: Color(0xFFFFC8A0),
+                                    fontSize: 12,
+                                    decoration: TextDecoration.none,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
                         const SizedBox(width: 10),
                         GestureDetector(
                           behavior: HitTestBehavior.opaque,
@@ -2031,8 +2100,25 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
             right: badgeRight,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
+              // Right-click the badge for the actions that aren't about the
+              // queue.
+              //
+              // On DOWN, not on tap. In a browser the `contextmenu` event fires
+              // at mouse-down and the browser's menu swallows the mouse-up, so
+              // a secondary TAP never completes and the first right-click did
+              // nothing — you had to click twice. The browser's own menu is
+              // enabled by default and only an app-wide
+              // `BrowserContextMenu.disableContextMenu()` suppresses it, which
+              // would take the developer's own "Inspect element" with it; so
+              // both menus appear, and dismissing the browser's leaves ours up.
+              onSecondaryTapDown: (_) => _toggleBadgeMenu(),
               onTap: () {
                 _showErrorPanel = false;
+                if (_showBadgeMenu) {
+                  _showBadgeMenu = false;
+                  _safeSetState();
+                  return;
+                }
                 if (_showQueuedMessagesPanel) {
                   _showQueuedMessagesPanel = false;
                   _queuedMessagesSnapshot = const [];
@@ -2105,6 +2191,22 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               ),
             ),
           ),
+          if (_showBadgeMenu)
+            Positioned(
+              top: badgeTop + 40,
+              right: badgeRight,
+              child: _BadgeMenu(
+                busy: _hotReloadInFlight,
+                onHotReload: () {
+                  _showBadgeMenu = false;
+                  unawaited(_hotReload());
+                },
+                onHotRestart: () {
+                  _showBadgeMenu = false;
+                  unawaited(_hotReload(fullRestart: true));
+                },
+              ),
+            ),
           if (_showQueuedMessagesPanel && _queuedMessagesSnapshot.isNotEmpty)
             Positioned(
               top: badgeTop + 40,
@@ -2129,7 +2231,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   if (widget.annotationService.enabled) {
                     widget.annotationService.disable();
                   }
-                  unawaited(_flushToServer(clearOnChannelDelivery: true));
+                  unawaited(_flushToServer(clearOnAcceptance: true));
                   _showQueuedMessagesPanel = false;
                   _queuedMessagesSnapshot = const [];
                   _annotationDraftQueueId = null;
@@ -2158,6 +2260,19 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               child: _FlushErrorBanner(
                 message: _flushErrorMessage!,
                 onDismiss: _dismissFlushError,
+              ),
+            ),
+          // Reload status, in the same place and for the same reason: it is the
+          // answer to an action taken at the badge.
+          if (_reloadBannerMessage != null && _flushErrorMessage == null)
+            Positioned(
+              top: badgeTop + 40,
+              right: badgeRight,
+              child: _HotReloadBanner(
+                message: _reloadBannerMessage!,
+                ok: _reloadBannerOk,
+                fullRestart: _reloadBannerRestart,
+                onDismiss: _dismissReloadBanner,
               ),
             ),
         ],
@@ -2259,10 +2374,43 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     return parts.join('\n');
   }
 
+  /// The structured half of the payload, with `minified:*` resolved.
+  ///
+  /// The agent reads `data` as well as `text` — `widgetType` and `widgetPath`
+  /// live in there — so resolving only the prose would leave the machine-
+  /// readable copy opaque.
+  ///
+  /// Done over the encoded JSON because the names are nested at several
+  /// depths and a minified token (`[A-Za-z0-9_$]+`) can never contain a quote
+  /// or a brace, so the structure cannot be disturbed. Anything that fails to
+  /// round-trip — a value that is not JSON-encodable — returns the original
+  /// map: this is a debugging aid, and one that dropped a user's annotation
+  /// would be worse than one that left it minified.
+  static Future<Map<String, dynamic>> _resolveMinifiedNames(
+    Map<String, dynamic> data,
+  ) async {
+    try {
+      final encoded = jsonEncode(data);
+      final resolved = await MinifiedNameResolver.resolveIn(encoded);
+      if (identical(resolved, encoded)) return data;
+      final decoded = jsonDecode(resolved);
+      return decoded is Map<String, dynamic> ? decoded : data;
+    } catch (_) {
+      return data;
+    }
+  }
+
   static String _formatAnnotationLine(Map<String, dynamic> annotation) {
     final bounds = _rectFromBoundsValue(annotation['bounds']);
     final text = annotation['text']?.toString() ?? '(no label)';
     final buffer = StringBuffer('  - "$text"');
+    final shape = annotation['shape'];
+    if (shape != null && shape != 'box') {
+      buffer.write(' [$shape]');
+      if (shape == 'arrow') {
+        buffer.write(' from ${annotation['start']} to ${annotation['end']}');
+      }
+    }
     if (bounds != null) {
       buffer.write(
         ' at (${bounds.left.round()}, ${bounds.top.round()}) '
@@ -2588,7 +2736,7 @@ class _InspectorOverlayState extends State<_InspectorOverlay> {
   }
 }
 
-/// Annotation overlay: allows drawing rectangles and typing labels.
+/// Annotation overlay: allows drawing shapes and typing labels.
 class _AnnotationOverlay extends StatefulWidget {
   const _AnnotationOverlay({
     required this.service,
@@ -2736,6 +2884,7 @@ class _AnnotationOverlayState extends State<_AnnotationOverlay> {
             child: CustomPaint(
               painter: AnnotationPainter(
                 annotations: widget.service.annotations,
+                shape: widget.service.shape,
                 dragStart: widget.service.dragStart,
                 dragCurrent: widget.service.dragCurrent,
                 pendingRect: widget.service.pendingRect,
@@ -3608,6 +3757,20 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
                       keyCaps: [scrollKey], label: 'Cycle widgets')),
             ],
           ),
+          // Hot reload asks the relay to signal this app's `flutter run`; a
+          // deployed build has none, so the hint goes with the agent hints.
+          if (!FlanBinding.agentDisabled) ...[
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                    child: _ShortcutRow(
+                        keyCaps: [ctrlKey, shiftKey, const _KeyCapText('L')],
+                        label: 'Hot reload')),
+                const Expanded(child: SizedBox()),
+              ],
+            ),
+          ],
         ],
       ),
     );
@@ -5194,6 +5357,243 @@ class _FlushErrorBanner extends StatelessWidget {
                 message,
                 style: const TextStyle(
                   color: Color(0xFFE0C8C8),
+                  fontSize: 12,
+                  height: 1.35,
+                  decoration: TextDecoration.none,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The badge's right-click menu: the actions that are about the app rather
+/// than about the queue.
+///
+/// Right-click rather than another floating dot — the overlay already has two,
+/// and a reload is wanted often but not constantly.
+class _BadgeMenu extends StatelessWidget {
+  const _BadgeMenu({
+    required this.busy,
+    required this.onHotReload,
+    required this.onHotRestart,
+  });
+
+  /// A reload or restart is already in flight. flutter_tools ignores a second
+  /// request while it is busy, so both items grey out — the banner is already
+  /// saying which one is running, and a label that guessed got it wrong.
+  final bool busy;
+  final VoidCallback onHotReload;
+  final VoidCallback onHotRestart;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      type: MaterialType.transparency,
+      child: Container(
+        width: 220,
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xF00D0D1A),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: const Color(0xFF333344), width: 1),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x60000000),
+              blurRadius: 16,
+              offset: Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _BadgeMenuItem(
+              icon: Icons.bolt,
+              label: 'Hot reload',
+              shortcut: 'Ctrl ⇧ L',
+              enabled: !busy,
+              onTap: onHotReload,
+            ),
+            _BadgeMenuItem(
+              icon: Icons.restart_alt,
+              label: 'Hot restart',
+              shortcut: 'Ctrl ⇧ ⌥ L',
+              enabled: !busy,
+              onTap: onHotRestart,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _BadgeMenuItem extends StatelessWidget {
+  const _BadgeMenuItem({
+    required this.icon,
+    required this.label,
+    required this.shortcut,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final String shortcut;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final color =
+        enabled ? const Color(0xFFE0E0E8) : const Color(0xFF666677);
+    return Semantics(
+      button: true,
+      enabled: enabled,
+      label: label,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: enabled ? onTap : null,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            children: [
+              Icon(
+                icon,
+                size: 16,
+                color: enabled
+                    ? const Color(0xFF66CCFF)
+                    : const Color(0xFF445566),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    color: color,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    decoration: TextDecoration.none,
+                  ),
+                ),
+              ),
+              Text(
+                shortcut,
+                style: const TextStyle(
+                  color: Color(0xFF888899),
+                  fontSize: 11,
+                  decoration: TextDecoration.none,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Outcome of a hot reload asked for from inside the app.
+///
+/// Deliberately the same size and position as [_FlushErrorBanner]: both answer
+/// an action taken at the badge, and only one is ever on screen.
+class _HotReloadBanner extends StatelessWidget {
+  const _HotReloadBanner({
+    required this.message,
+    required this.ok,
+    required this.fullRestart,
+    required this.onDismiss,
+  });
+
+  final String message;
+  final bool ok;
+
+  /// Titles and icon follow the action actually taken. The relay's own wording
+  /// in [message] already names it, and a title that disagreed with it read as
+  /// the restart having silently done a reload.
+  final bool fullRestart;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = ok ? const Color(0xFF00AAFF) : const Color(0xFFD32F2F);
+    final action = fullRestart ? 'Hot restart' : 'Hot reload';
+    return Material(
+      type: MaterialType.transparency,
+      child: Container(
+        width: 320,
+        padding: const EdgeInsets.fromLTRB(12, 10, 8, 12),
+        decoration: BoxDecoration(
+          color: ok ? const Color(0xF00D1A2A) : const Color(0xF02A1010),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: accent, width: 1),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x60000000),
+              blurRadius: 16,
+              offset: Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(top: 1),
+                  child: Icon(
+                    ok
+                        ? (fullRestart ? Icons.restart_alt : Icons.bolt)
+                        : Icons.error_outline,
+                    size: 16,
+                    color: ok ? const Color(0xFF66CCFF) : const Color(0xFFFF6060),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    ok ? action : '$action failed',
+                    style: TextStyle(
+                      color: ok
+                          ? const Color(0xFF99DDFF)
+                          : const Color(0xFFFF8080),
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      decoration: TextDecoration.none,
+                    ),
+                  ),
+                ),
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: onDismiss,
+                  child: const Padding(
+                    padding: EdgeInsets.all(2),
+                    child: Icon(
+                      Icons.close,
+                      size: 16,
+                      color: Color(0xFFAAAAAA),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Padding(
+              padding: const EdgeInsets.only(left: 24, right: 4),
+              child: Text(
+                message,
+                style: TextStyle(
+                  color: ok
+                      ? const Color(0xFFC8DCE0)
+                      : const Color(0xFFE0C8C8),
                   fontSize: 12,
                   height: 1.35,
                   decoration: TextDecoration.none,

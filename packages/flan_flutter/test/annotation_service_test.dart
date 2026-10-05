@@ -10,6 +10,64 @@ void main() {
     service = AnnotationService();
   });
 
+  group('annotation shapes', () {
+    for (final end in [
+      const Offset(20, 100),
+      const Offset(100, 20),
+      const Offset(20, 20),
+      const Offset(180, 20),
+    ]) {
+      test('arrow preserves direction to $end and can be selected', () {
+        service.enable();
+        service.selectShape(AnnotationShape.arrow);
+        const start = Offset(100, 100);
+        service.startDrawing(start);
+        service.updateDrawing(end);
+        service.finishDrawing();
+        expect(service.drawState, AnnotationDrawState.editing);
+        service.submitAnnotationText('target');
+        final arrow = service.annotations.single;
+        expect(arrow.shape, AnnotationShape.arrow);
+        expect(arrow.toJson()['start'], {'x': 100.0, 'y': 100.0});
+        expect(arrow.toJson()['end'], {'x': end.dx, 'y': end.dy});
+        expect(service.startDrawing((start + end) / 2), isTrue);
+        service.submitEditedAnnotationText('updated');
+        expect(service.annotations.single.end, end);
+      });
+    }
+
+    test('circle uses drag bounds and excludes bounding box corners', () {
+      service.enable();
+      service.selectShape(AnnotationShape.circle);
+      service.startDrawing(const Offset(100, 80));
+      service.updateDrawing(const Offset(20, 20));
+      service.finishDrawing();
+      service.submitAnnotationText('circle');
+      final circle = service.annotations.single;
+      expect(circle.toJson()['shape'], 'circle');
+      expect(circle.bounds, const Rect.fromLTRB(20, 20, 100, 80));
+      expect(circle.contains(const Offset(21, 21)), isFalse);
+      expect(service.startDrawing(circle.bounds.center), isTrue);
+    });
+
+    test('short arrow is discarded and tool switch cancels pending drawing',
+        () {
+      service.enable();
+      service.selectShape(AnnotationShape.arrow);
+      service.startDrawing(const Offset(100, 100));
+      service.updateDrawing(const Offset(105, 100));
+      service.finishDrawing();
+      expect(service.drawState, AnnotationDrawState.normal);
+      service.startDrawing(const Offset(100, 100));
+      service.updateDrawing(const Offset(200, 100));
+      service.finishDrawing();
+      service.selectShape(AnnotationShape.box);
+      expect(service.drawState, AnnotationDrawState.normal);
+      expect(service.pendingRect, isNull);
+      expect(service.annotations, isEmpty);
+    });
+  });
+
   group('initial state', () {
     test('starts disabled with normal draw state', () {
       expect(service.enabled, isFalse);

@@ -15,6 +15,21 @@ void main() {
       expect(config.shouldStopTraversal, isNull);
       expect(config.extractText, isNull);
     });
+
+    test('relay configuration is environment-neutral by default', () {
+      const config = FlanConfiguration();
+      expect(config.serverUrl, isEmpty);
+      expect(config.appId, isEmpty);
+    });
+
+    test('accepts a host-provided relay and app identity', () {
+      const config = FlanConfiguration(
+        serverUrl: 'https://flan.example.test',
+        appId: 'worktree-003',
+      );
+      expect(config.serverUrl, 'https://flan.example.test');
+      expect(config.appId, 'worktree-003');
+    });
   });
 
   group('isInteractiveWidgetType', () {

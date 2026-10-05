@@ -3,10 +3,12 @@ import 'dart:convert';
 import 'package:flan_flutter/src/overlay/flan_overlay_widget.dart';
 import 'package:flan_flutter/src/services/annotation_service.dart';
 import 'package:flan_flutter/src/services/error_interceptor.dart';
+import 'package:flan_flutter/src/services/flan_server_client.dart';
 import 'package:flan_flutter/src/services/inspector_service.dart';
 import 'package:flan_flutter/src/services/macro_recorder_service.dart';
 import 'package:flan_flutter/src/services/screenshot_service.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -21,6 +23,7 @@ Widget _buildTestApp({
   required ScreenshotService screenshotService,
   required ErrorInterceptor errorInterceptor,
   MacroRecorderService? macroRecorderService,
+  FlanServerClient? serverClient,
   Widget? child,
   bool useMaterialApp = false,
 }) {
@@ -32,6 +35,7 @@ Widget _buildTestApp({
       screenshotService: screenshotService,
       errorInterceptor: errorInterceptor,
       macroRecorderService: macroRecorderService ?? MacroRecorderService(),
+      serverClient: serverClient,
       child: child ?? const ColoredBox(color: Colors.black),
     ),
   );
@@ -86,18 +90,27 @@ http.Client _noOpHttpClient() => http_testing.MockClient(
 void _createServices() {
   inspectorService = InspectorService();
   annotationService = AnnotationService();
-  userMessageService = UserMessageService(httpClient: _noOpHttpClient());
+  userMessageService = UserMessageService(
+    httpClient: _noOpHttpClient(),
+    serverUrl: 'http://relay.test',
+  );
   screenshotService =
       ScreenshotService(maxScreenshotSize: const Size(1024, 1024));
   errorInterceptor = ErrorInterceptor();
 }
 
-Widget _app({Widget? child, bool useMaterialApp = false}) => _buildTestApp(
+Widget _app({
+  Widget? child,
+  bool useMaterialApp = false,
+  FlanServerClient? serverClient,
+}) =>
+    _buildTestApp(
       inspectorService: inspectorService,
       annotationService: annotationService,
       userMessageService: userMessageService,
       screenshotService: screenshotService,
       errorInterceptor: errorInterceptor,
+      serverClient: serverClient,
       child: child,
       useMaterialApp: useMaterialApp,
     );
@@ -120,6 +133,91 @@ void main() {
   });
 
   group('Queue badge', () {
+    testWidgets('right-clicking the badge offers a hot reload', (tester) async {
+      late http.Request captured;
+      final relay = FlanServerClient(
+        serverUrl: 'http://relay.test',
+        appId: 'app-under-test',
+        httpClient: http_testing.MockClient((request) async {
+          captured = request;
+          return http.Response.bytes(
+            utf8.encode(jsonEncode({
+              'ok': true,
+              'via': 'signal',
+              'detail': 'Hot reload requested — SIGUSR1 → pid 7',
+            })),
+            200,
+            headers: const {'content-type': 'application/json'},
+          );
+        }),
+      );
+
+      await tester.pumpWidget(_app(serverClient: relay));
+      await tester.pumpAndSettle();
+
+      // Left click is the queue; the app actions are behind right click.
+      expect(find.text('Hot reload'), findsNothing);
+      await tester.tap(find.text('Q'), buttons: kSecondaryButton);
+      await tester.pumpAndSettle();
+      expect(find.text('Hot reload'), findsOneWidget);
+      expect(find.text('Hot restart'), findsOneWidget);
+
+      await _runAsyncAndSettle(tester, () async {
+        await tester.tap(find.text('Hot reload'));
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+
+      expect(captured.url.path, '/api/hot-reload');
+      final body = jsonDecode(captured.body) as Map<String, dynamic>;
+      expect(body['app_id'], 'app-under-test');
+      expect(body['full_restart'], isFalse);
+      // The relay's own words, shown verbatim — including what it did NOT
+      // claim: a signalled reload was requested, not verified.
+      expect(find.textContaining('SIGUSR1'), findsOneWidget);
+      expect(find.text('Hot restart'), findsNothing);
+    });
+
+    testWidgets('a hot restart is reported as a restart, not a reload',
+        (tester) async {
+      late http.Request captured;
+      final relay = FlanServerClient(
+        serverUrl: 'http://relay.test',
+        appId: 'app-under-test',
+        httpClient: http_testing.MockClient((request) async {
+          captured = request;
+          return http.Response.bytes(
+            utf8.encode(jsonEncode({
+              'ok': true,
+              'via': 'signal',
+              'detail': 'Hot restart requested — SIGUSR2 → pid 7',
+            })),
+            200,
+            headers: const {'content-type': 'application/json'},
+          );
+        }),
+      );
+
+      await tester.pumpWidget(_app(serverClient: relay));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Q'), buttons: kSecondaryButton);
+      await tester.pumpAndSettle();
+
+      await _runAsyncAndSettle(tester, () async {
+        await tester.tap(find.text('Hot restart'));
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+
+      expect(
+        (jsonDecode(captured.body) as Map<String, dynamic>)['full_restart'],
+        isTrue,
+      );
+      // The banner's own title, not just the relay's sentence: a restart
+      // headed "Hot reload" reads as the restart having quietly not happened.
+      expect(find.text('Hot restart'), findsOneWidget);
+      expect(find.text('Hot reload'), findsNothing);
+      expect(find.textContaining('SIGUSR2'), findsOneWidget);
+    });
+
     testWidgets('shows Q badge', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
@@ -5513,7 +5611,10 @@ void main() {
           200,
         ),
       );
-      userMessageService = UserMessageService(httpClient: client);
+      userMessageService = UserMessageService(
+        httpClient: client,
+        serverUrl: 'http://relay.test',
+      );
 
       // Manually trigger a poll to set hasServerAssociation
       await tester.runAsync(() => userMessageService.pollServerStatus());
@@ -5546,7 +5647,10 @@ void main() {
           200,
         ),
       );
-      userMessageService = UserMessageService(httpClient: client);
+      userMessageService = UserMessageService(
+        httpClient: client,
+        serverUrl: 'http://relay.test',
+      );
       userMessageService.setHostConnectionState(
         connected: true,
         pushCapable: true,

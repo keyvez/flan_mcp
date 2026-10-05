@@ -164,14 +164,17 @@ final class VmServiceContext {
   /// Best-effort: if the flan_server is not running, this is a silent no-op.
   /// Returns the number of web messages added.
   Future<int> _drainWebQueue({required String origin}) async {
-    final port =
-        int.tryParse(Platform.environment['FLAN_SERVER_PORT'] ?? '') ?? 4050;
+    final configuredServerUrl = Platform.environment['FLAN_SERVER_URL'];
+    if (configuredServerUrl == null || configuredServerUrl.isEmpty) return 0;
+    final base = configuredServerUrl.endsWith('/')
+        ? configuredServerUrl
+        : '$configuredServerUrl/';
     HttpClient? client;
     try {
       client = HttpClient()
         ..connectionTimeout = const Duration(seconds: 2);
       final request = await client.postUrl(
-        Uri.parse('http://127.0.0.1:$port/api/web-messages/consume'),
+        Uri.parse(base).resolve('api/web-messages/consume'),
       );
       final response = await request.close().timeout(
         const Duration(seconds: 3),
@@ -1145,7 +1148,7 @@ final class VmServiceContext {
         'enable_annotations',
         description:
             'Enables annotation/markup drawing mode in the Flutter app. '
-            'When active, drag to draw a rectangle and type a label. '
+            'When active, choose Box, Arrow, or Circle, then drag to draw and type a label. '
             'Annotations are stored and can be retrieved with get_annotations. '
             'Inspector and annotation modes are mutually exclusive. '
             'Requires an active connection established via connect.',

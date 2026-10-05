@@ -6,14 +6,26 @@ import 'package:flutter/foundation.dart';
 /// Event kind sent when annotations change.
 const String kAnnotationChangedEventKind = 'flan.annotationChanged';
 
+/// Shapes available in annotation mode.
+enum AnnotationShape { box, arrow, circle }
+
 /// A single annotation with bounds, text, and metadata.
 class Annotation {
   Annotation({
     required this.id,
     required this.bounds,
     required this.text,
+    this.shape = AnnotationShape.box,
+    this.start,
+    this.end,
     DateTime? timestamp,
   }) : timestamp = timestamp ?? DateTime.now();
+
+  final AnnotationShape shape;
+
+  /// Ordered endpoints for arrows; bounds alone cannot preserve direction.
+  final Offset? start;
+  final Offset? end;
 
   final String id;
   final Rect bounds;
@@ -25,10 +37,42 @@ class Annotation {
         bounds: bounds ?? this.bounds,
         text: text ?? this.text,
         timestamp: timestamp,
+        shape: shape,
+        start: start,
+        end: end,
       );
+
+  Offset get arrowStart => start ?? bounds.topLeft;
+  Offset get arrowEnd => end ?? bounds.bottomRight;
+
+  bool contains(Offset position) {
+    switch (shape) {
+      case AnnotationShape.box:
+        return bounds.contains(position);
+      case AnnotationShape.circle:
+        if (bounds.isEmpty) return false;
+        final dx = (position.dx - bounds.center.dx) / (bounds.width / 2);
+        final dy = (position.dy - bounds.center.dy) / (bounds.height / 2);
+        return dx * dx + dy * dy <= 1;
+      case AnnotationShape.arrow:
+        final delta = arrowEnd - arrowStart;
+        final lengthSquared = delta.distanceSquared;
+        if (lengthSquared == 0) return (position - arrowStart).distance <= 10;
+        final relative = position - arrowStart;
+        final t =
+            ((relative.dx * delta.dx + relative.dy * delta.dy) / lengthSquared)
+                .clamp(0.0, 1.0);
+        return (position - (arrowStart + delta * t)).distance <= 10;
+    }
+  }
 
   Map<String, dynamic> toJson() => {
         'id': id,
+        'shape': shape.name,
+        if (shape == AnnotationShape.arrow) ...{
+          'start': {'x': arrowStart.dx, 'y': arrowStart.dy},
+          'end': {'x': arrowEnd.dx, 'y': arrowEnd.dy},
+        },
         'bounds': {
           'x': bounds.left,
           'y': bounds.top,
@@ -45,10 +89,10 @@ enum AnnotationDrawState {
   /// No drawing in progress, user can start a new annotation.
   normal,
 
-  /// User is dragging to draw a rectangle.
+  /// User is dragging to draw a shape.
   drawing,
 
-  /// Rectangle is drawn, text field is visible for labeling.
+  /// Shape is drawn, text field is visible for labeling.
   editing,
 
   /// An existing annotation is selected for editing its text.
@@ -62,6 +106,16 @@ const double _kMinAnnotationSize = 20.0;
 /// programmatic annotation creation.
 class AnnotationService extends ChangeNotifier {
   bool _enabled = false;
+  AnnotationShape _shape = AnnotationShape.box;
+
+  AnnotationShape get shape => _shape;
+
+  void selectShape(AnnotationShape shape) {
+    if (_shape == shape) return;
+    _shape = shape;
+    cancelEditing();
+  }
+
   AnnotationDrawState _drawState = AnnotationDrawState.normal;
   final List<Annotation> _annotations = [];
   int _nextId = 1;
@@ -102,7 +156,7 @@ class AnnotationService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Called when the user starts dragging to draw a rectangle.
+  /// Called when the user starts dragging to draw a shape.
   /// Returns true if an existing annotation was tapped for editing.
   bool startDrawing(Offset position) {
     if (!_enabled) return false;
@@ -111,7 +165,7 @@ class AnnotationService extends ChangeNotifier {
 
     // Check if the tap is on an existing annotation (last drawn = top)
     for (var i = _annotations.length - 1; i >= 0; i--) {
-      if (_annotations[i].bounds.contains(position)) {
+      if (_annotations[i].contains(position)) {
         _editingIndex = i;
         _drawState = AnnotationDrawState.editingExisting;
         notifyListeners();
@@ -126,14 +180,14 @@ class AnnotationService extends ChangeNotifier {
     return false;
   }
 
-  /// Called as the user drags to update the rectangle.
+  /// Called as the user drags to update the shape.
   void updateDrawing(Offset position) {
     if (_drawState != AnnotationDrawState.drawing) return;
     _dragCurrent = position;
     notifyListeners();
   }
 
-  /// Called when the user finishes dragging. If the rectangle is large
+  /// Called when the user finishes dragging. If the shape is large
   /// enough, transitions to the editing state for text input.
   void finishDrawing() {
     // Don't interfere with text editing (new or existing annotation).
@@ -148,7 +202,10 @@ class AnnotationService extends ChangeNotifier {
     }
 
     final rect = Rect.fromPoints(_dragStart!, _dragCurrent!);
-    if (rect.width < _kMinAnnotationSize || rect.height < _kMinAnnotationSize) {
+    if (_shape == AnnotationShape.arrow
+        ? (_dragCurrent! - _dragStart!).distance < _kMinAnnotationSize
+        : rect.width < _kMinAnnotationSize ||
+            rect.height < _kMinAnnotationSize) {
       _resetDrawing();
       return;
     }
@@ -158,7 +215,7 @@ class AnnotationService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Submits the annotation text for the pending rectangle.
+  /// Submits the annotation text for the pending shape.
   void submitAnnotationText(String text) {
     if (_drawState != AnnotationDrawState.editing || _pendingRect == null) {
       return;
@@ -167,6 +224,9 @@ class AnnotationService extends ChangeNotifier {
     final annotation = Annotation(
       id: '${_nextId++}',
       bounds: _pendingRect!,
+      shape: _shape,
+      start: _shape == AnnotationShape.arrow ? _dragStart : null,
+      end: _shape == AnnotationShape.arrow ? _dragCurrent : null,
       text: text.isEmpty ? '(no label)' : text,
     );
     _annotations.add(annotation);

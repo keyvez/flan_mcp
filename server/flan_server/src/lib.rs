@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io::{BufRead, BufReader, Read, Write as IoWrite},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write as IoWrite},
     net::TcpStream,
     path::PathBuf,
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU16, AtomicU64, Ordering},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -70,9 +70,11 @@ fn utf8_char_len(b: u8) -> usize {
     else if b < 0xf0 { 3 }
     else { 4 }
 }
+use std::sync::{Mutex, OnceLock};
 use tokio::sync::RwLock;
 
 pub mod desktop_bridge;
+pub mod watch;
 
 // ── Coding Agent Detection ─────────────────────────────────────────────
 
@@ -147,6 +149,20 @@ pub struct FlutterApp {
     /// web app that flushes with only its origin (no vm_service_uri / pid).
     #[serde(default)]
     pub web_port: Option<u16>,
+    /// Opaque app identity supplied by the environment. Unlike the browser's
+    /// visible port, this remains stable when a tailnet proxy fronts the app.
+    #[serde(default)]
+    pub app_id: Option<String>,
+    /// The machine the app is running on, when it is not this one.
+    ///
+    /// A remote app flushes its browser origin, which already carries the host
+    /// — `http://m1.follow-ionian.ts.net:5105`. That host was being parsed for
+    /// its port and otherwise discarded, so two apps on two machines rendered
+    /// identically apart from a port number. `None` means the app was found
+    /// locally (process table or listener), which is a statement about this
+    /// machine rather than a missing value.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +213,891 @@ pub struct TrmPane {
     pub has_dev_channels: bool,
 }
 
+/// A live coding-agent session — the unit the TUI lists in its agent column.
+///
+/// Sessions come from three places, in decreasing order of richness:
+///   * Claude Code's own registry at `~/.claude/sessions/<pid>.json`, which
+///     knows every running session including those with no Flan wiring at all;
+///   * flan-channel processes found in the process table, which supply the
+///     loopback port that makes a session *reachable*;
+///   * channels that registered over HTTP, for hosts where the process table
+///     doesn't show them.
+///
+/// None of these needs a terminal multiplexer, which is the point: a detached
+/// `zmx` session, plain ssh, or a cloud runner exposes no pane to discover.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSession {
+    /// Claude Code's session id. Stable for the life of the session — unlike a
+    /// channel port, which is rebound on restart — so it is the identity a
+    /// persisted link should hang off.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// PID of the agent process itself.
+    #[serde(default)]
+    pub agent_pid: Option<u32>,
+    /// Product name ("Claude", "Codex", …).
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    /// Claude Code's own label for the session, e.g. "fasmac-40". The one
+    /// handle that distinguishes several sessions sharing a repo.
+    #[serde(default)]
+    pub session_name: Option<String>,
+    /// "busy", "idle", "shell", … as reported by the registry.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Controlling tty, e.g. "ttys020".
+    #[serde(default)]
+    pub tty: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Checked-out branch, and the linked-worktree name when the cwd is one.
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub worktree: Option<String>,
+    /// What the session is working on: its AI-generated title, else the last
+    /// prompt the user sent.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Artifacts published from this session, most recent last — the same
+    /// names Claude Code shows in its status line. Often the clearest way to
+    /// tell which of several sessions on one repo is which.
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    /// Loopback port of this session's flan-channel. `None` means the session
+    /// is visible but NOT reachable — it can be seen, not messaged.
+    #[serde(default)]
+    pub channel_port: Option<u16>,
+    #[serde(default)]
+    pub channel_pid: Option<u32>,
+    /// trm surface id, when pane resolution happened to succeed. Informational.
+    #[serde(default)]
+    pub surface_id: Option<String>,
+    /// Seconds since an HTTP-registered channel last checked in. Always 0 for
+    /// sessions found by scanning.
+    #[serde(default)]
+    pub age_secs: u64,
+}
+
+/// A flan-channel that announced itself over HTTP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelRegistration {
+    pub port: u16,
+    #[serde(default)]
+    pub channel_pid: Option<u32>,
+    #[serde(default)]
+    pub agent_pid: Option<u32>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub tty: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub surface_id: Option<String>,
+}
+
+/// How long a registration stays listed without a heartbeat. The channel
+/// re-registers every 30s, so three missed beats means it's gone.
+pub const CHANNEL_TTL: Duration = Duration::from_secs(95);
+
+/// How long an app that can only be seen when it talks stays listed. Nothing
+/// heartbeats here — a browser tab flushes when the user sends a message and is
+/// otherwise silent — so the window is generous. Too short and the row vanishes
+/// between messages, taking the link with it.
+pub const REMOTE_APP_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Find the link that belongs to a flushing app.
+///
+/// Order matters. The app id comes first: it is the only identity an app
+/// without a local process has, and for a local app it outlives a rebuild that
+/// changes the pid. The cwd is last — it is a recovery path for an app that
+/// restarted, not an identity, since two apps can share a directory.
+///
+/// There is deliberately no "if all else fails, use the first link" step: with
+/// several linked apps that routes everyone's messages to one agent.
+pub fn resolve_association(
+    assocs: &[Association],
+    app_id: Option<&str>,
+    resolved_pid: Option<u32>,
+    flutter_cwd: Option<&str>,
+) -> Option<Association> {
+    app_id
+        .filter(|id| !id.is_empty())
+        .and_then(|id| {
+            assocs
+                .iter()
+                .find(|a| a.flutter_app_id.as_deref() == Some(id))
+                .cloned()
+        })
+        .or_else(|| {
+            // pid 0 means "no local process"; it must never match by pid, or
+            // every remote app would collapse onto one link.
+            let pid = resolved_pid.filter(|pid| *pid != 0)?;
+            assocs.iter().find(|a| a.flutter_pid == pid).cloned()
+        })
+        .or_else(|| {
+            let cwd = flutter_cwd.filter(|c| !c.is_empty())?;
+            assocs
+                .iter()
+                .find(|a| a.flutter_cwd.as_deref() == Some(cwd))
+                .cloned()
+        })
+}
+
+/// Add remote apps that no local process already covers.
+///
+/// A local process is always the better row — it has a pid, a cwd, and a real
+/// path — so a match on either identity keeps the local one. The port counts as
+/// an identity here: a statically-served app is discovered by its port and
+/// flushes by its id, and those are the same app seen from two sides.
+///
+/// A port only identifies an app *on the same host*. Two machines both running
+/// `--web-port 5005` are two apps, and treating the port alone as the identity
+/// silently hides whichever one is merged second — which is how an app on the
+/// build host disappears because this machine happens to serve the same port.
+pub fn merge_remote_apps(apps: &mut Vec<FlutterApp>, remote: Vec<FlutterApp>) {
+    for app in remote {
+        let same_id = app
+            .app_id
+            .as_ref()
+            .is_some_and(|id| apps.iter().any(|a| a.app_id.as_ref() == Some(id)));
+        let same_port = app
+            .web_port
+            .is_some_and(|port| {
+                apps.iter()
+                    .any(|a| a.web_port == Some(port) && a.host == app.host)
+            });
+        if !same_id && !same_port {
+            apps.push(app);
+        }
+    }
+}
+
+/// Add the apps a peer flan server reports from its own process table.
+///
+/// Identity is `app_id`, or the host-and-port pair. A bare port is deliberately
+/// not enough: see [merge_remote_apps].
+///
+/// Order matters at the call site. A peer row carries a pid, a cwd and a device,
+/// so merging peers BEFORE [merge_remote_apps] lets the full row win over the
+/// `pid 0` stub the same app left behind when it last flushed.
+pub fn merge_peer_apps(apps: &mut Vec<FlutterApp>, peer: Vec<FlutterApp>) {
+    for app in peer {
+        let same_id = app
+            .app_id
+            .as_ref()
+            .is_some_and(|id| apps.iter().any(|a| a.app_id.as_ref() == Some(id)));
+        let same_place = app.web_port.is_some_and(|port| {
+            apps.iter()
+                .any(|a| a.web_port == Some(port) && a.host == app.host)
+        });
+        if !same_id && !same_place {
+            apps.push(app);
+        }
+    }
+}
+
+/// Flutter web builds being served by a plain static server.
+///
+/// `flutter run` isn't the only way an app gets in front of a browser: a
+/// release bundle served by python, nginx, or anything else has no Flutter
+/// process at all, so process-name discovery never sees it. What it does have
+/// is a listening port and a working directory full of Flutter build output —
+/// enough to name it, place it, and route a flush by origin port.
+pub fn discover_static_web_apps() -> Vec<FlutterApp> {
+    // A watched port gets its own row (pointing at its proxy), so a Flutter
+    // bundle that happens to sit behind one must not also appear here.
+    let watched = watch::load_watched_ports();
+    let mut apps = watch::discover_watched_web_apps(&watched);
+
+    // pid → first listening port.
+    let mut listeners: Vec<(u32, u16)> = Vec::new();
+    for (pid, port) in listening_sockets() {
+        if watched.contains(&port) {
+            continue;
+        }
+        if !listeners.iter().any(|(known, _)| *known == pid) {
+            listeners.push((pid, port));
+        }
+    }
+    if listeners.is_empty() {
+        return apps;
+    }
+
+    let pid_csv = listeners
+        .iter()
+        .map(|(pid, _)| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let cwds = process_cwds(&pid_csv);
+
+    let static_apps: Vec<FlutterApp> =     listeners
+        .into_iter()
+        .filter_map(|(pid, port)| {
+            let served = PathBuf::from(cwds.get(&pid)?);
+            if !is_flutter_web_build(&served) {
+                return None;
+            }
+            // Report the project directory, not `build/web`: that's what pairs
+            // with an agent's cwd and what a human recognises.
+            let root = flutter_project_root(&served);
+            Some(FlutterApp {
+                pid,
+                folder_name: root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                cwd: root.to_string_lossy().to_string(),
+                vm_service_uri: None,
+                device: Some("static".to_string()),
+                queue_count: 0,
+                connected: false,
+                web_port: Some(port),
+                app_id: None,
+                host: None,
+            })
+        })
+        .collect();
+    apps.extend(static_apps);
+    apps
+}
+
+/// Every `(pid, port)` pair with a listening TCP socket, as `lsof` reports.
+pub fn listening_sockets() -> Vec<(u32, u16)> {
+    let Ok(out) = Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut sockets = Vec::new();
+    let mut cur: Option<u32> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            cur = pid.parse().ok();
+        } else if let Some(name) = line.strip_prefix('n') {
+            let Some(port) = name.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) else {
+                continue;
+            };
+            if let Some(pid) = cur {
+                sockets.push((pid, port));
+            }
+        }
+    }
+    sockets
+}
+
+/// True if this directory is Flutter web build output. `flutter_bootstrap.js`
+/// is emitted by current builds, `main.dart.js` by older ones.
+fn is_flutter_web_build(dir: &std::path::Path) -> bool {
+    dir.join("flutter_bootstrap.js").exists() || dir.join("main.dart.js").exists()
+}
+
+/// Strip the `build/web` tail a served bundle sits in, leaving the project.
+fn flutter_project_root(served: &std::path::Path) -> PathBuf {
+    let mut root = served.to_path_buf();
+    for expected in ["web", "build"] {
+        if root.file_name().map(|n| n == expected).unwrap_or(false) {
+            root.pop();
+        }
+    }
+    root
+}
+
+/// Build the row for an app known only by the identity it flushes with.
+pub fn remote_app(app_id: &str, origin: Option<&str>) -> FlutterApp {
+    // The id is conventionally "<project>:<worktree>"; the tail is the part
+    // that distinguishes two apps from the same project.
+    let folder_name = app_id.rsplit(':').next().unwrap_or(app_id).to_string();
+    FlutterApp {
+        // No local process: 0 marks "not a pid" rather than pretending.
+        pid: 0,
+        cwd: String::new(),
+        folder_name,
+        vm_service_uri: None,
+        device: Some("remote".to_string()),
+        queue_count: 0,
+        connected: false,
+        web_port: origin.and_then(parse_origin_port),
+        app_id: Some(app_id.to_string()),
+        host: origin.and_then(parse_origin_host),
+    }
+}
+
+/// Walk up from `pid` to the nearest ancestor that looks like a coding agent,
+/// returning `(pid, display name, tty)`.
+///
+/// An MCP server is spawned as a child of the agent process, so the agent is
+/// always an ancestor of the flan-channel — usually the direct parent, but a
+/// shell wrapper (`dart run …`) can sit in between, hence the walk.
+pub fn find_agent_ancestor(pid: u32) -> Option<(u32, String, Option<String>)> {
+    find_agent_ancestor_in(&process_table(), pid)
+}
+
+/// `pid → (ppid, tty, comm)` for every process, so a caller resolving many
+/// pids pays for `ps` once.
+pub fn process_table() -> HashMap<u32, (u32, String, String)> {
+    let Ok(out) = Command::new("ps").args(["-eo", "pid=,ppid=,tty=,comm="]).output() else {
+        return HashMap::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut procs: HashMap<u32, (u32, String, String)> = HashMap::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let Some(pid) = it.next().and_then(|v| v.parse::<u32>().ok()) else { continue };
+        let Some(ppid) = it.next().and_then(|v| v.parse::<u32>().ok()) else { continue };
+        let Some(tty) = it.next() else { continue };
+        let comm = it.collect::<Vec<_>>().join(" ");
+        procs.insert(pid, (ppid, tty.to_string(), comm));
+    }
+    procs
+}
+
+/// As [`find_agent_ancestor`], against an already-built process table.
+pub fn find_agent_ancestor_in(
+    procs: &HashMap<u32, (u32, String, String)>,
+    pid: u32,
+) -> Option<(u32, String, Option<String>)> {
+    let mut cur = pid;
+    for _ in 0..12 {
+        let (ppid, tty, comm) = procs.get(&cur)?.clone();
+        if let Some(name) = agent_name_from_comm(&comm) {
+            let tty = (tty != "??" && !tty.is_empty()).then_some(tty);
+            return Some((cur, name.to_string(), tty));
+        }
+        if ppid <= 1 {
+            return None;
+        }
+        cur = ppid;
+    }
+    None
+}
+
+/// True if `pid` is still alive. `kill(pid, 0)` performs the permission and
+/// existence checks without delivering a signal.
+pub fn pid_is_alive(pid: u32) -> bool {
+    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+}
+
+/// One entry of Claude Code's session registry.
+#[derive(Debug, Clone, Deserialize)]
+struct SessionRecord {
+    pid: u32,
+    #[serde(default)]
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Every live agent session on this host, with the context needed to tell two
+/// sessions in the same repo apart.
+///
+/// Listing only *reachable* sessions hid over half of them: a session without
+/// the flan-channel MCP server has no port to find, but it is still running,
+/// still worth seeing, and still the thing a user means when they ask which
+/// agents are up. Reachability is a property to display, not a filter.
+pub fn discover_agent_sessions() -> Vec<AgentSession> {
+    let procs = process_table();
+    let channels = discover_channel_processes(&procs);
+
+    let mut sessions: Vec<AgentSession> = Vec::new();
+    let mut claimed_ports: HashSet<u16> = HashSet::new();
+
+    for record in read_session_registry() {
+        if !pid_is_alive(record.pid) {
+            continue;
+        }
+        let tty = procs
+            .get(&record.pid)
+            .map(|(_, tty, _)| tty.clone())
+            .filter(|t| t != "??" && !t.is_empty());
+        let agent_name = procs
+            .get(&record.pid)
+            .and_then(|(_, _, comm)| agent_name_from_comm(comm))
+            .map(|n| n.to_string())
+            .or_else(|| Some("Claude".to_string()));
+        let channel = channels.iter().find(|c| c.agent_pid == Some(record.pid));
+        if let Some(channel) = channel {
+            claimed_ports.insert(channel.port);
+        }
+        let cwd = record.cwd.filter(|c| !c.is_empty());
+        let (branch, worktree) = cwd.as_deref().map(git_context).unwrap_or((None, None));
+        let transcript = match (cwd.as_deref(), record.session_id.as_deref()) {
+            (Some(cwd), Some(sid)) => transcript_index(cwd, sid),
+            _ => None,
+        };
+        sessions.push(AgentSession {
+            session_id: record.session_id,
+            agent_pid: Some(record.pid),
+            agent_name,
+            session_name: record.name,
+            status: record.status,
+            tty,
+            cwd,
+            branch,
+            worktree,
+            summary: transcript.as_ref().and_then(|t| t.summary()),
+            artifacts: transcript.map(|t| t.artifacts).unwrap_or_default(),
+            channel_port: channel.map(|c| c.port),
+            channel_pid: channel.and_then(|c| c.channel_pid),
+            surface_id: None,
+            age_secs: 0,
+        });
+    }
+
+    // Channels whose agent isn't in the registry — a non-Claude agent, or a
+    // Claude old enough to predate it. Reachable, just less well described.
+    for channel in &channels {
+        if claimed_ports.contains(&channel.port) {
+            continue;
+        }
+        let cwd = channel.agent_pid.and_then(|pid| {
+            let cwd = get_process_cwd(pid);
+            (!cwd.is_empty()).then_some(cwd)
+        });
+        let (branch, worktree) = cwd.as_deref().map(git_context).unwrap_or((None, None));
+        sessions.push(AgentSession {
+            session_id: None,
+            agent_pid: channel.agent_pid,
+            agent_name: channel.agent_name.clone(),
+            session_name: None,
+            status: None,
+            tty: channel.tty.clone(),
+            cwd,
+            branch,
+            worktree,
+            summary: None,
+            artifacts: Vec::new(),
+            channel_port: Some(channel.port),
+            channel_pid: channel.channel_pid,
+            surface_id: None,
+            age_secs: 0,
+        });
+    }
+
+    sort_sessions(&mut sessions);
+    sessions
+}
+
+impl AgentSession {
+    /// The identity a link is stored against.
+    ///
+    /// The agent's pid: unique, constant for the life of the process, and
+    /// independent of the channel port, so a link survives the flan-channel
+    /// being restarted on a new port.
+    ///
+    /// NOT the Claude session id — two live agents can report the SAME one by
+    /// resuming a session — and never the cwd, which sibling sessions share.
+    pub fn entry_id(&self) -> String {
+        match (self.agent_pid, self.channel_port) {
+            (Some(pid), _) => format!("sess:{pid}"),
+            (None, Some(port)) => format!("chan:{port}"),
+            _ => "sess:unknown".to_string(),
+        }
+    }
+
+    /// Short human label for this session, for logs and the app's status chip.
+    pub fn label(&self) -> String {
+        self.session_name
+            .clone()
+            .or_else(|| self.cwd.as_ref().map(|c| {
+                c.rsplit('/').next().unwrap_or(c).to_string()
+            }))
+            .unwrap_or_else(|| self.entry_id())
+    }
+}
+
+/// Stable display order, so rows don't shuffle between refreshes: by cwd, then
+/// by the session's own name, then by pid.
+pub fn sort_sessions(sessions: &mut [AgentSession]) {
+    sessions.sort_by(|a, b| {
+        a.cwd
+            .cmp(&b.cwd)
+            .then(a.session_name.cmp(&b.session_name))
+            .then(a.agent_pid.cmp(&b.agent_pid))
+    });
+}
+
+fn read_session_registry() -> Vec<SessionRecord> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+    let dir = PathBuf::from(home).join(".claude").join("sessions");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? != "json" {
+                return None;
+            }
+            serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()
+        })
+        .collect()
+}
+
+/// A flan-channel process found in the process table.
+#[derive(Debug, Clone)]
+pub struct ChannelProcess {
+    pub port: u16,
+    pub channel_pid: Option<u32>,
+    pub agent_pid: Option<u32>,
+    pub agent_name: Option<String>,
+    pub tty: Option<String>,
+}
+
+/// Find live flan-channel processes and read their bound port straight from
+/// the kernel, without waiting to be told.
+///
+/// Registration-by-heartbeat only covers channels that know a relay URL and
+/// started after it was configured. Every channel already running when the
+/// server comes up would otherwise stay invisible even though its port is
+/// right there in `lsof`.
+pub fn discover_channel_processes(
+    procs: &HashMap<u32, (u32, String, String)>,
+) -> Vec<ChannelProcess> {
+    let Ok(out) = Command::new("ps").args(["-eo", "pid=,args="]).output() else {
+        return Vec::new();
+    };
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let channel_pids: Vec<u32> = listing
+        .lines()
+        .filter(|line| line.contains("flan_channel"))
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect();
+    if channel_pids.is_empty() {
+        return Vec::new();
+    }
+
+    // One lsof for every channel at once, rather than a spawn per process on a
+    // loop that reruns every few seconds.
+    let pid_csv = channel_pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let ports = channel_listen_ports(&pid_csv);
+
+    channel_pids
+        .iter()
+        .filter_map(|&channel_pid| {
+            let port = *ports.get(&channel_pid)?;
+            let ancestry = find_agent_ancestor_in(procs, channel_pid);
+            Some(ChannelProcess {
+                port,
+                channel_pid: Some(channel_pid),
+                agent_pid: ancestry.as_ref().map(|(pid, _, _)| *pid),
+                agent_name: ancestry.as_ref().map(|(_, name, _)| name.clone()),
+                tty: ancestry.and_then(|(_, _, tty)| tty),
+            })
+        })
+        .collect()
+}
+
+/// `pid → cwd` for the given comma-separated pids, in one `lsof`.
+pub fn process_cwds(pid_csv: &str) -> HashMap<u32, String> {
+    if pid_csv.is_empty() {
+        return HashMap::new();
+    }
+    let Ok(out) = Command::new("lsof")
+        .args(["-d", "cwd", "-a", "-Fpn", "-a", "-p", pid_csv])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    let mut cwds = HashMap::new();
+    let mut cur: Option<u32> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            cur = pid.parse().ok();
+        } else if let Some(path) = line.strip_prefix('n') {
+            if path.starts_with('/') {
+                if let Some(pid) = cur {
+                    cwds.entry(pid).or_insert_with(|| strip_ansi(path));
+                }
+            }
+        }
+    }
+    cwds
+}
+
+/// `pid → listening TCP port` for the given comma-separated pids.
+fn channel_listen_ports(pid_csv: &str) -> HashMap<u32, u16> {
+    let Ok(out) = Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", pid_csv, "-Fpn"])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    let mut ports = HashMap::new();
+    let mut cur: Option<u32> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            cur = pid.parse().ok();
+        } else if let Some(name) = line.strip_prefix('n') {
+            let Some(port) = name.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) else {
+                continue;
+            };
+            if let Some(pid) = cur {
+                // First listener wins; a channel binds exactly one port.
+                ports.entry(pid).or_insert(port);
+            }
+        }
+    }
+    ports
+}
+
+/// `(branch, worktree)` for a working directory, read from the git metadata
+/// rather than by shelling out to `git` on every refresh.
+///
+/// A linked worktree has a `.git` *file* pointing into the main repo's
+/// `worktrees/<name>` directory — which is exactly the name that distinguishes
+/// sibling sessions on one repo, so it's worth surfacing alongside the branch.
+pub fn git_context(cwd: &str) -> (Option<String>, Option<String>) {
+    let mut dir = PathBuf::from(cwd);
+    loop {
+        let dot_git = dir.join(".git");
+        if dot_git.is_dir() {
+            return (head_branch(&dot_git), None);
+        }
+        if dot_git.is_file() {
+            let Some(gitdir) = std::fs::read_to_string(&dot_git)
+                .ok()
+                .and_then(|s| s.trim().strip_prefix("gitdir:").map(|p| p.trim().to_string()))
+            else {
+                return (None, None);
+            };
+            let gitdir = PathBuf::from(gitdir);
+            let worktree = gitdir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string());
+            return (head_branch(&gitdir), worktree);
+        }
+        if !dir.pop() {
+            return (None, None);
+        }
+    }
+}
+
+fn head_branch(gitdir: &std::path::Path) -> Option<String> {
+    let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref: refs/heads/") {
+        Some(branch) => Some(branch.to_string()),
+        // Detached HEAD: show the short sha rather than nothing.
+        None => Some(head.chars().take(8).collect()),
+    }
+}
+
+/// Claude Code's on-disk name for a project directory: every `/`, `_` and `.`
+/// becomes `-`. Getting this wrong silently yields "no transcript" for any repo
+/// with an underscore in its path — `flan_mcp`, for one.
+pub fn claude_project_slug(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c == '/' || c == '_' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// What we've learned from a session's transcript, and how far into the file
+/// we got.
+///
+/// Transcripts reach tens of megabytes and only ever grow, so each pass reads
+/// the bytes appended since the last one. Re-reading from the start every few
+/// seconds would be hundreds of megabytes a minute; reading only the tail
+/// would miss anything stated once and early — which is exactly where artifact
+/// records live.
+#[derive(Debug, Default, Clone)]
+pub struct TranscriptIndex {
+    /// Byte offset consumed so far, always on a line boundary.
+    pub read_to: u64,
+    pub title: Option<String>,
+    pub last_prompt: Option<String>,
+    /// Artifact names in publication order.
+    pub artifacts: Vec<String>,
+}
+
+impl TranscriptIndex {
+    /// The session's one-line description: its AI-generated title, falling
+    /// back to the last prompt the user sent.
+    pub fn summary(&self) -> Option<String> {
+        self.title
+            .clone()
+            .or_else(|| self.last_prompt.clone())
+            .map(|text| one_line(&text, 96))
+    }
+}
+
+/// Fold a run of transcript lines into the index.
+///
+/// Only lines that can possibly matter are parsed — a substring check first,
+/// `serde_json` second — because the overwhelming majority of a transcript is
+/// tool traffic this doesn't care about.
+pub fn absorb_transcript(index: &mut TranscriptIndex, text: &str) {
+    for line in text.lines() {
+        let interesting = line.contains("aiTitle")
+            || line.contains("lastPrompt")
+            || line.contains("frameUrl");
+        if !interesting {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(title) = value.get("aiTitle").and_then(|v| v.as_str()) {
+            index.title = Some(title.to_string());
+        }
+        if let Some(prompt) = value.get("lastPrompt").and_then(|v| v.as_str()) {
+            index.last_prompt = Some(prompt.to_string());
+        }
+        // A published artifact is recorded as a "frame-link" naming the file it
+        // was built from. The file stem is the name Claude Code's status line
+        // shows, so it's the one a user will recognise.
+        if value.get("frameUrl").is_some() {
+            if let Some(name) = value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .and_then(artifact_name)
+            {
+                if !index.artifacts.contains(&name) {
+                    index.artifacts.push(name);
+                }
+            }
+        }
+    }
+}
+
+fn artifact_name(path: &str) -> Option<String> {
+    let file = path.rsplit('/').next()?;
+    let stem = file.split('.').next()?;
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
+/// Cached transcript state per session id. Pure derived data — a cache miss
+/// costs time, never correctness — so it lives beside the reader rather than
+/// being threaded through every caller.
+fn transcript_cache() -> &'static Mutex<HashMap<String, TranscriptIndex>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, TranscriptIndex>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Read whatever the session has appended since last time and return the
+/// updated index.
+pub fn transcript_index(cwd: &str, session_id: &str) -> Option<TranscriptIndex> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home)
+        .join(".claude")
+        .join("projects")
+        .join(claude_project_slug(cwd))
+        .join(format!("{session_id}.jsonl"));
+
+    let mut cache = transcript_cache().lock().ok()?;
+    let index = cache.entry(session_id.to_string()).or_default();
+
+    let mut file = std::fs::File::open(&path).ok()?;
+    let len = file.metadata().ok()?.len();
+    // Shorter than what we consumed means a different file wearing the same
+    // name — start over rather than splicing two transcripts together.
+    if len < index.read_to {
+        *index = TranscriptIndex::default();
+    }
+    if len > index.read_to {
+        file.seek(SeekFrom::Start(index.read_to)).ok()?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).ok()?;
+        // Stop at the last newline: the session may be mid-write, and half a
+        // line would be parsed as garbage and then never re-read.
+        if let Some(end) = buf.iter().rposition(|&b| b == b'\n') {
+            let text = String::from_utf8_lossy(&buf[..=end]);
+            absorb_transcript(index, &text);
+            index.read_to += end as u64 + 1;
+        }
+    }
+    Some(index.clone())
+}
+
+/// Collapse to a single line and clip to `max` chars, so a pasted wall of text
+/// can't blow up a row.
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let clipped: String = flat.chars().take(max.saturating_sub(1)).collect();
+    format!("{clipped}…")
+}
+
+
+/// Drop registrations whose agent has exited or that have gone quiet.
+///
+/// Both checks matter: liveness catches an agent that was killed a second ago,
+/// while the heartbeat window catches one that vanished without its pid ever
+/// being resolvable. A registration that outlives its process would otherwise
+/// sit in the TUI as a link target that silently swallows flushes.
+pub fn prune_channels(
+    channels: &mut HashMap<u16, (Instant, ChannelRegistration)>,
+    is_alive: impl Fn(u32) -> bool,
+) -> Vec<(u64, ChannelRegistration)> {
+    channels.retain(|_, (seen, reg)| {
+        seen.elapsed() < CHANNEL_TTL && reg.agent_pid.map(&is_alive).unwrap_or(true)
+    });
+    let mut out: Vec<(u64, ChannelRegistration)> = channels
+        .values()
+        .map(|(seen, reg)| (seen.elapsed().as_secs(), reg.clone()))
+        .collect();
+    out.sort_by_key(|(_, reg)| reg.port);
+    out
+}
+
+/// Fold HTTP registrations into the discovered list.
+///
+/// Discovery covers everything visible in the process table; a registration
+/// only adds something when it doesn't — a channel this process can't see, on
+/// a host where `ps` and `lsof` don't reach it.
+pub fn merge_registrations(
+    discovered: &mut Vec<AgentSession>,
+    registrations: Vec<(u64, ChannelRegistration)>,
+) {
+    for (age_secs, reg) in registrations {
+        if let Some(existing) = discovered.iter_mut().find(|s| {
+            s.channel_port == Some(reg.port)
+                || (reg.agent_pid.is_some() && s.agent_pid == reg.agent_pid)
+        }) {
+            // Known session: registration only adds the pane it resolved and,
+            // if discovery somehow missed it, the port.
+            existing.channel_port = existing.channel_port.or(Some(reg.port));
+            existing.surface_id = existing.surface_id.take().or(reg.surface_id);
+            continue;
+        }
+        discovered.push(AgentSession {
+            session_id: None,
+            agent_pid: reg.agent_pid,
+            agent_name: reg.agent_name,
+            session_name: None,
+            status: None,
+            tty: reg.tty,
+            cwd: reg.cwd,
+            branch: None,
+            worktree: None,
+            summary: None,
+            artifacts: Vec::new(),
+            channel_port: Some(reg.port),
+            channel_pid: reg.channel_pid,
+            surface_id: reg.surface_id,
+            age_secs,
+        });
+    }
+    sort_sessions(discovered);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Association {
     pub id: String,
@@ -208,6 +1109,12 @@ pub struct Association {
     /// associations that predate this field.
     #[serde(default)]
     pub flutter_cwd: Option<String>,
+    /// `FLAN_APP_ID`, when the app supplies one. The only identity that works
+    /// for an app this host can't see as a process — served as a static bundle,
+    /// or running on another machine and reaching the relay over the tailnet.
+    /// It also outlives a rebuild, unlike the pid.
+    #[serde(default)]
+    pub flutter_app_id: Option<String>,
 }
 
 /// An annotated feedback message sent by a web (React) client over the
@@ -281,10 +1188,27 @@ pub struct SharedState {
     /// login_pid is the trm-direct-child login that is an ancestor of the
     /// flan-channel process.
     pub channel_ports_by_login: RwLock<HashMap<u32, u16>>,
+    /// Channels that announced themselves over HTTP, keyed by port with the
+    /// time of the last heartbeat. Discovery covers everything visible in the
+    /// process table; this covers the rest.
+    pub channels: RwLock<HashMap<u16, (Instant, ChannelRegistration)>>,
+    /// Apps that have flushed with an `app_id` matching no local process,
+    /// keyed by that id. An app served as a static bundle, or running on
+    /// another machine, never appears in `ps` — but it is plainly real, since
+    /// it just talked to us, and it needs a row to be linkable.
+    pub remote_apps: RwLock<HashMap<String, (Instant, FlutterApp)>>,
+    /// Where the remote-app list is kept between runs. These apps are only
+    /// visible while they flush, so without this a restart erases every row a
+    /// user could link to — and takes their links with it.
+    pub remote_apps_path: PathBuf,
     /// Server-side message queue for web (React) clients. Web apps cannot
     /// host their own queue the way Flutter apps do, so annotated feedback
     /// arriving on `/ws` is buffered here and drained by the MCP server.
     pub web_queue: RwLock<Vec<WebMessage>>,
+    /// Upstream ports this process has a watch proxy bound for.
+    pub watch_proxies: RwLock<HashSet<u16>>,
+    /// The port this server answers on, for URLs it hands to browsers.
+    pub server_port: AtomicU16,
     /// Monotonic counter assigning `queue_id`s to web messages.
     pub web_queue_seq: AtomicU64,
 }
@@ -292,6 +1216,7 @@ pub struct SharedState {
 impl SharedState {
     pub fn new() -> Self {
         let persistence_path = flan_dir().join("associations.json");
+        let remote_apps_path = flan_dir().join("remote_apps.json");
         let mut associations = load_associations(&persistence_path);
         // One-time migration: older builds keyed trm associations by the
         // positional surface index (trm:<index>), which drifts as panes are
@@ -310,9 +1235,61 @@ impl SharedState {
             channel_ports: RwLock::new(HashMap::new()),
             channel_ports_by_cwd: RwLock::new(HashMap::new()),
             channel_ports_by_login: RwLock::new(HashMap::new()),
+            channels: RwLock::new(HashMap::new()),
+            remote_apps: RwLock::new(load_remote_apps(&remote_apps_path)),
+            remote_apps_path,
             web_queue: RwLock::new(Vec::new()),
             web_queue_seq: AtomicU64::new(1),
+            watch_proxies: RwLock::new(HashSet::new()),
+            server_port: AtomicU16::new(4050),
         }
+    }
+
+    /// Live remote apps — those seen only when they flush — with ones that
+    /// have gone quiet dropped.
+    pub async fn remote_apps(&self) -> Vec<FlutterApp> {
+        let mut remote = self.remote_apps.write().await;
+        let before = remote.len();
+        remote.retain(|_, (seen, _)| seen.elapsed() < REMOTE_APP_TTL);
+        let mut apps: Vec<FlutterApp> = remote.values().map(|(_, app)| app.clone()).collect();
+        apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+        if remote.len() != before {
+            save_remote_apps(&self.remote_apps_path, &apps);
+        }
+        apps
+    }
+
+    /// Record an app that can only be seen when it talks to us.
+    ///
+    /// Sightings are merged, not replaced: not every flush carries an origin,
+    /// and a later one that doesn't must not erase the port an earlier one
+    /// taught us.
+    pub async fn remember_remote_app(&self, app: FlutterApp) {
+        let Some(app_id) = app.app_id.clone() else { return };
+        let apps = {
+            let mut remote = self.remote_apps.write().await;
+            let mut app = app;
+            if let Some((_, known)) = remote.get(&app_id) {
+                app.web_port = app.web_port.or(known.web_port);
+            }
+            remote.insert(app_id, (Instant::now(), app));
+            remote.values().map(|(_, a)| a.clone()).collect::<Vec<_>>()
+        };
+        save_remote_apps(&self.remote_apps_path, &apps);
+    }
+
+    /// The agent sessions to display: everything discovery found, plus any
+    /// registration it couldn't see. Stale registrations — dead agent, or too
+    /// many missed heartbeats — are dropped here, on read, so a vanished agent
+    /// can't linger as a link target.
+    pub async fn agent_sessions(&self, discovered: Vec<AgentSession>) -> Vec<AgentSession> {
+        let registrations = {
+            let mut channels = self.channels.write().await;
+            prune_channels(&mut channels, pid_is_alive)
+        };
+        let mut sessions = discovered;
+        merge_registrations(&mut sessions, registrations);
+        sessions
     }
 
     pub async fn log(
@@ -358,18 +1335,31 @@ mod server {
     struct CreateAssociation {
         claude_surface_id: String,
         flutter_pid: u32,
+        /// Identity of an app with no local pid. Required to link one at all,
+        /// since every such app reports pid 0.
+        #[serde(default)]
+        flutter_app_id: Option<String>,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     struct FlushRequest {
         flutter_pid: Option<u32>,
         vm_service_uri: Option<String>,
+        /// Stable identity supplied with `--dart-define=FLAN_APP_ID=...`.
+        app_id: Option<String>,
         /// "desktop" to route to floss instead of Flutter VM service.
         mode: Option<String>,
         /// The web app's own origin (e.g. "http://localhost:5005"). Web apps
         /// can't read their vm_service_uri, so they send this; the server maps
         /// the port to the flutter app's --web-port.
         origin: Option<String>,
+        /// Messages to relay to the loopback-only MCP channel.
+        messages: Option<Vec<serde_json::Value>>,
+        /// Set when a peer forwarded this flush to us. A relayed flush is never
+        /// relayed on, which is what keeps two servers pointing at each other
+        /// from bouncing one message between them forever.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relayed_from: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -386,6 +1376,31 @@ mod server {
     #[derive(Debug, Deserialize)]
     struct FocusAppRequest {
         device: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct HotReloadRequest {
+        /// The `flutter run` pid, as `/api/flutter-apps` reports it.
+        pid: Option<u32>,
+        /// Identity of an app with no local pid, supplied with
+        /// `--dart-define=FLAN_APP_ID=...`.
+        app_id: Option<String>,
+        /// What the app itself knows about where it is: a native app posts this
+        /// on every flush, and without `FLAN_APP_ID` it is the only name it has.
+        vm_service_uri: Option<String>,
+        /// The web app's own origin (`http://host:PORT`). A page has no pid and
+        /// no VM service, so this is the only identifier it has beyond
+        /// `FLAN_APP_ID` — the same reason [FlushRequest] carries it.
+        origin: Option<String>,
+        /// Ask for a hot RESTART instead: loses state, but picks up the changes
+        /// a reload can't (new fields, globals, `main()`).
+        #[serde(default)]
+        full_restart: bool,
+        /// Set when a peer forwarded this to us. A relayed request is never
+        /// relayed on, which is what keeps two servers pointing at each other
+        /// from bouncing one reload between them forever.
+        #[serde(default)]
+        relayed_from: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -418,20 +1433,71 @@ mod server {
         Json(procs)
     }
 
-    async fn get_flutter_apps(State(state): State<Arc<SharedState>>) -> Json<Vec<FlutterApp>> {
+    /// Everything on this machine's own process table, and nothing else.
+    ///
+    /// This is what a peer asks for. It must never consult peers or the remote
+    /// registry: two servers listing each other would otherwise recurse, and a
+    /// peer has no use for rows about a third host it can't reach anyway.
+    fn local_flutter_apps() -> Vec<FlutterApp> {
+        let mut apps = discover_flutter_apps();
+        merge_remote_apps(&mut apps, discover_static_web_apps());
+        apps
+    }
+
+    async fn flutter_apps_snapshot(state: &Arc<SharedState>) -> Vec<FlutterApp> {
         {
             let cache = state.flutter_cache.read().await;
             if let Some((ts, ref data)) = *cache {
                 if ts.elapsed() < Duration::from_secs(5) {
-                    return Json(data.clone());
+                    return data.clone();
                 }
             }
         }
-        let apps = tokio::task::spawn_blocking(discover_flutter_apps)
-            .await
-            .unwrap_or_default();
+        let mut apps = tokio::task::spawn_blocking(|| {
+            let mut apps = local_flutter_apps();
+            // Peers before the registry: a peer row carries a pid and a cwd,
+            // and should win over the stub the same app left when it flushed.
+            merge_peer_apps(&mut apps, discover_peer_apps(&load_peers()));
+            apps
+        })
+        .await
+        .unwrap_or_default();
+        merge_remote_apps(&mut apps, state.remote_apps().await);
         *state.flutter_cache.write().await = Some((Instant::now(), apps.clone()));
-        Json(apps)
+        apps
+    }
+
+    #[derive(Deserialize)]
+    struct FlutterAppsQuery {
+        /// Set by a peer: answer from this machine's process table alone.
+        local: Option<String>,
+    }
+
+    async fn get_flutter_apps(
+        State(state): State<Arc<SharedState>>,
+        Query(query): Query<FlutterAppsQuery>,
+    ) -> Json<Vec<FlutterApp>> {
+        if query.local.is_some_and(|v| v != "0" && v != "false") {
+            let apps = tokio::task::spawn_blocking(local_flutter_apps)
+                .await
+                .unwrap_or_default();
+            return Json(apps);
+        }
+        Json(flutter_apps_snapshot(&state).await)
+    }
+
+    /// Which peers are configured and whether the last poll of each one
+    /// actually got an answer. The question "is it empty or is it broken?" has
+    /// to be answerable without reading the source.
+    async fn get_peers(State(state): State<Arc<SharedState>>) -> Json<serde_json::Value> {
+        // Peers are polled as part of discovery, so without this the answer is
+        // empty until something else happens to ask for the app list — which
+        // reads as "no peers configured" and is the opposite of the truth.
+        let _ = flutter_apps_snapshot(&state).await;
+        Json(serde_json::json!({
+            "configured": load_peers(),
+            "peers": peer_states(),
+        }))
     }
 
     async fn get_desktop_target(
@@ -490,14 +1556,31 @@ mod server {
                     if c.is_empty() { None } else { Some(c) }
                 })
         };
+        // Prefer the id the caller supplied; otherwise carry over whatever the
+        // discovered app reports, so a link made against a locally-visible app
+        // still survives that app being rebuilt with a new pid.
+        let flutter_app_id = body.flutter_app_id.filter(|id| !id.is_empty()).or_else(|| {
+            let pid = body.flutter_pid;
+            state.flutter_cache.try_read().ok().and_then(|c| {
+                c.as_ref()
+                    .and_then(|(_, apps)| apps.iter().find(|a| a.pid == pid))
+                    .and_then(|a| a.app_id.clone())
+            })
+        });
         let assoc = Association {
             id: new_association_id(),
             claude_surface_id: body.claude_surface_id,
             flutter_pid: body.flutter_pid,
             flutter_cwd,
+            flutter_app_id,
         };
         let mut assocs = state.associations.write().await;
-        assocs.retain(|a| a.flutter_pid != assoc.flutter_pid);
+        // One link per app. Match on the app id when there is one — pid 0 is
+        // shared by every remote app, so pid alone would clobber unrelated links.
+        assocs.retain(|a| match (&a.flutter_app_id, &assoc.flutter_app_id) {
+            (Some(existing), Some(new)) => existing != new,
+            _ => a.flutter_pid != assoc.flutter_pid || assoc.flutter_pid == 0,
+        });
         assocs.push(assoc.clone());
         save_associations(&state.persistence_path, &assocs);
         state
@@ -548,7 +1631,25 @@ mod server {
         State(state): State<Arc<SharedState>>,
         Json(body): Json<FlushRequest>,
     ) -> impl IntoResponse {
-        tracing::info!("handle_flush: pid={:?} vm_service_uri={:?}", body.flutter_pid, body.vm_service_uri);
+        tracing::info!(
+            "handle_flush: app_id={:?} pid={:?} vm_service_uri={:?} messages={}",
+            body.app_id,
+            body.flutter_pid,
+            body.vm_service_uri,
+            body.messages.as_ref().map_or(0, Vec::len),
+        );
+        // Log what the app said about itself, on the way in. When a flush
+        // can't be routed, the identity it carried is the whole diagnosis, and
+        // it is otherwise invisible from the outside.
+        let identity = format!(
+            "app_id={} origin={} pid={} vm_uri={}",
+            body.app_id.as_deref().unwrap_or("-"),
+            body.origin.as_deref().unwrap_or("-"),
+            body.flutter_pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            body.vm_service_uri.as_deref().unwrap_or("-"),
+        );
+
+        let apps = flutter_apps_snapshot(&state).await;
         let surfaces: Vec<CmuxSurface> = tokio::task::spawn_blocking(cmux_surface_list)
             .await
             .unwrap_or_default();
@@ -557,9 +1658,19 @@ mod server {
 
         let mut assocs = state.associations.write().await;
         let before = assocs.len();
+        // Drop links whose target this server has no way to resolve. A cmux id
+        // is only meaningful while that surface is live; pane and session ids
+        // are resolved further down, against discovery.
+        //
+        // This list must cover EVERY id form the TUI can store: an id missing
+        // here isn't merely unroutable, it is deleted from disk on the first
+        // flush, so the user's link silently disappears.
         assocs.retain(|a| {
-            a.claude_surface_id.starts_with("trm:")
-                || live_surface_ids.contains(&a.claude_surface_id)
+            let id = &a.claude_surface_id;
+            id.starts_with("trm:")
+                || id.starts_with("sess:")
+                || id.starts_with("chan:")
+                || live_surface_ids.contains(id)
         });
         if assocs.len() < before {
             save_associations(&state.persistence_path, &assocs);
@@ -576,31 +1687,52 @@ mod server {
         // to the flutter app's --web-port. This is the only identifier a web app
         // actually has.
         let origin_port = body.origin.as_deref().and_then(parse_origin_port);
-        let resolved_pid = body.flutter_pid.or_else(|| {
-            let cache = state.flutter_cache.try_read().ok()?;
-            let (_, ref apps) = (*cache).as_ref()?;
-            // 1. Match by vm_service_uri (native/desktop debug apps).
-            if let Some(uri) = body.vm_service_uri.as_ref() {
-                if let Some(app) = apps.iter()
-                    .find(|a| a.vm_service_uri.as_deref() == Some(uri.as_str()))
-                {
-                    return Some(app.pid);
-                }
+        let resolved_app = body
+            .app_id
+            .as_ref()
+            // A local row first: a remembered remote row can carry a stale port
+            // from an earlier sighting, and letting it win would resolve the app
+            // to pid 0 and lose a perfectly good link.
+            .and_then(|id| {
+                apps.iter()
+                    .find(|app| app.app_id.as_ref() == Some(id) && app.pid != 0)
+                    .or_else(|| apps.iter().find(|app| app.app_id.as_ref() == Some(id)))
+            })
+            .or_else(|| {
+                // Match by vm_service_uri (native/desktop debug apps).
+                let uri = body.vm_service_uri.as_ref()?;
+                apps.iter()
+                    .find(|app| app.vm_service_uri.as_ref() == Some(uri))
+            })
+            .or_else(|| {
+                // Match by web port only as a legacy fallback. A reverse proxy
+                // can change the visible origin port, which is why app_id wins.
+                let port = origin_port?;
+                apps.iter().find(|app| app.web_port == Some(port))
+            });
+        // An app_id we can't place is not a mistake — it's an app this host
+        // can't see as a process. Remember it so it gets a row to link to
+        // instead of being unreachable forever.
+        // Re-record on every sighting, not just the first: the row this
+        // matched may BE the remembered one, and each flush can carry detail
+        // (a fresh origin, a moved port) the stored copy predates.
+        let needs_recording = resolved_app.map_or(true, |app| app.pid == 0);
+        if let Some(app_id) = body.app_id.as_deref() {
+            if needs_recording && !app_id.is_empty() {
+                let entry = remote_app(app_id, body.origin.as_deref());
+                tracing::info!("Remote app seen: app_id={} origin={:?}", app_id, body.origin);
+                state.remember_remote_app(entry).await;
             }
-            // 2. Match by web port (web apps).
-            if let Some(port) = origin_port {
-                if let Some(app) = apps.iter().find(|a| a.web_port == Some(port)) {
-                    return Some(app.pid);
-                }
-            }
-            None
-        });
+        }
+
+        let resolved_pid = body.flutter_pid.or_else(|| resolved_app.map(|app| app.pid));
 
         // The flushing app's own cwd, used both for the cwd-keyed association
         // fallback below and the surface-discovery fallback further down.
-        let flutter_cwd = resolved_pid
-            .map(get_process_cwd)
-            .filter(|c| !c.is_empty());
+        let flutter_cwd = resolved_app
+            .map(|app| app.cwd.clone())
+            .filter(|cwd| !cwd.is_empty())
+            .or_else(|| resolved_pid.map(get_process_cwd).filter(|cwd| !cwd.is_empty()));
 
         // Only an EXACT pid match counts as a primary association. We deliberately
         // do NOT fall back to `assocs.first()`: with multiple linked services
@@ -613,17 +1745,20 @@ mod server {
         // existing agent link automatically, no manual re-link needed. We still
         // require an EXACT cwd equality (not prefix) so two apps under sibling
         // dirs can't steal each other's link.
-        let assoc = resolved_pid
-            .and_then(|pid| assocs.iter().find(|a| a.flutter_pid == pid).cloned())
-            .or_else(|| {
-                let cwd = flutter_cwd.as_ref()?;
-                assocs
-                    .iter()
-                    .find(|a| a.flutter_cwd.as_deref() == Some(cwd.as_str()))
-                    .cloned()
-            });
-        let pruned = before - assocs.len();
+        let assoc = resolve_association(
+            &assocs,
+            body.app_id.as_deref(),
+            resolved_pid,
+            flutter_cwd.as_deref(),
+        );
         drop(assocs);
+
+        let cwd_channel_port = if let Some(cwd) = flutter_cwd.as_deref() {
+            let ports = state.channel_ports_by_cwd.read().await;
+            channel_port_for_cwd(&ports, cwd)
+        } else {
+            None
+        };
 
         // Determine target surface: use association if one exists, otherwise
         // discover a Claude Code surface by title. The typical flow is that
@@ -654,24 +1789,102 @@ mod server {
                         false
                     }
                 })
-                .or_else(|| cc_surfaces.first())
+                .or_else(|| {
+                    // A cwd-registered channel is a stronger routing signal
+                    // than an unrelated first surface on a multi-agent host.
+                    cwd_channel_port.is_none().then(|| cc_surfaces.first()).flatten()
+                })
                 .map(|s| s.id.clone())
         };
 
-        let Some(surface_id) = surface_id else {
-            state
-                .log(
-                    "in",
-                    "Flush failed: no association and no Claude Code surface found".into(),
-                    None,
-                    false,
-                )
-                .await;
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "No association or Claude Code surface found"})),
-            );
+        let surface_id = match surface_id {
+            Some(surface_id) => surface_id,
+            None if cwd_channel_port.is_some()
+                && body.messages.as_ref().is_some_and(|items| !items.is_empty()) =>
+            {
+                "cwd-route".to_string()
+            }
+            None => {
+                // The app posts to the flan server named by FLAN_SERVER_URL,
+                // which `wt` points at the worktree's OWN server. The agent,
+                // though, runs wherever the human is — often another machine.
+                // Discovery already crosses that gap by pulling; without the
+                // same hop for flushes, an app and the agent it is linked to
+                // can see each other and still never exchange a word.
+                if body.relayed_from.is_none() {
+                    if let Some((peer, outcome)) = relay_flush_to_peers(&body, &load_peers()).await
+                    {
+                        let host = peer_host(&peer).unwrap_or_else(|| peer.clone());
+                        state
+                            .log(
+                                "in",
+                                format!("Flush relayed to {host}"),
+                                Some(format!("{identity} · delivered={}", outcome.delivered)),
+                                true,
+                            )
+                            .await;
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "accepted": outcome.accepted,
+                                "delivered": outcome.delivered,
+                                "relayed_to": peer,
+                            })),
+                        );
+                    }
+                }
+                let relay_note = if body.relayed_from.is_some() {
+                    " · arrived as a relay, so not relayed on".to_string()
+                } else {
+                    let peers = load_peers();
+                    if peers.is_empty() {
+                        " · no peers configured to relay to".to_string()
+                    } else {
+                        format!(" · no peer of {} took it", peers.len())
+                    }
+                };
+                state
+                    .log(
+                        "in",
+                        "Flush failed: no linked receiver".into(),
+                        Some(format!(
+                            "{identity} · apps={}{relay_note}",
+                            apps.iter()
+                                .map(|a| format!(
+                                    "{}:{}",
+                                    a.pid,
+                                    a.web_port.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )),
+                        false,
+                    )
+                    .await;
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "No linked Flan receiver was found",
+                    })),
+                );
+            }
         };
+
+        // Teach the link the app's id. An app identifies itself by FLAN_APP_ID,
+        // but a link made in the TUI is made against a row — which, for a
+        // statically-served build, has no id to copy. Stamping it on the first
+        // flush that resolves by any other means means a later flush carrying
+        // only the id still finds its way home.
+        if let (Some(app_id), Some(ref matched)) = (body.app_id.as_deref(), assoc.as_ref()) {
+            if !app_id.is_empty() && matched.flutter_app_id.as_deref() != Some(app_id) {
+                let mut assocs = state.associations.write().await;
+                if let Some(entry) = assocs.iter_mut().find(|a| a.id == matched.id) {
+                    entry.flutter_app_id = Some(app_id.to_string());
+                    tracing::info!("Link {} learned app_id={}", entry.id, app_id);
+                }
+                save_associations(&state.persistence_path, &assocs);
+            }
+        }
 
         // Desktop mode: tell Claude to connect in desktop mode instead of Flutter
         let is_desktop = body.mode.as_deref() == Some("desktop")
@@ -687,11 +1900,9 @@ mod server {
             body.vm_service_uri.clone().or_else(|| {
                 let flutter_pid = assoc.as_ref().map(|a| a.flutter_pid)
                     .or(resolved_pid)?;
-                if let Ok(cache) = state.flutter_cache.try_read() {
-                    if let Some((_, ref apps)) = *cache {
-                        if let Some(app) = apps.iter().find(|a| a.pid == flutter_pid) {
-                            return app.vm_service_uri.clone();
-                        }
+                if let Some(app) = apps.iter().find(|app| app.pid == flutter_pid) {
+                    if app.vm_service_uri.is_some() {
+                        return app.vm_service_uri.clone();
                     }
                 }
                 probe_vm_service_uri(flutter_pid)
@@ -707,8 +1918,34 @@ mod server {
             )
             .await;
 
-        let channel_port = state.channel_ports.read().await
-            .get(&surface_id).copied();
+        let channel_port = state
+            .channel_ports
+            .read()
+            .await
+            .get(&surface_id)
+            .copied();
+        // A link made in the TUI's agent column is stored against a session id
+        // (`sess:<pid>`), which the pane-keyed map above knows nothing about.
+        // Resolve those against live discovery, so an explicit link routes
+        // exactly where it says instead of silently falling through to the cwd
+        // guess — which, with several agents on one repo, lands on the wrong one.
+        let channel_port = match channel_port {
+            Some(port) => Some(port),
+            None if surface_id.starts_with("sess:") || surface_id.starts_with("chan:") => {
+                let target = surface_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    discover_agent_sessions()
+                        .into_iter()
+                        .find(|session| session.entry_id() == target)
+                        .and_then(|session| session.channel_port)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            None => None,
+        };
+        let channel_port = channel_port.or(cwd_channel_port);
 
         let mut resp = serde_json::json!({"ok": true, "surface_id": surface_id});
         if let Some(ref uri) = resolved_vm_uri {
@@ -716,6 +1953,156 @@ mod server {
         }
         if let Some(port) = channel_port {
             resp["channel_port"] = serde_json::Value::Number(port.into());
+        }
+
+        // A Codex link can't take channel notifications — that protocol is
+        // Claude Code's, and a flan-channel started under Codex rejects the
+        // batch — so its messages go through `codex queue` into the thread
+        // the Codex process has open. Checked before the channel requirement:
+        // a Codex session usually DOES have a channel port, and it is the
+        // wrong door.
+        let codex_pid = {
+            let target = surface_id.clone();
+            tokio::task::spawn_blocking(move || codex_pid_for_target(&target))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let (Some(pid), Some(messages)) = (
+            codex_pid,
+            body.messages.as_ref().filter(|items| !items.is_empty()),
+        ) {
+            let thread = tokio::task::spawn_blocking(move || {
+                codex_threads_for_pid(pid).into_iter().next()
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(thread) = thread else {
+                state
+                    .log(
+                        "out",
+                        format!("Codex queue → pid {pid}: no open thread"),
+                        Some(identity.clone()),
+                        false,
+                    )
+                    .await;
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "accepted": false,
+                        "delivered": false,
+                        "error": format!(
+                            "Codex process {pid} has no open thread to queue into"
+                        ),
+                    })),
+                );
+            };
+            resp["codex_pid"] = serde_json::Value::Number(pid.into());
+            resp["codex_thread"] = serde_json::Value::String(thread.clone());
+
+            let (text, images) =
+                format_codex_message(messages, resolved_vm_uri.as_deref(), resolved_pid);
+            let relay = {
+                let thread = thread.clone();
+                tokio::task::spawn_blocking(move || relay_codex_queue(&thread, &text, &images))
+                    .await
+                    .map_err(|error| format!("Codex queue task failed: {error}"))
+                    .and_then(|result| result)
+            };
+            let summary = format!(
+                "Codex queue → thread {}… (pid {pid})",
+                &thread[..8.min(thread.len())]
+            );
+            match relay {
+                Ok(outcome) => {
+                    state
+                        .log(
+                            "out",
+                            summary,
+                            Some(format!("{} message(s)", messages.len())),
+                            true,
+                        )
+                        .await;
+                    resp["accepted"] = serde_json::Value::Bool(true);
+                    resp["delivered"] = serde_json::Value::Bool(outcome.delivered);
+                    return (StatusCode::OK, Json(resp));
+                }
+                Err(error) => {
+                    state.log("out", summary, Some(error.clone()), false).await;
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "accepted": false,
+                            "delivered": false,
+                            "error": error,
+                            "codex_pid": pid,
+                            "codex_thread": thread,
+                        })),
+                    );
+                }
+            }
+        }
+
+        if let Some(messages) = body.messages.as_ref().filter(|items| !items.is_empty()) {
+            let Some(port) = channel_port else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "accepted": false,
+                        "delivered": false,
+                        "error": "No linked Flan channel is available",
+                    })),
+                );
+            };
+            let mut channel_payload = serde_json::json!({"messages": messages});
+            if let Some(uri) = resolved_vm_uri.as_ref() {
+                channel_payload["vm_service_uri"] =
+                    serde_json::Value::String(uri.clone());
+            }
+            if let Some(pid) = resolved_pid {
+                channel_payload["flutter_pid"] =
+                    serde_json::Value::Number(pid.into());
+            }
+            let payload = channel_payload.to_string();
+            let relay = tokio::task::spawn_blocking(move || {
+                relay_channel_flush(port, &payload)
+            })
+            .await
+            .map_err(|error| format!("Flan channel relay task failed: {error}"))
+            .and_then(|result| result);
+
+            match relay {
+                Ok(outcome) if outcome.accepted => {
+                    resp["accepted"] = serde_json::Value::Bool(true);
+                    resp["delivered"] = serde_json::Value::Bool(outcome.delivered);
+                }
+                Ok(_) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "accepted": false,
+                            "delivered": false,
+                            "error": "Flan channel rejected the message batch",
+                        })),
+                    );
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "accepted": false,
+                            "delivered": false,
+                            "error": error,
+                        })),
+                    );
+                }
+            }
         }
 
         (StatusCode::OK, Json(resp))
@@ -845,6 +2232,7 @@ mod server {
         State(state): State<Arc<SharedState>>,
         Json(body): Json<RegisterChannelRequest>,
     ) -> impl IntoResponse {
+        let registered_cwd = body.cwd.clone().filter(|cwd| !cwd.is_empty());
         // Resolve surface_id: use the explicit value, or look up which trm pane
         // the given PID belongs to.
         let surface_id = if let Some(sid) = body.surface_id {
@@ -924,9 +2312,67 @@ mod server {
                 state.channel_ports_by_cwd.write().await.insert(cwd, port);
             }
         }
+        if let Some(cwd) = registered_cwd {
+            tracing::info!("Channel registered by client cwd: {} → port {}", cwd, port);
+            state.channel_ports_by_cwd.write().await.insert(cwd, port);
+        }
+
+        // Record the channel as an agent in its own right. Everything above
+        // tries to bind this port onto a *pane*; this records the agent even
+        // when there is no pane to bind to — the headless case, where the trm
+        // RPC is absent and pane discovery yields nothing at all.
+        {
+            let channel_pid = body.pid;
+            let ancestry = match channel_pid {
+                Some(pid) => tokio::task::spawn_blocking(move || {
+                    let (agent_pid, name, tty) = find_agent_ancestor(pid)?;
+                    Some((agent_pid, name, tty, get_process_cwd(agent_pid)))
+                })
+                .await
+                .ok()
+                .flatten(),
+                None => None,
+            };
+            let (agent_pid, agent_name, tty, agent_cwd) = match ancestry {
+                Some((pid, name, tty, cwd)) => {
+                    (Some(pid), Some(name), tty, Some(cwd).filter(|c| !c.is_empty()))
+                }
+                None => (None, None, None, None),
+            };
+            let registration = ChannelRegistration {
+                port,
+                channel_pid,
+                agent_pid,
+                agent_name,
+                tty,
+                // The AGENT's cwd, not the channel's: an MCP server is often
+                // launched from wherever its config lives (one shared flan_mcp
+                // checkout serving every session), so the channel's own cwd
+                // would collapse unrelated agents onto one directory and pair
+                // them with the wrong Flutter app. Fall back to the reported
+                // cwd only when the agent process can't be resolved.
+                cwd: agent_cwd.or_else(|| body.cwd.clone().filter(|c| !c.is_empty())),
+                surface_id: surface_id.clone(),
+            };
+            tracing::info!(
+                "Channel registered: port={} agent={:?} pid={:?} tty={:?} cwd={:?}",
+                registration.port, registration.agent_name, registration.agent_pid,
+                registration.tty, registration.cwd
+            );
+            state.channels.write().await.insert(port, (Instant::now(), registration));
+        }
 
         let sid_str = surface_id.as_deref().unwrap_or("(unresolved)");
         (StatusCode::OK, Json(serde_json::json!({"ok": true, "surface_id": sid_str})))
+    }
+
+    async fn get_agents(State(state): State<Arc<SharedState>>) -> Json<Vec<AgentSession>> {
+        // Discover on read so the HTTP view matches the TUI's, which refreshes
+        // on its own cycle.
+        let discovered = tokio::task::spawn_blocking(discover_agent_sessions)
+            .await
+            .unwrap_or_default();
+        Json(state.agent_sessions(discovered).await)
     }
 
     async fn handle_focus_app(
@@ -951,6 +2397,93 @@ mod server {
         }
     }
 
+    /// POST /api/hot-reload — ask an app's `flutter run` to reload.
+    ///
+    /// The request only has to name the app; the discovered row carries the
+    /// three things that decide how to ask it — a pid on this machine, a VM
+    /// service URI, or a host that isn't us.
+    async fn handle_hot_reload(
+        State(state): State<Arc<SharedState>>,
+        Json(body): Json<HotReloadRequest>,
+    ) -> impl IntoResponse {
+        let full_restart = body.full_restart;
+        let verb = reload_verb(full_restart);
+        let apps = flutter_apps_snapshot(&state).await;
+        // The same ladder `handle_flush` climbs, and for the same reason: an app
+        // names itself with whatever it has. A web page has neither pid nor VM
+        // service, and only its origin places it.
+        let app = body
+            .pid
+            .filter(|pid| *pid != 0)
+            .and_then(|pid| apps.iter().find(|app| app.pid == pid))
+            .or_else(|| {
+                let id = body.app_id.as_ref()?;
+                // A row with a live pid first: a remembered remote row can carry
+                // a stale port from an earlier sighting.
+                apps.iter()
+                    .find(|app| app.app_id.as_ref() == Some(id) && app.pid != 0)
+                    .or_else(|| apps.iter().find(|app| app.app_id.as_ref() == Some(id)))
+            })
+            .or_else(|| {
+                let uri = body.vm_service_uri.as_ref()?;
+                apps.iter().find(|app| app.vm_service_uri.as_ref() == Some(uri))
+            })
+            .or_else(|| {
+                let port = body.origin.as_deref().and_then(parse_origin_port)?;
+                apps.iter().find(|app| app.web_port == Some(port))
+            })
+            .cloned();
+
+        let relayed = body.relayed_from.is_some();
+        let label = app
+            .as_ref()
+            .filter(|app| !app.folder_name.is_empty())
+            .map(|app| app.folder_name.clone())
+            .or_else(|| body.app_id.clone())
+            .unwrap_or_else(|| format!("pid {}", body.pid.unwrap_or(0)));
+        let pid = body.pid.or_else(|| app.as_ref().map(|app| app.pid)).unwrap_or(0);
+        let requested_uri = body.vm_service_uri.clone();
+
+        let outcome = tokio::task::spawn_blocking(move || match app {
+            // A relayed request stops here: this IS the machine that was asked,
+            // so strip the host and reload it as a local one.
+            Some(app) if relayed => hot_reload_app(
+                &FlutterApp {
+                    host: None,
+                    ..app
+                },
+                full_restart,
+            ),
+            Some(app) => hot_reload_app(&app, full_restart),
+            // Not in the snapshot: discovery may simply have missed it on this
+            // tick, and either a live `flutter run` pid or the URI the app sent
+            // is enough to act on by itself.
+            None => hot_reload_local(pid, requested_uri.as_deref(), full_restart),
+        })
+        .await
+        .unwrap_or_else(|error| HotReloadOutcome {
+            ok: false,
+            via: "none".into(),
+            detail: format!("{verb} task failed: {error}"),
+        });
+
+        state
+            .log(
+                "out",
+                format!("{verb} {label} via {}", outcome.via),
+                Some(outcome.detail.clone()),
+                outcome.ok,
+            )
+            .await;
+
+        let status = if outcome.ok {
+            StatusCode::OK
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, Json(serde_json::json!(outcome)))
+    }
+
     async fn handle_rescan(State(state): State<Arc<SharedState>>) -> impl IntoResponse {
         *state.claude_cache.write().await = None;
         *state.flutter_cache.write().await = None;
@@ -962,7 +2495,14 @@ mod server {
         State(state): State<Arc<SharedState>>,
         Query(params): Query<std::collections::HashMap<String, String>>,
     ) -> Json<serde_json::Value> {
-        let flutter_pid: Option<u32> = params.get("pid").and_then(|s| s.parse().ok());
+        let requested_pid: Option<u32> = params.get("pid").and_then(|s| s.parse().ok());
+        let apps = flutter_apps_snapshot(&state).await;
+        let flutter_pid = requested_pid.or_else(|| {
+            let app_id = params.get("app_id")?;
+            apps.iter()
+                .find(|app| app.app_id.as_ref() == Some(app_id))
+                .map(|app| app.pid)
+        });
         let assocs = state.associations.read().await;
 
         // Prefer an exact pid match. If that fails (e.g. the app relaunched with
@@ -1003,6 +2543,14 @@ mod server {
                 } else {
                     sid.clone()
                 }
+            } else if sid.starts_with("sess:") || sid.starts_with("chan:") {
+                // A linked agent session: show the name the TUI shows, so the
+                // app's status chip and the TUI agree on what it's linked to.
+                discover_agent_sessions()
+                    .iter()
+                    .find(|session| &session.entry_id() == sid)
+                    .map(|session| session.label())
+                    .unwrap_or_else(|| sid.clone())
             } else {
                 // For cmux surfaces, use the last component of the surface id.
                 sid[..8.min(sid.len())].to_string()
@@ -1024,6 +2572,10 @@ mod server {
 
     async fn serve_ui() -> Html<&'static str> {
         Html(include_str!("../static/index.html"))
+    }
+
+    async fn get_health() -> Json<serde_json::Value> {
+        Json(serde_json::json!({"ok": true}))
     }
 
     // ── Web channel (React clients) ─────────────────────────────────────
@@ -1203,8 +2755,10 @@ mod server {
 
         Router::new()
             .route("/", get(serve_ui))
+            .route("/api/health", get(get_health))
             .route("/api/claude-processes", get(get_claude_processes))
             .route("/api/flutter-apps", get(get_flutter_apps))
+            .route("/api/peers", get(get_peers))
             .route("/api/desktop-target", get(get_desktop_target))
             .route("/api/cmux-surfaces", get(get_cmux_surfaces))
             .route(
@@ -1218,13 +2772,21 @@ mod server {
             .route("/api/flush", post(handle_flush))
             .route("/api/focus-surface", post(handle_focus_surface))
             .route("/api/focus-app", post(handle_focus_app))
+            .route("/api/hot-reload", post(handle_hot_reload))
             .route("/api/test-send", post(handle_test_send))
             .route("/api/register-channel", post(handle_register_channel))
+            .route("/api/agents", get(get_agents))
             .route("/api/rescan", post(handle_rescan))
             .route("/api/status", get(get_status))
             .route("/api/logs", get(get_activity_log))
             .route("/api/trm-debug", get(get_trm_debug))
             .route("/ws", get(handle_web_socket))
+            .route("/flan.js", get(watch::serve_flan_js))
+            .route(
+                "/api/watch-ports",
+                get(watch::get_watched_ports).post(watch::post_watched_port),
+            )
+            .route("/api/watch-ports/{port}", delete(watch::delete_watched_port))
             .route(
                 "/api/web-messages",
                 get(get_web_messages).post(post_web_message),
@@ -1257,6 +2819,25 @@ pub fn flan_dir() -> PathBuf {
     let p = PathBuf::from(home).join(".flan");
     std::fs::create_dir_all(&p).ok();
     p
+}
+
+pub fn load_remote_apps(path: &PathBuf) -> HashMap<String, (Instant, FlutterApp)> {
+    let apps: Vec<FlutterApp> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    // The clock restarts with the process: how long ago an app last flushed
+    // isn't worth persisting, and starting the window fresh is the forgiving
+    // choice for something a user has linked.
+    apps.into_iter()
+        .filter_map(|app| Some((app.app_id.clone()?, (Instant::now(), app))))
+        .collect()
+}
+
+pub fn save_remote_apps(path: &PathBuf, apps: &[FlutterApp]) {
+    if let Ok(json) = serde_json::to_string_pretty(apps) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 pub fn load_associations(path: &PathBuf) -> Vec<Association> {
@@ -1449,6 +3030,7 @@ pub fn discover_flutter_apps() -> Vec<FlutterApp> {
 
         let device = extract_device_flag(line);
         let web_port = extract_web_port(line);
+        let app_id = extract_flan_app_id(line);
         let cwd = get_process_cwd(pid);
         let folder_name = cwd.rsplit('/').next().unwrap_or(&cwd).to_string();
         let vm_uri = probe_vm_service_uri(pid);
@@ -1466,10 +3048,458 @@ pub fn discover_flutter_apps() -> Vec<FlutterApp> {
             queue_count: peek.queue_count,
             connected: peek.connected,
             web_port,
+            app_id,
+            // Discovered from this machine's process table, so it is here.
+            host: None,
         });
     }
 
     apps
+}
+
+// ── Discovery: Peer hosts ───────────────────────────────────────────────
+//
+// `discover_flutter_apps` reads THIS machine's process table, so an app running
+// on the build host is invisible to it. The remote-app registry is not a
+// substitute: an app lands there only when it *flushes*, which means an app that
+// is running but hasn't been talked to yet has no row at all, and the row it
+// does get is a stub — pid 0, no cwd, no device.
+//
+// Each host already runs a flan server with a complete local view of itself.
+// Asking it is the only way to list what is actually running there.
+
+/// How long to wait on a peer before giving up on it this cycle. Discovery runs
+/// on a 5-second tick, so a peer that is down must cost a fraction of that, not
+/// a whole cycle.
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
+const PEER_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Relaying a flush is slower than reading a list — the peer has to resolve a
+/// link and hand the message to an agent's channel before it answers — and it
+/// happens on a user action rather than a timer, so it gets longer than a poll.
+const PEER_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a peer's last good answer keeps being shown after the peer stops
+/// answering. A 5-second poll over a LAN or a tailnet drops the occasional
+/// request, and without a grace period every drop blinks every remote row out
+/// of the list and back.
+const PEER_GRACE: Duration = Duration::from_secs(45);
+
+fn peers_path() -> PathBuf {
+    flan_dir().join("peers.json")
+}
+
+/// Other flan servers to ask about their Flutter apps.
+///
+/// From `~/.flan/peers.json` (a JSON array of base URLs) plus `FLAN_PEERS` as a
+/// comma-separated list, mirroring how watched ports are configured.
+pub fn load_peers() -> Vec<String> {
+    let mut peers: Vec<String> = std::fs::read_to_string(peers_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| normalize_peer(p))
+        .collect();
+    if let Ok(env) = std::env::var("FLAN_PEERS") {
+        peers.extend(parse_peer_list(&env));
+    }
+    peers.retain(|p| !is_self_peer(p));
+    peers.sort();
+    peers.dedup();
+    peers
+}
+
+/// "m1:4050, http://laptop.example:4050" → two normalized base URLs. Junk is
+/// skipped rather than fatal.
+pub fn parse_peer_list(list: &str) -> Vec<String> {
+    list.split(',').filter_map(normalize_peer).collect()
+}
+
+/// "m1" → "http://m1:4050". Accepts bare hosts, host:port, and full URLs so the
+/// config file can hold whichever the user reaches the peer by.
+pub fn normalize_peer(peer: &str) -> Option<String> {
+    let (scheme, rest) = match peer.trim().split_once("://") {
+        Some((scheme, rest)) if !scheme.is_empty() => (scheme, rest),
+        Some(_) => return None,
+        None => ("http", peer.trim()),
+    };
+    // Keep only the authority: a peer is a server, not a path.
+    let authority = rest.split('/').next().unwrap_or("").trim();
+    if authority.is_empty() {
+        return None;
+    }
+    match authority.rsplit_once(':') {
+        // A bracketed IPv6 literal with no port — the ':' found is inside it.
+        Some(_) if authority.ends_with(']') => Some(format!("{scheme}://{authority}:4050")),
+        // A port was given, so it has to be one.
+        Some((host, port)) => (!host.is_empty() && port.parse::<u16>().is_ok())
+            .then(|| format!("{scheme}://{authority}")),
+        None => Some(format!("{scheme}://{authority}:4050")),
+    }
+}
+
+/// Whether a peer URL names this very machine.
+///
+/// Polling yourself costs a round trip and, with the recursion guard in place,
+/// returns rows you already have. Cheap to notice, so notice it.
+pub fn is_self_peer(peer: &str) -> bool {
+    let Some(host) = peer_host(peer) else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+        return true;
+    }
+    // Compare the first label: peers are written as tailnet FQDNs
+    // ("m1.follow-ionian.ts.net") while `hostname -s` is the short name.
+    let label = |h: &str| h.split('.').next().unwrap_or("").to_string();
+    !host.is_empty() && label(&host) == local_hostname().to_ascii_lowercase()
+}
+
+/// The host part of a normalized peer URL, without the port.
+pub fn peer_host(peer: &str) -> Option<String> {
+    let rest = peer.split_once("://").map(|(_, r)| r).unwrap_or(peer);
+    let authority = rest.split('/').next()?;
+    // IPv6 literals are bracketed, so the last ':' is the port separator only
+    // outside the brackets.
+    let host = match authority.rfind(']') {
+        Some(end) => &authority[..=end],
+        None => authority.split(':').next()?,
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// This machine's short hostname, read once. Used for apps discovered locally,
+/// which by construction are running here.
+pub fn local_hostname() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        Command::new("hostname")
+            .arg("-s")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "local".to_string())
+    })
+    .clone()
+}
+
+/// Ask every peer what it is running, in parallel, and label the answers with
+/// the host they came from.
+pub fn discover_peer_apps(peers: &[String]) -> Vec<FlutterApp> {
+    // A peer dropped from the config must stop being reported, or the TUI keeps
+    // warning about a machine nobody asked about any more.
+    if let Ok(mut cache) = peer_cache().lock() {
+        cache.retain(|peer, _| peers.iter().any(|configured| configured == peer));
+    }
+    if peers.is_empty() {
+        return Vec::new();
+    }
+    let handles: Vec<_> = peers
+        .iter()
+        .cloned()
+        .map(|peer| std::thread::spawn(move || (peer.clone(), fetch_peer_apps(&peer))))
+        .collect();
+
+    let mut apps = Vec::new();
+    for handle in handles {
+        // A panicked fetch is one peer's problem, not discovery's.
+        let Ok((peer, fetched)) = handle.join() else {
+            continue;
+        };
+        apps.extend(remember_peer_result(&peer, fetched));
+    }
+    apps
+}
+
+/// What the last poll of a peer found.
+///
+/// Kept because an unreachable peer and a peer with nothing running produce the
+/// same empty list, and a TUI that can't tell them apart reads as broken. This
+/// is the difference between "nothing is running there" and "I couldn't ask".
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerState {
+    pub peer: String,
+    pub reachable: bool,
+    pub app_count: usize,
+    /// Seconds since this peer last answered, if it ever has.
+    pub last_ok_secs: Option<u64>,
+}
+
+struct PeerRecord {
+    /// When the peer last answered — `None` if it never has this run.
+    last_ok: Option<Instant>,
+    reachable: bool,
+    apps: Vec<FlutterApp>,
+}
+
+/// Last good answer per peer, so a dropped request doesn't blink rows away.
+fn peer_cache() -> &'static std::sync::Mutex<HashMap<String, PeerRecord>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, PeerRecord>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Every peer's last known state, for `/api/peers` and the TUI's log.
+pub fn peer_states() -> Vec<PeerState> {
+    let Ok(cache) = peer_cache().lock() else {
+        return Vec::new();
+    };
+    let mut states: Vec<PeerState> = cache
+        .iter()
+        .map(|(peer, record)| PeerState {
+            peer: peer.clone(),
+            reachable: record.reachable,
+            app_count: record.apps.len(),
+            last_ok_secs: record.last_ok.map(|at| at.elapsed().as_secs()),
+        })
+        .collect();
+    states.sort_by(|a, b| a.peer.cmp(&b.peer));
+    states
+}
+
+/// Record a successful fetch, or fall back to a recent one.
+///
+/// A peer that has been silent for longer than [PEER_GRACE] stops contributing
+/// rows — at that point we genuinely don't know what it is running, and saying
+/// nothing beats showing stale rows. The record itself is kept either way, so
+/// the peer is still reported as unreachable rather than vanishing.
+fn remember_peer_result(peer: &str, fetched: Option<Vec<FlutterApp>>) -> Vec<FlutterApp> {
+    let Ok(mut cache) = peer_cache().lock() else {
+        return fetched.unwrap_or_default();
+    };
+    match fetched {
+        Some(apps) => {
+            cache.insert(
+                peer.to_string(),
+                PeerRecord {
+                    last_ok: Some(Instant::now()),
+                    reachable: true,
+                    apps: apps.clone(),
+                },
+            );
+            apps
+        }
+        None => {
+            let record = cache.entry(peer.to_string()).or_insert_with(|| PeerRecord {
+                last_ok: None,
+                reachable: false,
+                apps: Vec::new(),
+            });
+            record.reachable = false;
+            let within_grace = record
+                .last_ok
+                .is_some_and(|at| at.elapsed() < PEER_GRACE);
+            if within_grace {
+                record.apps.clone()
+            } else {
+                record.apps.clear();
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// GET `<peer>/api/flutter-apps?local=1` and adopt the rows as remote.
+///
+/// `local=1` is what keeps two servers that list each other from recursing: the
+/// peer answers from its process table alone and never re-asks us. `host` is
+/// also forced to the peer, which drops any third-host row an older peer
+/// (one that ignores the query) would otherwise forward.
+fn fetch_peer_apps(peer: &str) -> Option<Vec<FlutterApp>> {
+    let host = peer_host(peer)?;
+    let body = peer_get(peer, "/api/flutter-apps?local=1")?;
+    let apps: Vec<FlutterApp> = serde_json::from_str(&body).ok()?;
+    Some(
+        apps.into_iter()
+            .filter(|app| app.host.is_none())
+            .map(|mut app| {
+                // A loopback VM service URI from another machine is worse than
+                // none: on this host that port belongs to something else
+                // entirely, and connecting would silently attach to it.
+                app.vm_service_uri = app.vm_service_uri.map(|uri| {
+                    uri.replace("127.0.0.1", &host)
+                        .replace("localhost", &host)
+                });
+                app.host = Some(host.clone());
+                app
+            })
+            .collect(),
+    )
+}
+
+/// Hand a flush this host can't route to a peer that might be able to.
+///
+/// Returns the peer that took it, or `None` if none did. Peers are tried in
+/// order and the first delivery wins — a message must reach one agent, not
+/// every agent on the tailnet.
+pub async fn relay_flush_to_peers<T: Serialize>(
+    body: &T,
+    peers: &[String],
+) -> Option<(String, ChannelRelayOutcome)> {
+    if peers.is_empty() {
+        return None;
+    }
+    let payload = mark_relayed(body)?;
+
+    for peer in peers {
+        let peer = peer.clone();
+        let payload = payload.clone();
+        let Ok(result) =
+            tokio::task::spawn_blocking(move || post_peer_flush(&peer, &payload)).await
+        else {
+            continue;
+        };
+        match result {
+            Ok((peer, outcome)) if outcome.accepted || outcome.delivered => {
+                return Some((peer, outcome));
+            }
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::debug!("Flush relay declined: {error}");
+                continue;
+            }
+        }
+    }
+    None
+}
+
+/// Stamp a flush payload as relayed, so the peer receiving it won't relay it on.
+///
+/// Without the stamp, two servers that list each other would hand the same
+/// message back and forth until one of them timed out.
+pub fn mark_relayed<T: Serialize>(body: &T) -> Option<String> {
+    let mut payload = serde_json::to_value(body).ok()?;
+    payload
+        .as_object_mut()?
+        .insert("relayed_from".into(), serde_json::json!(local_hostname()));
+    serde_json::to_string(&payload).ok()
+}
+
+/// POST a flush payload to one peer's `/api/flush`.
+fn post_peer_flush(peer: &str, payload: &str) -> Result<(String, ChannelRelayOutcome), String> {
+    let (status, parsed) = post_peer_json(peer, "/api/flush", payload, PEER_RELAY_TIMEOUT)?;
+    if status != 200 {
+        return Err(format!("{peer}: no linked receiver there either"));
+    }
+    Ok((
+        peer.to_string(),
+        ChannelRelayOutcome {
+            accepted: parsed["accepted"].as_bool().unwrap_or(false),
+            delivered: parsed["delivered"].as_bool().unwrap_or(false),
+        },
+    ))
+}
+
+/// POST JSON to one peer and return its status and parsed body.
+///
+/// Hand-rolled for the same reason [peer_get] is, and the read timeout is the
+/// caller's to pick: waiting for a peer to route a flush is a different wait
+/// from waiting for one to finish a hot reload, which blocks on a compile.
+fn post_peer_json(
+    peer: &str,
+    path: &str,
+    payload: &str,
+    read_timeout: Duration,
+) -> Result<(u16, serde_json::Value), String> {
+    use std::net::ToSocketAddrs;
+
+    let rest = peer.split_once("://").map(|(_, r)| r).unwrap_or(peer);
+    let authority = rest.split('/').next().unwrap_or("");
+    let addr = authority
+        .to_socket_addrs()
+        .map_err(|error| format!("{peer}: {error}"))?
+        .next()
+        .ok_or_else(|| format!("{peer}: no address"))?;
+
+    let mut stream = TcpStream::connect_timeout(&addr, PEER_CONNECT_TIMEOUT)
+        .map_err(|error| format!("{peer}: {error}"))?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|error| format!("{peer}: {error}"))?;
+    stream
+        .set_write_timeout(Some(read_timeout))
+        .map_err(|error| format!("{peer}: {error}"))?;
+
+    let request = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: {authority}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        payload.len(),
+        payload,
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("{peer}: {error}"))?;
+
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("{peer}: no HTTP status"))?;
+    let start = response
+        .find('{')
+        .ok_or_else(|| format!("{peer}: no JSON body"))?;
+    let end = response
+        .rfind('}')
+        .ok_or_else(|| format!("{peer}: incomplete JSON"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&response[start..=end])
+        .map_err(|error| format!("{peer}: {error}"))?;
+    Ok((status, parsed))
+}
+
+/// A bounded blocking GET against a peer, returning the response body.
+///
+/// Hand-rolled for the same reason [relay_channel_flush] is: one small hop
+/// doesn't justify a general-purpose HTTP client dependency, and the timeouts
+/// here have to be tight enough that a dead peer can't stall a discovery tick.
+fn peer_get(peer: &str, path: &str) -> Option<String> {
+    use std::net::ToSocketAddrs;
+
+    let rest = peer.split_once("://").map(|(_, r)| r).unwrap_or(peer);
+    let authority = rest.split('/').next()?;
+    let addr = authority
+        .to_socket_addrs()
+        .ok()?
+        .next()?;
+
+    let mut stream = TcpStream::connect_timeout(&addr, PEER_CONNECT_TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(PEER_READ_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(PEER_READ_TIMEOUT)).ok()?;
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+
+    let mut response = String::new();
+    // A read timeout surfaces as an error AFTER some bytes may have arrived, so
+    // a partial body is still worth parsing.
+    let _ = stream.read_to_string(&mut response);
+
+    let status_ok = response
+        .lines()
+        .next()
+        .is_some_and(|line| line.split_whitespace().nth(1) == Some("200"));
+    if !status_ok {
+        tracing::debug!("Peer {peer} returned a non-200 response for {path}");
+        return None;
+    }
+    // The body is a JSON array; isolating it handles both Content-Length and
+    // chunked framing without parsing HTTP properly.
+    let start = response.find('[')?;
+    let end = response.rfind(']')?;
+    (start <= end).then(|| response[start..=end].to_string())
 }
 
 pub fn has_listening_ports(pid: u32) -> bool {
@@ -1514,6 +3544,30 @@ pub fn extract_web_port(cmd_line: &str) -> Option<u16> {
     None
 }
 
+/// Parse the stable app identity supplied to Flutter as a Dart define.
+pub fn extract_flan_app_id(cmd_line: &str) -> Option<String> {
+    let parts: Vec<&str> = cmd_line.split_whitespace().collect();
+    for (index, part) in parts.iter().enumerate() {
+        if let Some(value) = part.strip_prefix("--dart-define=FLAN_APP_ID=") {
+            return non_empty_cli_value(value);
+        }
+        if *part == "--dart-define" {
+            if let Some(value) = parts
+                .get(index + 1)
+                .and_then(|next| next.strip_prefix("FLAN_APP_ID="))
+            {
+                return non_empty_cli_value(value);
+            }
+        }
+    }
+    None
+}
+
+fn non_empty_cli_value(value: &str) -> Option<String> {
+    let cleaned = value.trim_matches(['\'', '"']);
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
 /// Extract the port from a web origin like "http://localhost:5005" or
 /// "http://127.0.0.1:5005/". Returns None if no explicit port is present.
 pub fn parse_origin_port(origin: &str) -> Option<u16> {
@@ -1523,6 +3577,25 @@ pub fn parse_origin_port(origin: &str) -> Option<u16> {
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
     // Port is after the last ':'.
     authority.rsplit(':').next().and_then(|p| p.parse().ok())
+}
+
+/// The host out of a browser origin: `http://m1.follow-ionian.ts.net:5105` →
+/// `m1.follow-ionian.ts.net`. Returns `None` for a loopback origin, which
+/// names no machine worth showing.
+pub fn parse_origin_host(origin: &str) -> Option<String> {
+    let after_scheme = origin.split("://").nth(1).unwrap_or(origin);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Strip the port. Split from the left: an IPv6 literal is bracketed, and
+    // everything else has at most one colon.
+    let host = match authority.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !h.is_empty() => h,
+        _ => authority,
+    };
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if host.is_empty() || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        return None;
+    }
+    Some(host.to_string())
 }
 
 pub fn probe_vm_service_uri(pid: u32) -> Option<String> {
@@ -1681,6 +3754,440 @@ pub fn port_is_live(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelRelayOutcome {
+    pub accepted: bool,
+    pub delivered: bool,
+}
+
+pub fn channel_port_for_cwd(
+    registered_ports: &HashMap<String, u16>,
+    app_cwd: &str,
+) -> Option<u16> {
+    let app = app_cwd.trim_end_matches('/');
+    registered_ports
+        .iter()
+        .filter_map(|(registered_cwd, port)| {
+            let registered = registered_cwd.trim_end_matches('/');
+            (registered == app
+                || registered.starts_with(&format!("{app}/"))
+                || app.starts_with(&format!("{registered}/")))
+                .then_some((registered.len(), *port))
+        })
+        .max_by_key(|(specificity, _)| *specificity)
+        .map(|(_, port)| port)
+}
+
+/// Forward one message batch to a loopback-only flan-channel.
+///
+/// The public client talks only to the stable Rust server. Keeping this hop on
+/// loopback avoids exposing per-agent channel ports to browsers or the tailnet.
+// ── Delivery: Codex ─────────────────────────────────────────────────────
+//
+// A link to a Codex session can't be served by the flan-channel: that is
+// Claude Code's `notifications/claude/channel` protocol, and a channel
+// started under Codex refuses to push into it. Codex does take input from
+// outside, though — `codex queue --thread <id> --message <text>` appends a
+// user turn to a live thread through the app-server's control socket. The
+// thread id is read off the rollout file the Codex process keeps open.
+
+/// The thread id embedded in a Codex rollout path, e.g.
+/// `~/.codex/sessions/2026/09/07/rollout-2026-09-07T21-29-32-01a07f47-471e-7122-a0e9-8efe01dd2268.jsonl`.
+pub fn codex_thread_from_rollout_path(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next()?;
+    let stem = name.strip_suffix(".jsonl")?.strip_prefix("rollout-")?;
+    if stem.len() < 36 || !stem.is_char_boundary(stem.len() - 36) {
+        return None;
+    }
+    let uuid = &stem[stem.len() - 36..];
+    let shape_ok = uuid.split('-').map(str::len).eq([8, 4, 4, 4, 12]);
+    let hex_ok = uuid.chars().all(|c| c == '-' || c.is_ascii_hexdigit());
+    (shape_ok && hex_ok).then(|| uuid.to_string())
+}
+
+/// Threads a Codex process currently has open, most recently written first.
+///
+/// A TUI holds exactly one. An app-server (VS Code, the desktop app) holds
+/// one per live thread, and the freshest is the one being worked in.
+pub fn codex_threads_for_pid(pid: u32) -> Vec<String> {
+    let Ok(out) = Command::new("lsof")
+        .args(["-p", &pid.to_string(), "-Fn"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for line in text.lines() {
+        let Some(path) = line.strip_prefix('n') else { continue };
+        let Some(thread) = codex_thread_from_rollout_path(path) else { continue };
+        if found.iter().any(|(_, seen)| seen == &thread) {
+            continue;
+        }
+        let modified = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        found.push((modified, thread));
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, thread)| thread).collect()
+}
+
+fn is_codex_comm(comm: &str) -> bool {
+    agent_name_from_comm(comm) == Some("Codex")
+}
+
+/// Nearest Codex process at or below `root` in the process tree.
+fn codex_descendant_in(
+    procs: &HashMap<u32, (u32, String, String)>,
+    root: u32,
+) -> Option<u32> {
+    if procs.get(&root).is_some_and(|(_, _, comm)| is_codex_comm(comm)) {
+        return Some(root);
+    }
+    let mut frontier = vec![root];
+    for _ in 0..8 {
+        let mut next = Vec::new();
+        for parent in &frontier {
+            for (pid, (ppid, _, comm)) in procs {
+                if ppid == parent {
+                    if is_codex_comm(comm) {
+                        return Some(*pid);
+                    }
+                    next.push(*pid);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// The Codex process behind a link target, if the target is one.
+///
+/// `sess:<pid>` names the agent directly. `trm:<pane_id>` names a pane; its
+/// login process is the root of everything running there, so Codex is found
+/// underneath it. Any other id form (a cmux surface, the `cwd-route`
+/// sentinel) carries no process to resolve.
+pub fn codex_pid_for_target(target: &str) -> Option<u32> {
+    let procs = process_table();
+    if let Some(pid) = target.strip_prefix("sess:") {
+        let pid: u32 = pid.parse().ok()?;
+        return procs
+            .get(&pid)
+            .filter(|(_, _, comm)| is_codex_comm(comm))
+            .map(|_| pid);
+    }
+    if let Some(pane_id) = target.strip_prefix("trm:") {
+        let pane_id: usize = pane_id.parse().ok()?;
+        let pane = discover_trm_panes()
+            .into_iter()
+            .find(|p| p.pane_id == pane_id)?;
+        return codex_descendant_in(&procs, pane.login_pid?);
+    }
+    None
+}
+
+/// Where the `codex` CLI lives. The server is often started from a launcher
+/// whose PATH lacks `~/.local/bin`, so the usual install spots are checked
+/// too. `FLAN_CODEX_BIN` overrides everything.
+pub fn codex_binary() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("FLAN_CODEX_BIN") {
+        return PathBuf::from(explicit);
+    }
+    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).map(|dir| dir.join("codex")).collect())
+        .unwrap_or_default();
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".local/bin/codex"));
+        candidates.push(home.join(".codex/packages/standalone/current/bin/codex"));
+        candidates.push(home.join(".codex/packages/standalone/current/codex"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/codex"));
+    candidates.push(PathBuf::from("/usr/local/bin/codex"));
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("codex"))
+}
+
+/// Decode standard or URL-safe base64, ignoring whitespace and a leading
+/// `data:...;base64,` prefix. Small enough not to be worth a dependency.
+pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let payload = input
+        .find(";base64,")
+        .map(|at| &input[at + ";base64,".len()..])
+        .unwrap_or(input);
+    let mut out = Vec::with_capacity(payload.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u8;
+    for c in payload.bytes() {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Render a flushed batch as the text `codex queue` hands the thread.
+///
+/// The Claude channel formats the same fields on the Dart side and carries
+/// the VM URI as an attribute; Codex gets plain text, so the URI goes in the
+/// body along with what to do with it. Screenshots are decoded to PNG files
+/// that get attached to the queued turn and named in the text.
+pub fn format_codex_message(
+    messages: &[serde_json::Value],
+    vm_uri: Option<&str>,
+    flutter_pid: Option<u32>,
+) -> (String, Vec<PathBuf>) {
+    let mut out = String::new();
+    let mut images = Vec::new();
+
+    out.push_str("[flan] Message from the linked Flutter app, relayed by the Flan TUI.\n");
+    match vm_uri {
+        Some(uri) => out.push_str(&format!(
+            "vm_service_uri: {uri}\nIf you are not already connected to this app, call the \
+             flan `connect` tool with that URI first, then act on the message.\n"
+        )),
+        None => out.push_str(
+            "No VM service URI is attached; use the flan `list_apps` tool to find the app \
+             if you need to connect.\n",
+        ),
+    }
+    if let Some(pid) = flutter_pid {
+        out.push_str(&format!("flutter_pid: {pid}\n"));
+    }
+
+    let total = messages.len();
+    for (index, msg) in messages.iter().enumerate() {
+        if total > 1 {
+            out.push_str(&format!("\n--- message {} of {total} ---\n", index + 1));
+        } else {
+            out.push('\n');
+        }
+        let text = msg["text"].as_str().unwrap_or("");
+        let kind = msg["type"].as_str().unwrap_or("message");
+        if let Some(ts) = msg["timestamp"].as_str().filter(|t| !t.is_empty()) {
+            out.push_str(&format!("[{ts}]\n"));
+        }
+        if kind != "user_feedback" {
+            out.push_str(&format!("type: {kind}\n"));
+        }
+        out.push_str(text);
+        out.push('\n');
+
+        let Some(data) = msg["data"].as_object() else { continue };
+        for (key, label) in [
+            ("url", "URL"),
+            ("routeStack", "Route stack"),
+            ("currentRoute", "Current route"),
+        ] {
+            if let Some(value) = data.get(key).and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                out.push_str(&format!("{label}: {value}\n"));
+            }
+        }
+        if let Some(selection) = data.get("inspectorSelection").and_then(|v| v.as_object()) {
+            out.push_str("Inspector selection:\n");
+            for (key, label) in [
+                ("widgetType", "Widget type"),
+                ("widgetPath", "Widget path"),
+                ("sourceLocation", "Source"),
+                ("bounds", "Bounds"),
+            ] {
+                if let Some(value) = selection.get(key).filter(|v| !v.is_null()) {
+                    let shown = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
+                    out.push_str(&format!("  {label}: {shown}\n"));
+                }
+            }
+            if let Some(props) = selection.get("properties").filter(|v| !v.is_null()) {
+                out.push_str(&format!("  Properties: {props}\n"));
+            }
+        }
+        if let Some(annotations) = data.get("annotations").and_then(|v| v.as_array()) {
+            if !annotations.is_empty() {
+                out.push_str(&format!("Annotations: {}\n", serde_json::Value::Array(annotations.clone())));
+            }
+        }
+        if let Some(turns) = data.get("turns").or_else(|| data.get("chatLog")).and_then(|v| v.as_array()) {
+            if !turns.is_empty() {
+                out.push_str(&format!("Chat log: {}\n", serde_json::Value::Array(turns.clone())));
+            }
+        }
+        if let Some(encoded) = data.get("screenshot").and_then(|v| v.as_str()) {
+            match write_codex_image(encoded, index) {
+                Some(path) => {
+                    out.push_str(&format!("Screenshot: {} (attached)\n", path.display()));
+                    images.push(path);
+                }
+                None => out.push_str("Screenshot: attached image could not be decoded\n"),
+            }
+        }
+    }
+
+    (out, images)
+}
+
+/// Persist a base64 screenshot as a PNG the `codex queue --image` flag can
+/// read. Files live under `~/.flan/codex-images` so they outlive the request.
+fn write_codex_image(encoded: &str, index: usize) -> Option<PathBuf> {
+    let bytes = decode_base64(encoded).filter(|b| !b.is_empty())?;
+    let dir = flan_dir().join("codex-images");
+    std::fs::create_dir_all(&dir).ok()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("flan-{stamp}-{index}.png"));
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
+}
+
+/// Run a command, killing it if it outlives `timeout`. `codex queue` should
+/// return at once; a wedged app-server must not hang the flush handler.
+fn run_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("timed out after {}s", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Append a user turn to a live Codex thread with `codex queue`.
+///
+/// `--remote unix://` reaches the app-server over its default control socket,
+/// which is the one both the TUI and app-server-hosted threads hang off. When
+/// attachments are refused the text is re-sent alone rather than dropped.
+pub fn relay_codex_queue(
+    thread: &str,
+    message: &str,
+    images: &[PathBuf],
+) -> Result<ChannelRelayOutcome, String> {
+    let bin = codex_binary();
+    let build = |with_images: bool| {
+        let mut cmd = Command::new(&bin);
+        cmd.args(["queue", "--remote", "unix://", "--thread", thread, "--message", message]);
+        if with_images {
+            for image in images {
+                cmd.arg("--image").arg(image);
+            }
+        }
+        cmd
+    };
+    let timeout = Duration::from_secs(20);
+    let mut output = run_with_timeout(build(!images.is_empty()), timeout)
+        .map_err(|error| format!("Could not run {}: {error}", bin.display()))?;
+    if !output.status.success() && !images.is_empty() {
+        output = run_with_timeout(build(false), timeout)
+            .map_err(|error| format!("Could not run {}: {error}", bin.display()))?;
+    }
+    if output.status.success() {
+        return Ok(ChannelRelayOutcome { accepted: true, delivered: true });
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = stderr.trim().lines().last().or_else(|| stdout.trim().lines().last())
+        .unwrap_or("no output")
+        .to_string();
+    Err(format!("codex queue failed ({}): {detail}", output.status))
+}
+
+pub fn relay_channel_flush(
+    port: u16,
+    payload: &str,
+) -> Result<ChannelRelayOutcome, String> {
+    let address = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|error| format!("Invalid Flan channel address: {error}"))?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+        .map_err(|error| format!("Flan channel is unavailable: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("Could not configure Flan channel read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("Could not configure Flan channel write timeout: {error}"))?;
+
+    let request = format!(
+        "POST /flush HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        payload.len(),
+        payload,
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("Could not write to Flan channel: {error}"))?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("Could not read Flan channel response: {error}"))?;
+    let status_ok = response
+        .lines()
+        .next()
+        .is_some_and(|line| line.split_whitespace().nth(1) == Some("200"));
+    if !status_ok {
+        let error = response.find('{').zip(response.rfind('}'))
+            .and_then(|(start, end)| serde_json::from_str::<serde_json::Value>(
+                &response[start..=end]).ok())
+            .and_then(|body| body["error"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "Flan channel returned a non-success response".into());
+        return Err(error);
+    }
+
+    // Dart's HttpServer may use either Content-Length or chunked encoding.
+    // Isolating the outermost JSON object handles both without exposing a
+    // general-purpose HTTP client dependency for this local-only hop.
+    let start = response
+        .find('{')
+        .ok_or_else(|| "Flan channel returned no JSON body".to_string())?;
+    let end = response
+        .rfind('}')
+        .ok_or_else(|| "Flan channel returned incomplete JSON".to_string())?;
+    let body: serde_json::Value = serde_json::from_str(&response[start..=end])
+        .map_err(|error| format!("Invalid Flan channel response: {error}"))?;
+
+    Ok(ChannelRelayOutcome {
+        accepted: body["accepted"].as_bool().unwrap_or(false)
+            || body["ok"].as_bool().unwrap_or(false),
+        delivered: body["delivered"].as_bool().unwrap_or(false),
+    })
+}
+
 pub fn probe_port(port: u16) -> Option<String> {
     let addr = format!("127.0.0.1:{}", port);
     let mut stream =
@@ -1736,40 +4243,46 @@ pub fn peek_flan_queue(ws_uri: &str) -> usize {
 /// Call ext.flutter.flan.peekUserMessages via the VM service WebSocket and
 /// return the queue count and live listening state. Returns the default
 /// (count 0, not listening) if unreachable / extension not registered.
-pub fn peek_flan(ws_uri: &str) -> FlanPeek {
+/// Open a VM service WebSocket, with every step bounded by a timeout.
+///
+/// We do NOT use tungstenite's `connect()` helper because it has no
+/// connect/read timeout — a VM service that accepts the TCP connection but
+/// never completes the handshake or never replies (seen with native macOS apps
+/// whose auth-gated port stalls) would block `read()` forever, hanging the
+/// entire discovery cycle and taking down /api/flutter-apps. Instead, open the
+/// TCP stream with connect_timeout, set a read timeout so every read is
+/// bounded, then run the WS handshake on it.
+///
+/// `read` is separate from `connect` because the two have nothing to do with
+/// each other: reaching a VM service should take milliseconds, while waiting
+/// for it to finish a hot reload can take seconds.
+fn connect_vm_service(
+    ws_uri: &str,
+    connect: Duration,
+    read: Duration,
+) -> Option<tungstenite::WebSocket<TcpStream>> {
     use std::net::ToSocketAddrs;
-    use tungstenite::Message;
 
-    let timeout = Duration::from_secs(3);
-
-    // Connect with bounded timeouts. We do NOT use tungstenite's `connect()`
-    // helper because it has no connect/read timeout — a VM service that accepts
-    // the TCP connection but never completes the handshake or never replies
-    // (seen with native macOS apps whose auth-gated port stalls) would block
-    // `read()` forever, hanging the entire discovery cycle and taking down
-    // /api/flutter-apps. Instead, open the TCP stream with connect_timeout, set
-    // a read timeout so every read is bounded, then run the WS handshake on it.
-    //
     // ws_uri looks like ws://127.0.0.1:PORT/TOKEN/ws
     let host_port = ws_uri
         .trim_start_matches("ws://")
         .split('/')
         .next()
         .unwrap_or("");
-    let addr = match host_port.to_socket_addrs().ok().and_then(|mut a| a.next()) {
-        Some(a) => a,
-        None => return FlanPeek::default(),
-    };
-    let tcp = match TcpStream::connect_timeout(&addr, timeout) {
-        Ok(s) => s,
-        Err(_) => return FlanPeek::default(),
-    };
-    if tcp.set_read_timeout(Some(timeout)).is_err() {
+    let addr = host_port.to_socket_addrs().ok()?.next()?;
+    let tcp = TcpStream::connect_timeout(&addr, connect).ok()?;
+    tcp.set_read_timeout(Some(read)).ok()?;
+    let (socket, _) = tungstenite::client(ws_uri, tcp).ok()?;
+    Some(socket)
+}
+
+pub fn peek_flan(ws_uri: &str) -> FlanPeek {
+    use tungstenite::Message;
+
+    let timeout = Duration::from_secs(3);
+
+    let Some(mut socket) = connect_vm_service(ws_uri, timeout, timeout) else {
         return FlanPeek::default();
-    }
-    let (mut socket, _) = match tungstenite::client(ws_uri, tcp) {
-        Ok(v) => v,
-        Err(_) => return FlanPeek::default(),
     };
 
     // 1. Get the isolate id.
@@ -1839,6 +4352,579 @@ pub fn peek_flan(ws_uri: &str) -> FlanPeek {
             Ok(_) => continue,
             Err(_) => return FlanPeek::default(),
         }
+    }
+}
+
+// ── Hot reload ──────────────────────────────────────────────────────────
+//
+// Two ways in, and which one is right depends on what we know about the app.
+//
+// The signal is the cheap one: `flutter run`'s TerminalHandler installs
+// handlers for SIGUSR1 (hot reload) and SIGUSR2 (hot restart), and
+// `flutter run --pid-file` documents them as the supported way for another
+// process to ask. It is one syscall against a pid discovery already has, needs
+// no handshake, and still works when a VM service port accepts a connection and
+// then stalls — the auth-gated native-macOS case `peek_flan` guards against.
+// What it cannot do is tell us anything: flutter_tools prints the compile errors
+// in its own terminal and answers nobody.
+//
+// The VM service is the one that answers. flutter_tools registers its reload
+// under a service name on the VM service, and invoking that returns success or
+// the reason it failed. It is also the only option for an app we have a URI for
+// but no local `flutter run` pid.
+//
+// An app on another machine is neither: only that host's own flan server can
+// see its pid, and its loopback VM service port means nothing here. That one
+// gets handed to the peer, the same way a flush it can't route is.
+
+/// How long to wait for flutter_tools' verdict on a reload. A reload compiles
+/// and pushes a kernel delta, and the first one of a session is routinely a few
+/// seconds; this is the point at which we stop believing an answer is coming.
+const RELOAD_VERDICT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// What a hot reload request did, in words a caller can show as-is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotReloadOutcome {
+    pub ok: bool,
+    /// How it was asked: "signal", the VM service method, or `host:via` for one
+    /// a peer carried out.
+    pub via: String,
+    pub detail: String,
+}
+
+/// The flutter_tools service that performs each kind of reload.
+fn reload_service_name(full_restart: bool) -> &'static str {
+    if full_restart {
+        "hotRestart"
+    } else {
+        "reloadSources"
+    }
+}
+
+/// How to name each kind of reload in a log line or a toast.
+fn reload_verb(full_restart: bool) -> &'static str {
+    if full_restart {
+        "Hot restart"
+    } else {
+        "Hot reload"
+    }
+}
+
+/// The full command line of `pid`, or None if it is gone.
+pub fn process_command_line(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!cmd.is_empty()).then_some(cmd)
+}
+
+/// Whether a `flutter run` command line is one that installed the SIGUSR
+/// handlers.
+///
+/// This matters more than it looks: the default disposition of SIGUSR1 is to
+/// TERMINATE the process. flutter_tools installs its handlers only when the run
+/// is resident and the device supports both the service protocol and restart, so
+/// a `--release` or `--profile` run — or one started `--no-resident` — would be
+/// killed by the very signal meant to reload it. Decide from the command line,
+/// never from the pid alone.
+pub fn command_line_accepts_reload_signal(cmd: &str) -> bool {
+    cmd.contains("flutter_tools.snapshot")
+        && cmd.contains(" run")
+        && !cmd.contains("--release")
+        && !cmd.contains("--profile")
+        && !cmd.contains("--no-resident")
+        && !cmd.contains("--trace-startup")
+}
+
+/// Whether `pid` is a `flutter run` that can be signalled for a reload.
+pub fn accepts_reload_signal(pid: u32) -> bool {
+    pid != 0
+        && process_command_line(pid)
+            .is_some_and(|cmd| command_line_accepts_reload_signal(&cmd))
+}
+
+/// SIGUSR1 asks a `flutter run` for a hot reload, SIGUSR2 for a hot restart.
+///
+/// The target is the TOOL process — the `dart … flutter_tools.snapshot run` that
+/// owns the incremental compiler — which is exactly what [discover_flutter_apps]
+/// records as `FlutterApp::pid`. Signalling the app process instead does
+/// nothing; on most devices it isn't even on this machine.
+///
+/// Call [accepts_reload_signal] first. This function only delivers the signal.
+pub fn hot_reload_signal(pid: u32, full_restart: bool) -> bool {
+    let sig = if full_restart {
+        libc::SIGUSR2
+    } else {
+        libc::SIGUSR1
+    };
+    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, sig) } == 0
+}
+
+/// One read of a VM service socket: a text frame, nothing yet, or done for.
+enum VmFrame {
+    Text(String),
+    /// Nothing to act on — a non-text frame, or the read slice simply elapsed.
+    Idle,
+    Failed(String),
+}
+
+/// Read one frame, treating a read timeout as "not yet" rather than a failure.
+///
+/// The socket's read timeout is a slice, not the budget: each loop below keeps
+/// its own deadline. Conflating the two is how waiting for a service
+/// registration that never came reported "Resource temporarily unavailable"
+/// instead of saying which service was missing.
+fn read_vm_frame(socket: &mut tungstenite::WebSocket<TcpStream>) -> VmFrame {
+    match socket.read() {
+        Ok(tungstenite::Message::Text(text)) => VmFrame::Text(text.to_string()),
+        Ok(_) => VmFrame::Idle,
+        Err(tungstenite::Error::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            VmFrame::Idle
+        }
+        Err(error) => VmFrame::Failed(format!("VM service read failed: {error}")),
+    }
+}
+
+/// How long one read of a VM service socket may block before the loop around it
+/// gets to re-check its own deadline.
+const VM_READ_SLICE: Duration = Duration::from_secs(1);
+
+/// Ask flutter_tools to reload over the VM service, and wait for its verdict.
+///
+/// The VM's own `reloadSources` RPC is not a substitute: a Flutter app's VM has
+/// no compiler, so nothing would recompile the edited sources. What does the
+/// work is the service flutter_tools REGISTERS under that name, which the VM
+/// service exposes to other clients under a per-client prefix
+/// (`s0.reloadSources`). That prefix is only learnable from a `ServiceRegistered`
+/// event on the `_Service` stream, which is replayed to each client as it
+/// subscribes — hence subscribe first, then watch for the name.
+pub fn hot_reload_via_vm_service(ws_uri: &str, full_restart: bool) -> Result<(), String> {
+    use tungstenite::Message;
+
+    let service = reload_service_name(full_restart);
+    let mut socket = connect_vm_service(ws_uri, Duration::from_secs(3), VM_READ_SLICE)
+        .ok_or_else(|| format!("VM service unreachable at {ws_uri}"))?;
+
+    let subscribe = serde_json::json!({
+        "jsonrpc": "2.0", "id": "1",
+        "method": "streamListen",
+        "params": {"streamId": "_Service"},
+    })
+    .to_string();
+    let get_vm = serde_json::json!({
+        "jsonrpc": "2.0", "id": "2", "method": "getVM",
+    })
+    .to_string();
+    for request in [subscribe, get_vm] {
+        socket
+            .send(Message::Text(request.into()))
+            .map_err(|error| format!("VM service write failed: {error}"))?;
+    }
+
+    // The isolate id and the prefixed method arrive on different messages, in
+    // no guaranteed order.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut isolate_id: Option<String> = None;
+    let mut method: Option<String> = None;
+    while isolate_id.is_none() || method.is_none() {
+        if Instant::now() > deadline {
+            break;
+        }
+        match read_vm_frame(&mut socket) {
+            VmFrame::Text(text) => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if value["id"] == "2" {
+                    isolate_id = value["result"]["isolates"][0]["id"]
+                        .as_str()
+                        .map(str::to_string);
+                }
+                let event = &value["params"]["event"];
+                if event["kind"] == "ServiceRegistered" && event["service"] == service {
+                    method = event["method"].as_str().map(str::to_string);
+                }
+            }
+            VmFrame::Idle => continue,
+            VmFrame::Failed(error) => return Err(error),
+        }
+    }
+
+    let isolate_id =
+        isolate_id.ok_or_else(|| format!("VM service at {ws_uri} reported no isolate"))?;
+    let method = method.ok_or_else(|| {
+        format!(
+            "No `{service}` service on this VM service — a {} needs a resident \
+             `flutter run` attached in debug mode",
+            reload_verb(full_restart).to_lowercase()
+        )
+    })?;
+
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": "3",
+        "method": method,
+        // `reloadSources` requires the isolate; `hotRestart` ignores it.
+        "params": {"isolateId": isolate_id},
+    })
+    .to_string();
+    socket
+        .send(Message::Text(call.into()))
+        .map_err(|error| format!("VM service write failed: {error}"))?;
+
+    let deadline = Instant::now() + RELOAD_VERDICT_TIMEOUT;
+    loop {
+        if Instant::now() > deadline {
+            return Err(format!(
+                "flutter_tools did not answer within {}s",
+                RELOAD_VERDICT_TIMEOUT.as_secs()
+            ));
+        }
+        match read_vm_frame(&mut socket) {
+            VmFrame::Text(text) => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if value["id"] != "3" {
+                    continue;
+                }
+                let _ = socket.close(None);
+                if value["result"]["type"] == "Success" {
+                    return Ok(());
+                }
+                // A compile failure comes back as a JSON-RPC error, and its
+                // message is the only account of what is wrong with the code.
+                return Err(value["error"]["message"]
+                    .as_str()
+                    .or_else(|| value["error"]["data"]["details"].as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string()));
+            }
+            VmFrame::Idle => continue,
+            VmFrame::Failed(error) => return Err(error),
+        }
+    }
+}
+
+// ── Reading the tool's own verdict ──────────────────────────────────────
+//
+// A signal has no reply channel, so flutter_tools answers nobody: it prints
+// "Restarted application in 223ms." — or three pages of compile errors — to its
+// own stdout and carries on. That used to be the end of it, and an app whose
+// restart never happened was told "Hot restart requested".
+//
+// But `flutter run` under `wt` (and under nohup, and under systemd) has its
+// stdout on a FILE, and a file can be read. Note its length before signalling,
+// then watch what gets appended. When stdout is a TTY or a pipe there is
+// nothing to read and the old wording stands — which is the honest answer in
+// that case rather than a worse one.
+
+/// How long to wait for a `flutter run` to say what happened. A restart of a
+/// large web app took ~5s on the build host; past this we stop claiming to know.
+const SIGNAL_VERDICT_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// What a `flutter run` said about the reload it was just asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolVerdict {
+    /// It finished, in its own words ("Restarted application in 223ms.").
+    Done(String),
+    /// It refused or failed, in its own words (the first compile error).
+    Failed(String),
+    /// It said nothing we recognise before the deadline.
+    Silent,
+}
+
+/// Where a process's stdout goes, when it goes to a regular file.
+///
+/// `/proc` on Linux, `lsof` on macOS, and `None` for a TTY, a pipe or anything
+/// else we can't read a verdict from.
+pub fn process_stdout_file(pid: u32) -> Option<PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    let proc_fd = PathBuf::from(format!("/proc/{pid}/fd/1"));
+    if let Ok(target) = std::fs::read_link(&proc_fd) {
+        return target.is_file().then_some(target);
+    }
+
+    // macOS: `-F ftn` prints one field per line — f<fd>, t<type>, n<name>.
+    let output = Command::new("lsof")
+        .args(["-p", &pid.to_string(), "-a", "-d", "1", "-F", "ftn"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut is_regular = false;
+    for line in stdout.lines() {
+        match line.split_at(1) {
+            ("t", kind) => is_regular = kind == "REG",
+            ("n", name) if is_regular => {
+                let path = PathBuf::from(name);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Classify whatever a `flutter run` printed after being signalled.
+///
+/// Order matters: a failed reload prints "Performing hot reload..." first and
+/// the error afterwards, so an error anywhere in the chunk outranks a start
+/// line, and only a completion line counts as success.
+pub fn verdict_from_output(output: &str) -> ToolVerdict {
+    // Progress is written with carriage returns and spinners, so lines have to
+    // be split on both terminators before anything can be matched.
+    let lines: Vec<String> = output
+        .split(['\n', '\r'])
+        .map(|line| strip_ansi(line).trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    // The compiler's own format: `path.dart:12:34: Error: message`.
+    if let Some(error) = lines.iter().find(|line| line.contains(": Error:")) {
+        return ToolVerdict::Failed(error.clone());
+    }
+    if let Some(line) = lines
+        .iter()
+        .find(|line| line.contains("Hot reload rejected") || line.contains("Try again after fixing"))
+    {
+        return ToolVerdict::Failed(line.clone());
+    }
+    // flutter_tools drops a request made while it is still handling one.
+    if let Some(line) = lines.iter().find(|line| line.contains("Ignoring signal")) {
+        return ToolVerdict::Failed(line.clone());
+    }
+    // A web app with no debug client attached: the code compiled and reached
+    // nobody. Reported as a failure because from the page's point of view that
+    // is what happened — nothing changed, and refreshing it is the way out.
+    if let Some(line) = lines.iter().find(|line| line.contains("No client connected")) {
+        return ToolVerdict::Failed(line.clone());
+    }
+    // Two wordings, and only matching one of them reported a web reload that
+    // plainly worked ("Reloaded application in 847ms.") as merely "requested":
+    //
+    //   Reloaded 1 of 1482 libraries in 349ms.   (a VM app)
+    //   Reloaded application in 847ms.           (web)
+    if let Some(line) = lines
+        .iter()
+        .find(|line| line.contains("Restarted application in") || line.starts_with("Reloaded "))
+    {
+        return ToolVerdict::Done(line.clone());
+    }
+    ToolVerdict::Silent
+}
+
+/// Watch `log` from `offset` until it says what happened, or until `timeout`.
+pub fn await_tool_verdict(log: &std::path::Path, offset: u64, timeout: Duration) -> ToolVerdict {
+    let deadline = Instant::now() + timeout;
+    let mut seen = String::new();
+    loop {
+        if let Ok(mut file) = std::fs::File::open(log) {
+            // A rotated or truncated log restarts the story rather than
+            // appending to it, so a shrunken file is read from the beginning.
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let from = if len < offset { 0 } else { offset };
+            if len > from && file.seek(SeekFrom::Start(from)).is_ok() {
+                seen.clear();
+                let _ = file.take(256 * 1024).read_to_string(&mut seen);
+                match verdict_from_output(&seen) {
+                    ToolVerdict::Silent => {}
+                    verdict => return verdict,
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return ToolVerdict::Silent;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// The size of a `flutter run`'s stdout file right now, so that only what it
+/// prints AFTER the signal is read as its answer.
+fn tool_output_mark(pid: u32) -> Option<(PathBuf, u64)> {
+    let path = process_stdout_file(pid)?;
+    let len = std::fs::metadata(&path).ok()?.len();
+    Some((path, len))
+}
+
+/// Reload an app running on THIS machine: signal if we can, VM service if not.
+pub fn hot_reload_local(pid: u32, vm_uri: Option<&str>, full_restart: bool) -> HotReloadOutcome {
+    let verb = reload_verb(full_restart);
+    if accepts_reload_signal(pid) {
+        // Marked BEFORE the signal, or the verdict could be the previous
+        // reload's.
+        let mark = tool_output_mark(pid);
+        if hot_reload_signal(pid, full_restart) {
+            let signal = if full_restart { "SIGUSR2" } else { "SIGUSR1" };
+            let verdict = mark
+                .map(|(log, offset)| await_tool_verdict(&log, offset, SIGNAL_VERDICT_TIMEOUT))
+                .unwrap_or(ToolVerdict::Silent);
+            return match verdict {
+                ToolVerdict::Done(line) => HotReloadOutcome {
+                    ok: true,
+                    via: "signal".into(),
+                    detail: line,
+                },
+                ToolVerdict::Failed(line) => HotReloadOutcome {
+                    ok: false,
+                    via: "signal".into(),
+                    detail: line,
+                },
+                // Either stdout isn't a file we can read, or it said nothing we
+                // recognise. "Requested" is then the whole truth: the signal
+                // was delivered and flutter_tools answers nobody.
+                ToolVerdict::Silent => HotReloadOutcome {
+                    ok: true,
+                    via: "signal".into(),
+                    detail: format!("{verb} requested — {signal} → pid {pid}"),
+                },
+            };
+        }
+    }
+
+    let service = reload_service_name(full_restart);
+    match vm_uri {
+        Some(uri) => match hot_reload_via_vm_service(uri, full_restart) {
+            Ok(()) => HotReloadOutcome {
+                ok: true,
+                via: service.into(),
+                detail: format!("{verb} complete"),
+            },
+            Err(error) => HotReloadOutcome {
+                ok: false,
+                via: service.into(),
+                detail: error,
+            },
+        },
+        None => HotReloadOutcome {
+            ok: false,
+            via: "none".into(),
+            detail: format!(
+                "No signalable `flutter run` here (pid {pid}) and no VM service URI to ask"
+            ),
+        },
+    }
+}
+
+/// Hand a reload for an app on another machine to the flan server that can
+/// actually perform it.
+///
+/// Only that host's own server can see the `flutter run` pid, and the loopback
+/// VM service URI it reported means nothing here — the same reason
+/// [discover_peer_apps] asks a peer rather than guessing.
+pub fn hot_reload_on_peer(
+    host: &str,
+    pid: u32,
+    app_id: Option<&str>,
+    full_restart: bool,
+) -> HotReloadOutcome {
+    let fail = |detail: String| HotReloadOutcome {
+        ok: false,
+        via: host.to_string(),
+        detail,
+    };
+    let Some(peer) = load_peers()
+        .into_iter()
+        .find(|peer| peer_host(peer).as_deref() == Some(host))
+    else {
+        return fail(format!("{host} is not a configured peer"));
+    };
+    hot_reload_via_peer(&peer, host, pid, app_id, full_restart)
+}
+
+/// The hop itself, against an already-resolved peer URL.
+fn hot_reload_via_peer(
+    peer: &str,
+    host: &str,
+    pid: u32,
+    app_id: Option<&str>,
+    full_restart: bool,
+) -> HotReloadOutcome {
+    let payload = serde_json::json!({
+        "pid": pid,
+        "app_id": app_id,
+        "full_restart": full_restart,
+        // Stamped so the peer reloads locally instead of relaying onward: two
+        // servers listing each other would otherwise bounce it between them.
+        "relayed_from": local_hostname(),
+    })
+    .to_string();
+
+    match post_peer_json(peer, "/api/hot-reload", &payload, RELOAD_VERDICT_TIMEOUT) {
+        Ok((_, value)) => HotReloadOutcome {
+            ok: value["ok"].as_bool().unwrap_or(false),
+            via: format!("{host}:{}", value["via"].as_str().unwrap_or("?")),
+            detail: value["detail"]
+                .as_str()
+                .unwrap_or("peer gave no detail")
+                .to_string(),
+        },
+        Err(error) => HotReloadOutcome {
+            ok: false,
+            via: host.to_string(),
+            detail: error,
+        },
+    }
+}
+
+/// Why this app cannot be hot reloaded by anyone, when that is a property of
+/// how it is being served rather than a failure to reach it.
+///
+/// A static bundle — `flutter build web` behind an http server, or a watched
+/// port — is files on disk: no flutter_tools, no compiler, no VM service.
+/// Nothing can reload it. Saying "no signalable `flutter run` here (pid 0)"
+/// is true but sends people hunting for a bug in flan instead of telling them
+/// the build they are looking at was never going to reload.
+pub fn unreloadable_reason(app: &FlutterApp) -> Option<String> {
+    let device = app.device.as_deref().unwrap_or_default();
+    if device != "static" && !device.starts_with("web:") {
+        return None;
+    }
+    let name = if app.folder_name.is_empty() {
+        "This app".to_string()
+    } else {
+        app.folder_name.clone()
+    };
+    let served = app
+        .web_port
+        .map(|port| format!(" on :{port}"))
+        .unwrap_or_default();
+    Some(format!(
+        "{name}{served} is a pre-built bundle served over HTTP — there is no \
+         `flutter run` behind it to reload. Start it with `flutter run -d chrome` \
+         (or `-d web-server`) to get hot reload."
+    ))
+}
+
+/// Reload one discovered app, wherever it is running.
+pub fn hot_reload_app(app: &FlutterApp, full_restart: bool) -> HotReloadOutcome {
+    if let Some(host) = app.host.as_deref() {
+        return hot_reload_on_peer(host, app.pid, app.app_id.as_deref(), full_restart);
+    }
+    let outcome = hot_reload_local(app.pid, app.vm_service_uri.as_deref(), full_restart);
+    if outcome.ok {
+        return outcome;
+    }
+    match unreloadable_reason(app) {
+        Some(detail) => HotReloadOutcome {
+            ok: false,
+            via: "none".into(),
+            detail,
+        },
+        None => outcome,
     }
 }
 
@@ -2919,11 +6005,213 @@ mod web_identity_tests {
     }
 
     #[test]
+    fn extract_flan_app_id_both_forms() {
+        assert_eq!(
+            extract_flan_app_id(
+                "flutter run --dart-define=FLAN_APP_ID=worktree-003",
+            ),
+            Some("worktree-003".into()),
+        );
+        assert_eq!(
+            extract_flan_app_id(
+                "flutter run --dart-define FLAN_APP_ID=fasmac:feature-a",
+            ),
+            Some("fasmac:feature-a".into()),
+        );
+        assert_eq!(extract_flan_app_id("flutter run -d chrome"), None);
+    }
+
+    #[test]
     fn parse_origin_port_variants() {
         assert_eq!(parse_origin_port("http://localhost:5005"), Some(5005));
         assert_eq!(parse_origin_port("http://127.0.0.1:3001/"), Some(3001));
         assert_eq!(parse_origin_port("http://localhost"), None); // no explicit port
         assert_eq!(parse_origin_port("https://example.com:8080/path"), Some(8080));
+    }
+
+    #[test]
+    fn parse_origin_host_names_the_machine() {
+        assert_eq!(
+            parse_origin_host("http://m1.follow-ionian.ts.net:5105").as_deref(),
+            Some("m1.follow-ionian.ts.net")
+        );
+        assert_eq!(
+            parse_origin_host("https://example.com/path").as_deref(),
+            Some("example.com")
+        );
+        // Loopback names no machine worth showing: the row falls back to this
+        // host's own name rather than printing "localhost" on every line.
+        assert_eq!(parse_origin_host("http://localhost:5005"), None);
+        assert_eq!(parse_origin_host("http://127.0.0.1:3001/"), None);
+        assert_eq!(parse_origin_host("http://[::1]:8080"), None);
+    }
+
+    #[test]
+    fn remote_app_carries_the_host_it_flushed_from() {
+        let app = remote_app("fasmac:worktree-002", Some("http://m1.follow-ionian.ts.net:5105"));
+        assert_eq!(app.host.as_deref(), Some("m1.follow-ionian.ts.net"));
+        assert_eq!(app.web_port, Some(5105));
+        // A local origin leaves it unset, so the TUI shows this machine.
+        let here = remote_app("fasmac:worktree-168", Some("http://localhost:7305"));
+        assert_eq!(here.host, None);
+        assert_eq!(here.web_port, Some(7305));
+    }
+}
+
+#[cfg(test)]
+mod channel_relay_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn cwd_channel_matches_a_flutter_subdirectory() {
+        let ports = HashMap::from([
+            ("/workspace/fasmac".to_string(), 43123),
+            ("/workspace/fasmac/frontend".to_string(), 43124),
+        ]);
+
+        assert_eq!(
+            channel_port_for_cwd(&ports, "/workspace/fasmac/frontend"),
+            Some(43124),
+        );
+        assert_eq!(
+            channel_port_for_cwd(&ports, "/workspace/other/frontend"),
+            None,
+        );
+    }
+
+    #[test]
+    fn codex_thread_is_read_off_the_rollout_filename() {
+        let path = "/Users/g/.codex/sessions/2026/09/07/\
+                    rollout-2026-09-07T21-29-32-01a07f47-471e-7122-a0e9-8efe01dd2268.jsonl";
+        assert_eq!(
+            codex_thread_from_rollout_path(path).as_deref(),
+            Some("01a07f47-471e-7122-a0e9-8efe01dd2268"),
+        );
+        // Not a rollout, not a jsonl, or no uuid at the end: nothing.
+        assert_eq!(codex_thread_from_rollout_path("/Users/g/.codex/history.jsonl"), None);
+        assert_eq!(codex_thread_from_rollout_path("/tmp/rollout-2026-09-07T21-29-32.jsonl"), None);
+        assert_eq!(
+            codex_thread_from_rollout_path("/tmp/rollout-x-01a07f47-471e-7122-a0e9-8efe01dd2268.log"),
+            None,
+        );
+    }
+
+    #[test]
+    fn base64_decodes_plain_and_data_uri_forms() {
+        assert_eq!(decode_base64("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(decode_base64("aGVsbG8").unwrap(), b"hello");
+        assert_eq!(decode_base64("data:image/png;base64,aGVs\nbG8=").unwrap(), b"hello");
+        assert_eq!(decode_base64("aGV$bG8="), None);
+    }
+
+    #[test]
+    fn codex_message_carries_uri_context_and_batch_fields() {
+        let messages = vec![
+            serde_json::json!({
+                "text": "the button is misaligned",
+                "type": "user_feedback",
+                "timestamp": "2026-09-07T22:00:00Z",
+                "data": {
+                    "url": "/settings/profile",
+                    "currentRoute": "profile",
+                    "inspectorSelection": {
+                        "widgetType": "ElevatedButton",
+                        "sourceLocation": "lib/profile.dart:42",
+                    },
+                    "annotations": [{"kind": "arrow"}],
+                },
+            }),
+            serde_json::json!({"text": "second", "type": "note"}),
+        ];
+        let (text, images) =
+            format_codex_message(&messages, Some("ws://127.0.0.1:1234/abc=/ws"), Some(4321));
+        assert!(images.is_empty());
+        assert!(text.starts_with("[flan] Message from the linked Flutter app"));
+        assert!(text.contains("vm_service_uri: ws://127.0.0.1:1234/abc=/ws"));
+        assert!(text.contains("flutter_pid: 4321"));
+        assert!(text.contains("--- message 1 of 2 ---"));
+        assert!(text.contains("[2026-09-07T22:00:00Z]\nthe button is misaligned"));
+        // user_feedback is the default kind and isn't labelled; others are.
+        assert!(!text.contains("type: user_feedback"));
+        assert!(text.contains("type: note\nsecond"));
+        assert!(text.contains("URL: /settings/profile"));
+        assert!(text.contains("Current route: profile"));
+        assert!(text.contains("  Widget type: ElevatedButton"));
+        assert!(text.contains("  Source: lib/profile.dart:42"));
+        assert!(text.contains(r#"Annotations: [{"kind":"arrow"}]"#));
+    }
+
+    #[test]
+    fn codex_target_resolution_ignores_non_process_ids() {
+        assert_eq!(codex_pid_for_target("cwd-route"), None);
+        assert_eq!(codex_pid_for_target("chan:60999"), None);
+        assert_eq!(codex_pid_for_target("sess:unknown"), None);
+        // Our own pid is a test binary, not Codex.
+        assert_eq!(codex_pid_for_target(&format!("sess:{}", std::process::id())), None);
+    }
+
+    #[test]
+    fn relay_preserves_unsupported_client_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut request = [0_u8; 4096];
+            stream.read(&mut request).unwrap();
+            let body = r#"{"ok":false,"accepted":false,"delivered":false,"error":"Codex must use process_queue"}"#;
+            let response = format!(
+                "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body,
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let error = relay_channel_flush(port, r#"{"messages":[{"text":"hello"}]}"#)
+            .unwrap_err();
+        assert_eq!(error, "Codex must use process_queue");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn relay_accepts_chunked_queued_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let bytes_read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..bytes_read]);
+            assert!(request.starts_with("POST /flush HTTP/1.1"));
+            assert!(request.contains("\"text\":\"hello\""));
+
+            let body = r#"{"ok":true,"accepted":true,"delivered":false}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                body.len(),
+                body,
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let outcome = relay_channel_flush(
+            port,
+            r#"{"messages":[{"text":"hello"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ChannelRelayOutcome {
+                accepted: true,
+                delivered: false,
+            },
+        );
+        server.join().unwrap();
     }
 }
 
@@ -3006,5 +6294,868 @@ mod pane_routing_tests {
         let panes = vec![pane(5, 12345, "/Users/gaurav/dev/x", false)];
         let empty = HashMap::new();
         assert!(pick_pane_for_login(&panes, 67890, "/Users/gaurav/dev/y", &empty).is_none());
+    }
+}
+
+#[cfg(test)]
+mod channel_registry_tests {
+    use super::*;
+
+    fn reg(port: u16, agent_pid: Option<u32>) -> ChannelRegistration {
+        ChannelRegistration {
+            port,
+            channel_pid: Some(port as u32 + 1),
+            agent_pid,
+            agent_name: Some("Claude".into()),
+            tty: Some("ttys006".into()),
+            cwd: Some("/repo".into()),
+            surface_id: None,
+        }
+    }
+
+    fn registry(entries: Vec<(u64, ChannelRegistration)>) -> HashMap<u16, (Instant, ChannelRegistration)> {
+        entries
+            .into_iter()
+            .map(|(age_secs, r)| {
+                let seen = Instant::now()
+                    .checked_sub(Duration::from_secs(age_secs))
+                    .expect("test clock underflow");
+                (r.port, (seen, r))
+            })
+            .collect()
+    }
+
+    fn session(port: Option<u16>, agent_pid: Option<u32>, cwd: &str) -> AgentSession {
+        AgentSession {
+            session_id: agent_pid.map(|p| format!("session-{p}")),
+            agent_pid,
+            agent_name: Some("Claude".into()),
+            session_name: Some("repo-01".into()),
+            status: Some("idle".into()),
+            tty: Some("ttys006".into()),
+            cwd: Some(cwd.into()),
+            branch: Some("main".into()),
+            worktree: None,
+            summary: None,
+            artifacts: Vec::new(),
+            channel_port: port,
+            channel_pid: None,
+            surface_id: None,
+            age_secs: 0,
+        }
+    }
+
+    #[test]
+    fn a_dead_agent_stops_being_a_link_target_immediately() {
+        // pid 1 is always alive; the dead one heartbeat a moment ago, so only
+        // the liveness check can catch it.
+        let mut channels = registry(vec![(1, reg(60365, Some(1))), (1, reg(60604, Some(4242)))]);
+
+        let live = prune_channels(&mut channels, |pid| pid == 1);
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].1.port, 60365);
+        assert!(!channels.contains_key(&60604), "dead agent must be evicted, not just hidden");
+    }
+
+    #[test]
+    fn a_channel_that_stopped_heartbeating_is_dropped_even_if_the_pid_survives() {
+        // Agent process still exists (a wedged session, or a pid reused) but
+        // the channel has missed several 30s beats.
+        let mut channels = registry(vec![(CHANNEL_TTL.as_secs() + 5, reg(60365, Some(1)))]);
+
+        let live = prune_channels(&mut channels, |_| true);
+
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn a_registration_with_no_resolvable_agent_survives_on_its_heartbeat() {
+        // Headless agents we can't resolve a pid for still register; the
+        // heartbeat is the only liveness signal available, so trust it.
+        let mut channels = registry(vec![(10, reg(60365, None))]);
+
+        let live = prune_channels(&mut channels, |_| false);
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].0, 10, "age should be reported for display");
+    }
+
+    /// The same channel seen twice — once by scanning, once by registration —
+    /// is one agent, and the discovered row is the richer of the two.
+    #[test]
+    fn a_registration_for_an_already_discovered_session_does_not_duplicate_it() {
+        let mut sessions = vec![session(Some(60365), Some(4242), "/repo")];
+
+        merge_registrations(&mut sessions, vec![(3, reg(60365, Some(4242)))]);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_name.as_deref(), Some("repo-01"));
+    }
+
+    /// A registration discovery couldn't see must still produce a row —
+    /// that's the only reason registration still exists.
+    #[test]
+    fn a_registration_discovery_missed_becomes_its_own_session() {
+        let mut sessions = vec![session(Some(60365), Some(4242), "/repo")];
+
+        merge_registrations(&mut sessions, vec![(3, reg(60999, Some(777)))]);
+
+        assert_eq!(sessions.len(), 2);
+        let added = sessions.iter().find(|s| s.channel_port == Some(60999)).unwrap();
+        assert_eq!(added.agent_pid, Some(777));
+        assert_eq!(added.age_secs, 3);
+    }
+
+    /// A session with no channel is listed, just not reachable — hiding it is
+    /// what made half the running agents invisible.
+    #[test]
+    fn a_session_without_a_channel_is_still_a_session() {
+        let mut sessions = vec![session(None, Some(4242), "/repo")];
+
+        merge_registrations(&mut sessions, vec![]);
+
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].channel_port.is_none());
+    }
+
+    #[test]
+    fn display_order_is_stable_across_refreshes() {
+        let mut sessions = vec![
+            session(None, Some(3), "/repo/b"),
+            session(None, Some(1), "/repo/a"),
+            session(None, Some(2), "/repo/a"),
+        ];
+
+        sort_sessions(&mut sessions);
+
+        let pids: Vec<Option<u32>> = sessions.iter().map(|s| s.agent_pid).collect();
+        assert_eq!(pids, vec![Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn project_slug_replaces_every_separator_git_style() {
+        // An underscore in the path silently broke transcript lookup before.
+        assert_eq!(claude_project_slug("/Users/g/dev/flan_mcp"), "-Users-g-dev-flan-mcp");
+        assert_eq!(
+            claude_project_slug("/Users/g/dev/fasmac/.worktrees/feature/genui-a2ui"),
+            "-Users-g-dev-fasmac--worktrees-feature-genui-a2ui"
+        );
+    }
+
+    /// Artifact records are written once, early, in transcripts that grow to
+    /// tens of megabytes — the case that ruled out reading only the tail.
+    #[test]
+    fn artifacts_and_title_are_picked_out_of_transcript_lines() {
+        let mut index = TranscriptIndex::default();
+
+        absorb_transcript(&mut index, concat!(
+            r#"{"type":"assistant","message":{"content":"noise"}}"#, "\n",
+            r#"{"type":"frame-link","path":"/tmp/x/scratchpad/extracted-tree-panel.html","frameUrl":"https://claude.ai/code/artifact/abc","title":"Extracted Tree Panel"}"#, "\n",
+            r#"{"type":"frame-link","path":"/tmp/x/scratchpad/cache-economics.html","frameUrl":"https://claude.ai/code/artifact/def","title":"Growth"}"#, "\n",
+            r#"{"aiTitle":"Candidate stats view","type":"snapshot"}"#, "\n",
+        ));
+
+        assert_eq!(index.artifacts, vec!["extracted-tree-panel", "cache-economics"]);
+        assert_eq!(index.summary().as_deref(), Some("Candidate stats view"));
+    }
+
+    /// The index is fed in chunks as the session appends to its transcript, so
+    /// later reads must build on earlier ones rather than replace them.
+    #[test]
+    fn a_later_chunk_adds_to_what_earlier_chunks_found() {
+        let mut index = TranscriptIndex::default();
+        absorb_transcript(&mut index, concat!(
+            r#"{"type":"frame-link","path":"/tmp/extraction-audit.html","frameUrl":"u1"}"#, "\n",
+            r#"{"aiTitle":"First title"}"#, "\n",
+        ));
+
+        absorb_transcript(&mut index, concat!(
+            r#"{"lastPrompt":"and now something else"}"#, "\n",
+            r#"{"type":"frame-link","path":"/tmp/reasoning-tax.html","frameUrl":"u2"}"#, "\n",
+        ));
+
+        assert_eq!(index.artifacts, vec!["extraction-audit", "reasoning-tax"]);
+        // A title already seen still wins over a newer prompt.
+        assert_eq!(index.summary().as_deref(), Some("First title"));
+    }
+
+    /// Republishing the same artifact re-emits the record; it is one artifact.
+    #[test]
+    fn republishing_an_artifact_does_not_list_it_twice() {
+        let mut index = TranscriptIndex::default();
+        let line = concat!(r#"{"type":"frame-link","path":"/tmp/a/cache-economics.html","frameUrl":"u"}"#, "\n");
+
+        absorb_transcript(&mut index, line);
+        absorb_transcript(&mut index, line);
+
+        assert_eq!(index.artifacts, vec!["cache-economics"]);
+    }
+
+    #[test]
+    fn summaries_are_flattened_and_clipped() {
+        assert_eq!(one_line("  keep   it   tidy \n now ", 40), "keep it tidy now");
+        let long = "x".repeat(200);
+        let clipped = one_line(&long, 20);
+        assert_eq!(clipped.chars().count(), 20);
+        assert!(clipped.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod remote_app_tests {
+    use super::*;
+
+    fn link(id: &str, pid: u32, cwd: Option<&str>, app_id: Option<&str>) -> Association {
+        Association {
+            id: id.into(),
+            claude_surface_id: format!("sess:{pid}"),
+            flutter_pid: pid,
+            flutter_cwd: cwd.map(str::to_string),
+            flutter_app_id: app_id.map(str::to_string),
+        }
+    }
+
+    /// An app served statically, or running on another machine, never appears
+    /// in `ps` — its FLAN_APP_ID is the only handle it has.
+    #[test]
+    fn an_app_with_no_local_process_is_matched_by_its_id() {
+        let assocs = vec![link("1", 0, None, Some("fasmac:worktree-003"))];
+
+        let found = resolve_association(&assocs, Some("fasmac:worktree-003"), None, None);
+
+        assert_eq!(found.map(|a| a.claude_surface_id), Some("sess:0".to_string()));
+    }
+
+    /// Every app without a local process reports pid 0. Matching on that would
+    /// hand one app's messages to whatever agent another app is linked to.
+    #[test]
+    fn pid_zero_never_matches_another_apps_link() {
+        let assocs = vec![link("1", 0, None, Some("fasmac:worktree-003"))];
+
+        let found = resolve_association(&assocs, Some("other:app"), Some(0), None);
+
+        assert!(found.is_none());
+    }
+
+    /// A rebuilt app keeps its id but gets a new pid; the link must follow.
+    #[test]
+    fn the_id_wins_over_a_stale_pid_match() {
+        let assocs = vec![
+            link("1", 16595, Some("/repo/frontend"), Some("fasmac:worktree-003")),
+            link("2", 30007, Some("/repo/other"), Some("fasmac:worktree-009")),
+        ];
+
+        let found = resolve_association(
+            &assocs,
+            Some("fasmac:worktree-009"),
+            Some(16595),
+            Some("/repo/frontend"),
+        );
+
+        assert_eq!(found.map(|a| a.id), Some("2".to_string()));
+    }
+
+    #[test]
+    fn without_an_id_it_falls_back_to_pid_then_cwd() {
+        let assocs = vec![link("1", 16595, Some("/repo/frontend"), None)];
+
+        let by_pid = resolve_association(&assocs, None, Some(16595), None);
+        let by_cwd = resolve_association(&assocs, None, Some(99999), Some("/repo/frontend"));
+        let no_match = resolve_association(&assocs, None, Some(99999), Some("/elsewhere"));
+
+        assert_eq!(by_pid.map(|a| a.id), Some("1".to_string()));
+        assert_eq!(by_cwd.map(|a| a.id), Some("1".to_string()));
+        assert!(no_match.is_none());
+    }
+
+    /// A local process is the better row — it has a pid, a cwd and a VM
+    /// service — so a remote sighting of the same app must not duplicate it.
+    #[test]
+    fn a_remote_sighting_of_a_local_app_does_not_duplicate_it() {
+        let mut apps = vec![FlutterApp {
+            pid: 16595,
+            cwd: "/repo/frontend".into(),
+            folder_name: "frontend".into(),
+            vm_service_uri: None,
+            device: Some("web-server".into()),
+            queue_count: 0,
+            connected: false,
+            web_port: Some(5305),
+            app_id: Some("fasmac:worktree-003".into()),
+            host: None,
+        }];
+
+        merge_remote_apps(
+            &mut apps,
+            vec![
+                remote_app("fasmac:worktree-003", Some("http://host:5305")),
+                remote_app("fasmac:worktree-009", Some("http://host:5309")),
+            ],
+        );
+
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0].pid, 16595, "the local row must survive");
+        assert_eq!(apps[1].app_id.as_deref(), Some("fasmac:worktree-009"));
+        assert_eq!(apps[1].folder_name, "worktree-009");
+        assert_eq!(apps[1].web_port, Some(5309));
+    }
+
+    fn peer_app(app_id: &str, port: u16, host: &str) -> FlutterApp {
+        FlutterApp {
+            pid: 60027,
+            cwd: format!("/home/g/ci/fasmac/{app_id}"),
+            folder_name: "frontend".into(),
+            vm_service_uri: None,
+            device: Some("web-server".into()),
+            queue_count: 0,
+            connected: false,
+            web_port: Some(port),
+            app_id: Some(app_id.into()),
+            host: Some(host.into()),
+        }
+    }
+
+    fn local_app(app_id: Option<&str>, port: u16) -> FlutterApp {
+        FlutterApp {
+            pid: 28719,
+            cwd: "/Users/g/dev/fasmac/frontend".into(),
+            folder_name: "frontend".into(),
+            vm_service_uri: None,
+            device: Some("web-server".into()),
+            queue_count: 0,
+            connected: false,
+            web_port: Some(port),
+            app_id: app_id.map(str::to_owned),
+            host: None,
+        }
+    }
+
+    /// The bug this whole path exists for: `--web-port 5005` on the build host
+    /// and 5005 here are two apps, and the build host's one used to vanish.
+    #[test]
+    fn an_app_on_a_peer_survives_a_local_app_on_the_same_port() {
+        let mut apps = vec![local_app(Some("fasmac:worktree-003"), 5005)];
+
+        merge_peer_apps(
+            &mut apps,
+            vec![peer_app("fasmac:worktree-001", 5005, "m1.follow-ionian.ts.net")],
+        );
+
+        assert_eq!(apps.len(), 2, "same port on two hosts is two apps");
+        assert_eq!(apps[1].app_id.as_deref(), Some("fasmac:worktree-001"));
+        assert_eq!(apps[1].host.as_deref(), Some("m1.follow-ionian.ts.net"));
+    }
+
+    /// Same hazard, reached through the registry rather than a peer.
+    #[test]
+    fn a_remote_sighting_is_not_hidden_by_a_local_app_on_the_same_port() {
+        let mut apps = vec![local_app(Some("fasmac:worktree-003"), 5005)];
+
+        merge_remote_apps(
+            &mut apps,
+            vec![remote_app("fasmac:worktree-001", Some("http://m1.example:5005"))],
+        );
+
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[1].app_id.as_deref(), Some("fasmac:worktree-001"));
+    }
+
+    /// A static app and its own flush stub share a port AND a (blank) host, so
+    /// port-as-identity must keep working for the case it was written for.
+    #[test]
+    fn a_local_static_app_still_absorbs_its_own_flush_stub() {
+        let mut apps = vec![local_app(None, 7305)];
+
+        merge_remote_apps(
+            &mut apps,
+            vec![remote_app("fasmac:worktree-168", Some("http://localhost:7305"))],
+        );
+
+        assert_eq!(apps.len(), 1, "one app seen from two sides is one row");
+        assert_eq!(apps[0].pid, 28719);
+    }
+
+    /// The reason peers are merged before the registry: the peer knows the pid,
+    /// the cwd and the device; the stub knows only the id it flushed with.
+    #[test]
+    fn a_peer_row_wins_over_the_stub_the_same_app_left_behind() {
+        let mut apps = vec![peer_app("fasmac:worktree-002", 5105, "m1.example")];
+
+        merge_remote_apps(
+            &mut apps,
+            vec![remote_app("fasmac:worktree-002", Some("http://m1.example:5105"))],
+        );
+
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].pid, 60027, "the row with a pid and a cwd must win");
+        assert!(!apps[0].cwd.is_empty());
+    }
+
+    /// Two peers, two rows, even when neither carries an app_id.
+    #[test]
+    fn peers_on_different_hosts_do_not_collapse_without_an_app_id() {
+        let mut apps = Vec::new();
+        let mut a = peer_app("x", 5005, "m1.example");
+        a.app_id = None;
+        let mut b = peer_app("y", 5005, "laptop.example");
+        b.app_id = None;
+
+        merge_peer_apps(&mut apps, vec![a, b]);
+
+        assert_eq!(apps.len(), 2);
+    }
+
+    #[test]
+    fn a_peer_is_written_however_the_user_reaches_it() {
+        assert_eq!(normalize_peer("m1"), Some("http://m1:4050".into()));
+        assert_eq!(normalize_peer(" m1:4050 "), Some("http://m1:4050".into()));
+        assert_eq!(
+            normalize_peer("http://m1.follow-ionian.ts.net:4050/"),
+            Some("http://m1.follow-ionian.ts.net:4050".into())
+        );
+        // A path is not part of a peer's address.
+        assert_eq!(
+            normalize_peer("http://m1:4050/api/flutter-apps"),
+            Some("http://m1:4050".into())
+        );
+        assert_eq!(normalize_peer("https://m1:443"), Some("https://m1:443".into()));
+        assert_eq!(normalize_peer(""), None);
+        assert_eq!(normalize_peer("   "), None);
+        assert_eq!(normalize_peer("http://"), None);
+    }
+
+    #[test]
+    fn a_peer_list_skips_junk_rather_than_failing() {
+        assert_eq!(
+            parse_peer_list("m1, , http://laptop:4050/,"),
+            vec!["http://m1:4050".to_string(), "http://laptop:4050".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_peers_port_is_not_mistaken_for_part_of_its_host() {
+        assert_eq!(peer_host("http://m1:4050"), Some("m1".into()));
+        assert_eq!(
+            peer_host("http://m1.follow-ionian.ts.net:4050"),
+            Some("m1.follow-ionian.ts.net".into())
+        );
+        assert_eq!(peer_host("http://[::1]:4050"), Some("[::1]".into()));
+    }
+
+    /// The peer cache is process-global, so this walks the whole lifecycle in
+    /// one test rather than racing three against each other.
+    #[test]
+    fn a_peers_reachability_is_reported_not_guessed_at() {
+        let quiet = "http://unreachable-test-host:4050";
+        let flaky = "http://flaky-test-host:4050";
+        let state_of = |peer: &str| peer_states().into_iter().find(|s| s.peer == peer);
+
+        // A peer that has never answered must still be REPORTED. If the record
+        // vanished, the TUI could not tell "that machine is running nothing"
+        // from "I never got an answer" — the confusion this caused once already.
+        assert!(remember_peer_result(quiet, None).is_empty());
+        let s = state_of(quiet).expect("an unreachable peer must still be reported");
+        assert!(!s.reachable);
+        assert_eq!(s.app_count, 0);
+        assert_eq!(s.last_ok_secs, None, "it has never answered");
+
+        // A single dropped request must not blink a known app out of the list,
+        // but it is still a failure and must be said so.
+        remember_peer_result(flaky, Some(vec![peer_app("fasmac:worktree-001", 5005, "flaky")]));
+        assert!(state_of(flaky).unwrap().reachable);
+        let during_blip = remember_peer_result(flaky, None);
+        assert_eq!(during_blip.len(), 1, "a blip must not drop a known app");
+        let s = state_of(flaky).unwrap();
+        assert!(!s.reachable, "the blip is still a failure");
+        assert!(s.last_ok_secs.is_some(), "it answered a moment ago");
+
+        // A tick in which neither peer is configured any more.
+        discover_peer_apps(&[]);
+        assert!(
+            state_of(quiet).is_none() && state_of(flaky).is_none(),
+            "an unconfigured peer must not keep warning"
+        );
+    }
+
+    /// Two servers listing each other must not bounce one message forever.
+    #[test]
+    fn a_relayed_flush_is_stamped_so_it_is_never_relayed_on() {
+        let body = serde_json::json!({
+            "app_id": "fasmac:worktree-003",
+            "origin": "http://m1.follow-ionian.ts.net:5205",
+            "messages": [{"text": "hello"}],
+        });
+
+        let stamped: serde_json::Value =
+            serde_json::from_str(&mark_relayed(&body).expect("payload must serialize")).unwrap();
+
+        assert_eq!(stamped["relayed_from"], serde_json::json!(local_hostname()));
+        // Everything the app sent has to survive the hop untouched.
+        assert_eq!(stamped["app_id"], "fasmac:worktree-003");
+        assert_eq!(stamped["messages"][0]["text"], "hello");
+    }
+
+    /// A payload that isn't a JSON object has no field to stamp, and relaying it
+    /// unstamped would be the loop this guard exists to prevent.
+    #[test]
+    fn an_unstampable_payload_is_refused_rather_than_relayed_bare() {
+        assert!(mark_relayed(&serde_json::json!(["not", "an", "object"])).is_none());
+    }
+
+    #[tokio::test]
+    async fn with_no_peers_there_is_nothing_to_relay_to() {
+        let body = serde_json::json!({"app_id": "x"});
+        assert!(relay_flush_to_peers(&body, &[]).await.is_none());
+    }
+
+    #[test]
+    fn this_machine_is_not_its_own_peer() {
+        assert!(is_self_peer("http://localhost:4050"));
+        assert!(is_self_peer("http://127.0.0.1:4050"));
+        assert!(is_self_peer("http://[::1]:4050"));
+        // The short hostname and its tailnet FQDN name the same machine.
+        let me = local_hostname();
+        assert!(is_self_peer(&format!("http://{me}:4050")));
+        assert!(is_self_peer(&format!("http://{me}.follow-ionian.ts.net:4050")));
+        assert!(!is_self_peer("http://definitely-not-this-host:4050"));
+    }
+}
+
+#[cfg(test)]
+mod hot_reload_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+    use tungstenite::Message;
+
+    /// The decisive property: SIGUSR1's default disposition is to KILL. A run
+    /// that didn't install the handlers must never be signalled.
+    #[test]
+    fn only_a_resident_debug_run_is_signalled() {
+        let debug = "/Users/g/flutter/bin/cache/dart-sdk/bin/dart \
+                     /Users/g/flutter/bin/cache/flutter_tools.snapshot run -d macos";
+        assert!(command_line_accepts_reload_signal(debug));
+
+        for refused in [
+            // No handlers: the device has no service protocol in release mode.
+            "… flutter_tools.snapshot run --release -d macos",
+            // No handlers: profile builds don't support restart.
+            "… flutter_tools.snapshot run --profile -d macos",
+            // No handlers: nothing stays resident to receive them.
+            "… flutter_tools.snapshot run --no-resident -d macos",
+            "… flutter_tools.snapshot run --trace-startup -d macos",
+            // Not a `flutter run` at all — signalling this kills somebody's app.
+            "/Applications/MyApp.app/Contents/MacOS/MyApp",
+            "… flutter_tools.snapshot test",
+        ] {
+            assert!(
+                !command_line_accepts_reload_signal(refused),
+                "should refuse to signal: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_that_is_not_a_peer_cannot_be_asked() {
+        let outcome = hot_reload_on_peer("no-such-host.invalid", 1234, None, false);
+        assert!(!outcome.ok);
+        assert!(
+            outcome.detail.contains("not a configured peer"),
+            "got: {}",
+            outcome.detail
+        );
+    }
+
+    fn web_app(device: &str, port: u16) -> FlutterApp {
+        FlutterApp {
+            pid: 0,
+            cwd: "/Users/g/dev/pe/app_next".into(),
+            folder_name: "app_next".into(),
+            vm_service_uri: None,
+            device: Some(device.into()),
+            queue_count: 0,
+            connected: false,
+            web_port: Some(port),
+            app_id: None,
+            host: None,
+        }
+    }
+
+    /// The report that sent somebody hunting for a bug in flan: a `flutter build
+    /// web` behind `python3 -m http.server` has no compiler anywhere near it, and
+    /// "no signalable `flutter run` here (pid 0)" reads as a failure to find one.
+    #[test]
+    fn a_static_bundle_is_told_why_it_cannot_reload() {
+        let outcome = hot_reload_app(&web_app("static", 8087), false);
+
+        assert!(!outcome.ok);
+        assert!(outcome.detail.contains("app_next"), "{}", outcome.detail);
+        assert!(outcome.detail.contains(":8087"), "{}", outcome.detail);
+        assert!(
+            outcome.detail.contains("flutter run"),
+            "it has to say what to do instead: {}",
+            outcome.detail
+        );
+
+        // A watched plain dev server is the same story.
+        assert!(unreloadable_reason(&web_app("web:3000", 3000)).is_some());
+    }
+
+    /// A real `flutter run` that merely can't be reached must NOT be explained
+    /// away as unreloadable — that is the case where something is wrong.
+    #[test]
+    fn a_real_run_keeps_its_own_failure() {
+        let mut app = web_app("chrome", 5005);
+        app.pid = 999_999; // long gone
+        assert_eq!(unreloadable_reason(&app), None);
+        assert!(hot_reload_app(&app, false).detail.contains("pid 999999"));
+    }
+
+    /// A relayed reload has to carry the stamp, or the peer relays it back and
+    /// the two servers bounce it between them.
+    #[test]
+    fn a_relayed_reload_is_stamped_and_its_verdict_carried_back() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+
+            let body = r#"{"ok":true,"via":"signal","detail":"Hot reload requested — SIGUSR1 → pid 77"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+
+        let outcome =
+            hot_reload_via_peer(&format!("http://127.0.0.1:{port}"), "m1", 77, None, false);
+        let request = server.join().unwrap();
+
+        assert!(request.starts_with("POST /api/hot-reload HTTP/1.1"), "{request}");
+        assert!(
+            request.contains(&format!("\"relayed_from\":\"{}\"", local_hostname())),
+            "{request}"
+        );
+        assert!(outcome.ok);
+        // The peer's own account of how it did it, attributed to the peer.
+        assert_eq!(outcome.via, "m1:signal");
+        assert!(outcome.detail.contains("SIGUSR1"), "{}", outcome.detail);
+    }
+
+    /// Verbatim from the frontend that prompted this: a restart that compiled
+    /// nothing and restarted nothing, while the app was told "requested".
+    const FAILED_RESTART: &str = "\
+Performing hot restart...                                       \r
+lib/screens/settings/feature_requests_screen.dart:115:39: Error: The method 'withdraw' isn't defined for the type 'FeatureRequestsProvider'.
+ - 'FeatureRequestsProvider' is from 'package:resume_parser_frontend/providers/feature_requests_provider.dart'.
+Try correcting the name to the name of an existing method, or defining a method named 'withdraw'.
+";
+
+    /// The noise that surrounds it. None of this is a verdict, and reading
+    /// "Error thrown by handler" as one would fail every reload on this app.
+    const DWDS_NOISE: &str = "\
+ERROR - 2026-10-03 15:55:57.034470
+GET /
+Error thrown by handler.
+Bad state: No element
+dart:core                                            _Array.first
+";
+
+    #[test]
+    fn a_compile_failure_is_read_off_the_tools_own_output() {
+        match verdict_from_output(FAILED_RESTART) {
+            ToolVerdict::Failed(line) => {
+                assert!(line.contains("withdraw"), "{line}");
+                assert!(line.starts_with("lib/screens"), "name the file: {line}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_finished_reload_or_restart_is_a_success() {
+        assert_eq!(
+            verdict_from_output("Performing hot restart...\r\nRestarted application in 223ms."),
+            ToolVerdict::Done("Restarted application in 223ms.".into()),
+        );
+        assert_eq!(
+            verdict_from_output("Reloaded 1 of 1482 libraries in 349ms."),
+            ToolVerdict::Done("Reloaded 1 of 1482 libraries in 349ms.".into()),
+        );
+        // The web runner's wording, taken from a real frontend's log. It counts
+        // no libraries, and requiring that word reported this as "requested".
+        assert_eq!(
+            verdict_from_output("Performing hot reload...   847ms\rReloaded application in 847ms."),
+            ToolVerdict::Done("Reloaded application in 847ms.".into()),
+        );
+    }
+
+    /// `flutter run -d web-server` with no Dart debug client: it compiles and
+    /// the page never hears about it. "Requested" would be technically true and
+    /// practically a lie — nothing happened.
+    #[test]
+    fn a_recompile_that_reached_no_client_is_not_a_success() {
+        assert!(matches!(
+            verdict_from_output(
+                "Performing hot reload...\r\nRecompile complete. No client connected."
+            ),
+            ToolVerdict::Failed(line) if line.contains("No client connected"),
+        ));
+    }
+
+    #[test]
+    fn a_request_dropped_while_busy_is_not_a_success() {
+        assert!(matches!(
+            verdict_from_output("Ignoring signal: \"SIGUSR2\" because we are busy."),
+            ToolVerdict::Failed(_)
+        ));
+    }
+
+    /// Nothing recognisable means we say what we actually know, not that the
+    /// reload failed.
+    #[test]
+    fn unrelated_output_is_no_verdict_at_all() {
+        assert_eq!(verdict_from_output(DWDS_NOISE), ToolVerdict::Silent);
+        assert_eq!(verdict_from_output(""), ToolVerdict::Silent);
+    }
+
+    /// The offset is the whole reason this is trustworthy: a log full of
+    /// earlier successes must not answer for the reload just asked for.
+    #[test]
+    fn only_what_was_printed_after_the_signal_counts() {
+        let log = std::env::temp_dir().join(format!(
+            "flan-verdict-{}-{:?}.log",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&log, "Restarted application in 10ms.\n").unwrap();
+        let offset = std::fs::metadata(&log).unwrap().len();
+
+        // Nothing new: the earlier success is not this reload's verdict.
+        assert_eq!(
+            await_tool_verdict(&log, offset, Duration::from_millis(300)),
+            ToolVerdict::Silent,
+        );
+
+        // Appended a moment later, as a compile does.
+        let appending = log.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&appending)
+                .unwrap();
+            file.write_all(FAILED_RESTART.as_bytes()).unwrap();
+        });
+        let verdict = await_tool_verdict(&log, offset, Duration::from_secs(5));
+        writer.join().unwrap();
+        let _ = std::fs::remove_file(&log);
+
+        assert!(
+            matches!(verdict, ToolVerdict::Failed(line) if line.contains("withdraw")),
+            "the new bytes are the verdict",
+        );
+    }
+
+    /// Serve the handshake a real VM service performs, and answer the reload
+    /// call with `answer`. Returns the port and the thread, which yields the
+    /// reload request the client actually sent.
+    fn fake_vm_service(
+        answer: serde_json::Value,
+    ) -> (u16, thread::JoinHandle<Option<serde_json::Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let mut call: Option<serde_json::Value> = None;
+            for _ in 0..3 {
+                let Ok(Message::Text(text)) = ws.read() else {
+                    break;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let id = request["id"].clone();
+                let reply = match request["method"].as_str().unwrap_or("") {
+                    "streamListen" => {
+                        ws.send(Message::Text(
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": {"type": "Success"},
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .unwrap();
+                        // What makes the whole thing work: the prefix is only
+                        // knowable from this replayed registration.
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "method": "streamNotify",
+                            "params": {
+                                "streamId": "_Service",
+                                "event": {
+                                    "kind": "ServiceRegistered",
+                                    "service": "reloadSources",
+                                    "method": "s7.reloadSources",
+                                    "alias": "Flutter Tools",
+                                },
+                            },
+                        })
+                    }
+                    "getVM" => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"isolates": [{"id": "isolates/42"}]},
+                    }),
+                    _ => {
+                        call = Some(request.clone());
+                        let mut reply = answer.clone();
+                        reply["id"] = id;
+                        reply
+                    }
+                };
+                ws.send(Message::Text(reply.to_string().into())).unwrap();
+            }
+            call
+        });
+        (port, server)
+    }
+
+    #[test]
+    fn reload_invokes_the_prefixed_service_flutter_tools_registered() {
+        let (port, server) = fake_vm_service(serde_json::json!({
+            "jsonrpc": "2.0", "result": {"type": "Success"},
+        }));
+
+        hot_reload_via_vm_service(&format!("ws://127.0.0.1:{port}/ws"), false).unwrap();
+
+        let call = server.join().unwrap().expect("a reload call");
+        // Not the bare `reloadSources` RPC — that one has no compiler behind it.
+        assert_eq!(call["method"], "s7.reloadSources");
+        assert_eq!(call["params"]["isolateId"], "isolates/42");
+    }
+
+    /// The reason this path exists at all: the signal can't tell you the code
+    /// didn't compile, and this can.
+    #[test]
+    fn a_compile_failure_comes_back_as_its_message() {
+        let (port, server) = fake_vm_service(serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": {"code": 1005, "message": "lib/main.dart:7:3: Error: Expected ';'"},
+        }));
+
+        let error =
+            hot_reload_via_vm_service(&format!("ws://127.0.0.1:{port}/ws"), false).unwrap_err();
+
+        assert!(error.contains("Expected ';'"), "got: {error}");
+        server.join().unwrap();
     }
 }

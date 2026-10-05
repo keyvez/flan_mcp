@@ -11,7 +11,8 @@
 /// Register in .mcp.json as an MCP server, then start Claude Code with:
 ///   claude --dangerously-load-development-channels server:flan-channel
 ///
-/// The channel listens for POST /flush requests on --listen-port (default 4051).
+/// The channel listens for POST /flush requests on an OS-allocated loopback
+/// port unless --listen-port or FLAN_CHANNEL_PORT supplies a preferred port.
 /// The flan TUI should be configured to POST to this port in addition to (or
 /// instead of) injecting text into the Claude terminal.
 import 'dart:async';
@@ -24,6 +25,11 @@ import 'package:flan_mcp/src/chat_log_formatter.dart';
 import 'package:flan_mcp/src/compat/copilot_stdio_server_transport.dart';
 import 'package:flan_mcp/src/version.g.dart';
 import 'package:mcp_dart/mcp_dart.dart';
+
+/// Join path segments with the platform separator. A local helper so this
+/// entrypoint keeps its small dependency list.
+String p_join(String a, String b) =>
+    a.endsWith(Platform.pathSeparator) ? '$a$b' : '$a${Platform.pathSeparator}$b';
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -42,8 +48,12 @@ ArgParser _buildParser() {
     ..addOption('log-file', help: 'Path to log file. Defaults to stderr.')
     ..addOption(
       'listen-port',
-      defaultsTo: '4051',
-      help: 'Local HTTP port to listen on for flush POSTs from the TUI.',
+      help: 'Preferred local HTTP port. Defaults to an OS-allocated free port.',
+    )
+    ..addOption(
+      'server-url',
+      help: 'Flan relay URL. Defaults to FLAN_SERVER_URL, then the local '
+          'server on FLAN_SERVER_PORT (4050).',
     )
 ;
 }
@@ -95,10 +105,12 @@ class FlanChannel {
   FlanChannel({
     required this.mcpServer,
     required this.listenPort,
+    required this.serverUrl,
   });
 
   final McpServer mcpServer;
   final int listenPort;
+  final String? serverUrl;
 
   /// The port the HTTP server actually bound to (may differ from [listenPort]
   /// if that port was already in use).
@@ -108,10 +120,30 @@ class FlanChannel {
   final _logger = logging.Logger('FlanChannel');
   HttpServer? _httpServer;
   Timer? _registrationTimer;
+  bool _reportedMissingServerUrl = false;
 
   /// Images (screenshots, drawings) buffered from the last flush, available
   /// for retrieval via the `get_flushed_images` tool.
   final List<Map<String, dynamic>> _pendingImages = [];
+
+  /// Where [_writeImageFile] puts a copy of every image that arrives.
+  ///
+  /// `get_flushed_images` hands the agent an ImageContent — something it can
+  /// LOOK at and cannot write back out — and the call consumes the buffer. So
+  /// an agent asked to file a bug report "with the screenshot" had no way to
+  /// keep the screenshot: nothing on any hop touched disk (this buffer is in
+  /// memory, and the flan server drains its web_queue on delivery). A file on
+  /// disk, named in the channel text, turns that into a copy.
+  ///
+  /// Override with FLAN_IMAGE_DIR.
+  late final Directory _imageDir = Directory(
+    Platform.environment['FLAN_IMAGE_DIR'] ??
+        p_join(Directory.systemTemp.path, 'flan-images'),
+  );
+
+  /// Images older than this are pruned on each write, so a long-running
+  /// channel does not fill the temp directory with screenshots nobody kept.
+  static const _imageRetention = Duration(days: 7);
 
   /// Channel events that have been received from a flush but not yet
   /// confirmed delivered to the Claude session. We hold them here and replay
@@ -129,11 +161,13 @@ class FlanChannel {
   Future<void> start() async {
     // Try the preferred port first, then increment up to _maxPortAttempts.
     for (var attempt = 0; attempt < _maxPortAttempts; attempt++) {
-      final port = listenPort + attempt;
+      final port = listenPort == 0 ? 0 : listenPort + attempt;
       try {
         _httpServer = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
-        _boundPort = port;
-        _logger.info('Listening for flush events on http://127.0.0.1:$port');
+        _boundPort = _httpServer!.port;
+        _logger.info(
+          'Listening for flush events on loopback port $_boundPort',
+        );
         unawaited(_serveRequests());
         unawaited(_registerWithTui());
         // Re-register periodically so the TUI picks us up after restarts.
@@ -153,15 +187,31 @@ class FlanChannel {
   /// let the server resolve which trm pane we belong to (it uses trm's own
   /// `surface.list` RPC, so the index is guaranteed to match).
   Future<void> _registerWithTui() async {
+    final configuredServerUrl = serverUrl;
+    if (configuredServerUrl == null || configuredServerUrl.isEmpty) {
+      if (!_reportedMissingServerUrl) {
+        _logger.warning(
+          'FLAN_SERVER_URL is not configured; channel registration skipped',
+        );
+        _reportedMissingServerUrl = true;
+      }
+      return;
+    }
+
+    final client = HttpClient();
     try {
-      final resp = await HttpClient()
-          .postUrl(Uri.parse('http://127.0.0.1:4050/api/register-channel'))
+      final base = configuredServerUrl.endsWith('/')
+          ? configuredServerUrl
+          : '$configuredServerUrl/';
+      final resp = await client
+          .postUrl(Uri.parse(base).resolve('api/register-channel'))
           .then((req) {
         req.headers.contentType = ContentType.json;
         req.write(jsonEncode({
           'pid': pid,
           'port': _boundPort,
-          'cwd': Directory.current.path,
+          'cwd': Platform.environment['FLAN_CLIENT_CWD'] ??
+              Directory.current.path,
         }));
         return req.close();
       });
@@ -169,7 +219,74 @@ class FlanChannel {
       _logger.info('Registered channel (pid=$pid) → port $_boundPort: ${resp.statusCode} $body');
     } catch (e) {
       _logger.warning('Could not register channel port with TUI: $e');
+    } finally {
+      client.close(force: true);
     }
+  }
+
+  /// The channel line for one attached image: what it is, where it now lives,
+  /// and how to look at it.
+  ///
+  /// The path comes first because it is the part an agent has to ACT on — a
+  /// bug report filed from an annotation is worth little without the picture
+  /// it was drawn on, and copying a file is the only way to keep it.
+  String _imageLine(String kind, Object? payload) {
+    final path = _writeImageFile(kind, payload);
+    if (path == null) {
+      return '[$kind attached — use get_flushed_images to view]';
+    }
+    return '[$kind attached — saved to $path — '
+        'copy it alongside anything you file; '
+        'use get_flushed_images to view it]';
+  }
+
+  /// Decode one image payload and write it into [_imageDir].
+  ///
+  /// Accepts a bare base64 string or a `data:image/png;base64,…` URL, which is
+  /// what the web annotator sends. Returns the path, or null if anything went
+  /// wrong — a screenshot that cannot be saved must never cost the user their
+  /// message, so every failure here degrades to the old behaviour.
+  String? _writeImageFile(String kind, Object? payload) {
+    if (payload is! String || payload.isEmpty) return null;
+    try {
+      final comma = payload.startsWith('data:') ? payload.indexOf(',') : -1;
+      final base64Part = comma >= 0 ? payload.substring(comma + 1) : payload;
+      final bytes = base64Decode(base64Part.trim());
+      if (bytes.isEmpty) return null;
+
+      _imageDir.createSync(recursive: true);
+      _pruneOldImages();
+
+      // Sortable, unique, and readable at a glance in a directory listing.
+      final stamp = DateTime.now()
+          .toIso8601String()
+          .replaceAll(':', '-')
+          .replaceAll('.', '-');
+      final file = File(p_join(_imageDir.path, '$stamp-$kind.png'));
+      file.writeAsBytesSync(bytes);
+      _logger.info('Saved $kind to ${file.path} (${bytes.length} bytes)');
+      return file.path;
+    } catch (e) {
+      _logger.warning('Could not save $kind image: $e');
+      return null;
+    }
+  }
+
+  /// Delete images older than [_imageRetention]. Best-effort and silent: this
+  /// is housekeeping, not a feature, and a file that will not delete is not
+  /// worth a log line on every screenshot.
+  void _pruneOldImages() {
+    try {
+      final cutoff = DateTime.now().subtract(_imageRetention);
+      for (final entity in _imageDir.listSync()) {
+        if (entity is! File || !entity.path.endsWith('.png')) continue;
+        if (entity.statSync().modified.isBefore(cutoff)) {
+          try {
+            entity.deleteSync();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
   }
 
   void registerTools() {
@@ -179,7 +296,10 @@ class FlanChannel {
           'Retrieves screenshots and drawings that were included with the '
           'most recent batch of flushed user messages. Call this when the '
           'channel event mentions attached images. Returns the images as '
-          'base64-encoded PNGs. Each call consumes the buffered images.',
+          'base64-encoded PNGs. Each call consumes the buffered images. Every '
+          'image is also written to a .png file whose path is named in the '
+          'channel event text — copy that file when filing an issue, since '
+          'the images returned here cannot be written back out.',
       annotations: const ToolAnnotations(
         title: 'Get Flushed Images',
         readOnlyHint: true,
@@ -230,6 +350,20 @@ class FlanChannel {
       ..add('Access-Control-Allow-Headers', 'Content-Type');
   }
 
+  String? get _channelDeliveryError {
+    final client = mcpServer.server.getClientVersion();
+    if (client == null) {
+      return 'Flan channel is waiting for MCP client initialization. '
+          'Messages remain in the app queue; retry after the agent connects.';
+    }
+    if (client.name.toLowerCase().contains('codex')) {
+      return 'This Flan channel uses Claude Code channel messaging and cannot '
+          'push into Codex. Messages remain in the app queue. Ask Codex to '
+          'connect to the app and call process_queue.';
+    }
+    return null;
+  }
+
   Future<void> _handle(HttpRequest req) async {
     _addCorsHeaders(req.response);
 
@@ -267,11 +401,33 @@ class FlanChannel {
           'messages=${messages.length}');
 
       if (messages.isEmpty) {
+        final responseBody = jsonEncode({
+          'ok': false,
+          'accepted': false,
+          'delivered': false,
+          'reason': 'no messages',
+        });
         req.response
           ..statusCode = HttpStatus.ok
           ..headers.contentType = ContentType.json
-          ..write(jsonEncode({'ok': false, 'reason': 'no messages'}));
-        await req.response.close();
+          ..contentLength = utf8.encode(responseBody).length
+          ..write(responseBody);
+        return;
+      }
+
+      final deliveryError = _channelDeliveryError;
+      if (deliveryError != null) {
+        final responseBody = jsonEncode({
+          'ok': false,
+          'accepted': false,
+          'delivered': false,
+          'error': deliveryError,
+        });
+        req.response
+          ..statusCode = HttpStatus.conflict
+          ..headers.contentType = ContentType.json
+          ..contentLength = utf8.encode(responseBody).length
+          ..write(responseBody);
         return;
       }
 
@@ -283,19 +439,33 @@ class FlanChannel {
         route: route,
       );
 
-      // Always 200/ok: the event is now durably queued and will be replayed
+      // The event is now queued in this process and will be replayed
       // when the session connects, so the app should treat it as accepted and
       // NOT make the user retype. `delivered` distinguishes pushed-now from
       // queued-for-replay for diagnostics.
+      final responseBody = jsonEncode({
+        'ok': true,
+        'accepted': true,
+        'delivered': delivered,
+      });
       req.response
         ..statusCode = HttpStatus.ok
         ..headers.contentType = ContentType.json
-        ..write(jsonEncode({'ok': true, 'delivered': delivered}));
+        ..contentLength = utf8.encode(responseBody).length
+        ..write(responseBody);
     } catch (err, st) {
       _logger.warning('Error handling flush request', err, st);
+      final responseBody = jsonEncode({
+        'ok': false,
+        'accepted': false,
+        'delivered': false,
+        'error': err.toString(),
+      });
       req.response
         ..statusCode = HttpStatus.internalServerError
-        ..write(jsonEncode({'error': err.toString()}));
+        ..headers.contentType = ContentType.json
+        ..contentLength = utf8.encode(responseBody).length
+        ..write(responseBody);
     } finally {
       await req.response.close();
     }
@@ -378,14 +548,15 @@ class FlanChannel {
           buf.write(formatChatLog(chatLog, data));
         }
 
-        // Buffer images for retrieval via tool
+        // Buffer images for retrieval via tool, and write each one to disk so
+        // it can outlive the buffer — see [_imageDir].
         if (data.containsKey('screenshot')) {
           _pendingImages.add({
             'type': 'screenshot',
             'data': data['screenshot'],
             'mimeType': 'image/png',
           });
-          buf.writeln('[screenshot attached — use get_flushed_images to view]');
+          buf.writeln(_imageLine('screenshot', data['screenshot']));
         }
         if (data.containsKey('drawingImage')) {
           _pendingImages.add({
@@ -393,7 +564,7 @@ class FlanChannel {
             'data': data['drawingImage'],
             'mimeType': 'image/png',
           });
-          buf.writeln('[drawing attached — use get_flushed_images to view]');
+          buf.writeln(_imageLine('drawing', data['drawingImage']));
         }
       }
 
@@ -456,7 +627,7 @@ class FlanChannel {
     _draining = true;
     try {
       while (_pendingEvents.isNotEmpty) {
-        if (!mcpServer.isConnected) {
+        if (!mcpServer.isConnected || _channelDeliveryError != null) {
           _logger.warning(
             'MCP server not connected; ${_pendingEvents.length} channel '
             'event(s) held for replay',
@@ -525,8 +696,19 @@ Future<int> main(List<String> arguments) async {
 
     final levelName = (results.option('log-level') ?? 'INFO').toUpperCase();
     final logFile = results.option('log-file');
-    final listenPort =
-        int.tryParse(results.option('listen-port') ?? '4051') ?? 4051;
+    final listenPort = int.tryParse(
+          results.option('listen-port') ??
+              Platform.environment['FLAN_CHANNEL_PORT'] ??
+              '',
+        ) ??
+        0;
+    // Fall back to the local server rather than skipping registration: the
+    // relay runs on the same host as the agent, so a bare `dart run
+    // flan_channel.dart` in an .mcp.json — with no env plumbed through — should
+    // still announce itself and show up in the TUI.
+    final serverUrl = results.option('server-url') ??
+        Platform.environment['FLAN_SERVER_URL'] ??
+        'http://127.0.0.1:${Platform.environment['FLAN_SERVER_PORT'] ?? '4050'}';
     _setupLogging(levelName, logFile);
 
     final logger = logging.Logger('main');
@@ -557,6 +739,7 @@ Future<int> main(List<String> arguments) async {
     final channel = FlanChannel(
       mcpServer: server,
       listenPort: listenPort,
+      serverUrl: serverUrl,
     );
 
     // Register tools before connecting (capabilities cannot be added after).
