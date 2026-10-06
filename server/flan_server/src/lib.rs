@@ -2708,6 +2708,47 @@ mod server {
         Json(serde_json::json!({ "ok": true, "queued": depth }))
     }
 
+    /// POST /api/tunnel — make a peer's port reachable as localhost.
+    ///
+    /// DELIBERATELY ITS OWN ENDPOINT, and deliberately not a side effect of
+    /// `/api/flutter-apps`. That route is a read, and the TUI polls it every
+    /// few seconds: opening an ssh connection because somebody looked at a
+    /// list is not something a list should do. Asking is an act, so it gets a
+    /// POST somebody has to make.
+    async fn post_tunnel(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+        let host = body
+            .get("host")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let port = body.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+        if host.is_empty() || port == 0 || port > 65535 {
+            return Json(serde_json::json!({
+                "ok": false,
+                "message": "host and port are required",
+            }));
+        }
+
+        match tunnel_rpc(
+            "tunnel.ensure",
+            serde_json::json!({
+                "host": host,
+                "port": port,
+                "open": body.get("open").and_then(|v| v.as_bool()).unwrap_or(true),
+            }),
+        ) {
+            Some(reply) => Json(reply),
+            // The extension not being there is a real and ordinary state, so
+            // it says which socket it looked for rather than reporting a
+            // failure the caller cannot act on.
+            None => Json(serde_json::json!({
+                "ok": false,
+                "message": "trm auto-tunnel extension is not running \
+                            (expected /tmp/trm-tunnel.sock)",
+            })),
+        }
+    }
+
     /// Build the Axum router using the given shared state.
     pub fn build_router(state: Arc<SharedState>) -> Router {
         // Prune dead channel-port mappings every 2s. A flan-channel that has
@@ -2797,6 +2838,7 @@ mod server {
                 get(get_web_messages).post(post_web_message),
             )
             .route("/api/web-messages/consume", post(consume_web_messages))
+            .route("/api/tunnel", post(post_tunnel))
             .layer(cors)
             .layer(TraceLayer::new_for_http())
             .with_state(state)
@@ -5972,6 +6014,53 @@ pub fn trm_rpc(method: &str, params: serde_json::Value) -> Option<serde_json::Va
     if line.starts_with("ERROR") {
         return None;
     }
+    serde_json::from_str(&line).ok()
+}
+
+/// Ask trm's `auto-tunnel` extension to make a peer's port reachable as
+/// localhost, and open it.
+///
+/// Same envelope and the same shape as [`trm_rpc`] — a different socket is the
+/// only difference, because the tunnel manager is an extension rather than trm
+/// itself. Kept as a sibling rather than a parameter on `trm_rpc` so the two
+/// sockets cannot be confused at a call site.
+///
+/// **Why flan is the one asking.** An app discovered on a PEER is not on this
+/// machine, so a browser here cannot reach it — and for a Flutter debug build
+/// it does not merely fail, it kills the server: DWDS dies on a remote browser
+/// connection (`Bad state: No element` in `DebugService._wrapHandler`) and
+/// takes `flutter run` with it. flan is the only thing that knows an app is
+/// remote, so flan is what asks.
+///
+/// `None` means the extension is not installed or not running. That is not an
+/// error and must not be treated as one: discovery still works and the remote
+/// URL still prints, the browser is simply not opened for you.
+pub fn tunnel_rpc(method: &str, params: serde_json::Value) -> Option<serde_json::Value> {
+    use std::os::unix::net::UnixStream;
+
+    let socket = std::env::var("TRM_TUNNEL_SOCKET")
+        .unwrap_or_else(|_| "/tmp/trm-tunnel.sock".to_string());
+    let mut stream = UnixStream::connect(&socket).ok()?;
+    // Longer than trm_rpc's 5s: this one waits on an ssh handshake to another
+    // machine, not on a local window manager.
+    stream.set_read_timeout(Some(Duration::from_secs(20))).ok()?;
+
+    let password =
+        std::env::var("CMUX_SOCKET_PASSWORD").unwrap_or_else(|_| "flan".to_string());
+    let request = serde_json::json!({
+        "id": method,
+        "method": method,
+        "params": params,
+        "password": password,
+    });
+    let mut msg = serde_json::to_string(&request).ok()?;
+    msg.push('\n');
+    stream.write_all(msg.as_bytes()).ok()?;
+    stream.flush().ok()?;
+    stream.shutdown(std::net::Shutdown::Write).ok()?;
+
+    let reader = BufReader::new(&stream);
+    let line = reader.lines().next()?.ok()?;
     serde_json::from_str(&line).ok()
 }
 
