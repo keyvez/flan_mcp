@@ -1171,6 +1171,7 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
     .split(area);
 
     let left_area = cols[0];
+    let left_w = left_area.width.saturating_sub(2) as usize; // account for border
     let conn_area = cols[1];
     let right_area = cols[2];
 
@@ -1181,7 +1182,7 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|row| {
             let fl = row
                 .flutter
-                .map(|fi| build_flutter_lines(app, fi).len())
+                .map(|fi| build_flutter_lines(app, fi, left_w).len())
                 .unwrap_or(0)
                 .max(1);
             let cl = row
@@ -1197,7 +1198,6 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     // ── Flutter column (left) ────────────────────────────────────────
-    let left_w = left_area.width.saturating_sub(2) as usize; // account for border
     let flutter_items: Vec<ListItem> = rows
         .iter()
         .enumerate()
@@ -1211,7 +1211,7 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
 
             let content_lines = row
                 .flutter
-                .map(|fi| build_flutter_lines(app, fi))
+                .map(|fi| build_flutter_lines(app, fi, left_w))
                 .unwrap_or_default();
 
             let max_lines = row_heights[row_idx];
@@ -1342,7 +1342,51 @@ fn render_rows(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(claude_list, right_area, &mut app.claude_list_state);
 }
 
-fn build_flutter_lines(app: &App, idx: usize) -> Vec<(String, Style)> {
+/// The host as a person says it. A tailnet FQDN is the same machine as its
+/// first label — `m1.follow-ionian.ts.net` IS `m1` — and spelling it out costs
+/// 21 columns that the port then loses.
+fn short_host(host: &str) -> &str {
+    if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
+        return host;
+    }
+    host.split('.').next().unwrap_or(host)
+}
+
+/// The first line of a Flutter app row, fitted to `width`.
+///
+/// `host:port` is built first and never truncated: two apps on two machines
+/// differ ONLY by it, so it is the one part of the line that must survive. The
+/// tail-truncation that applies to every other line would take the port first —
+/// `frontend  (web-server)  m1.follow-ionian.ts.net:5305` in a 44%-wide column
+/// ends up as `frontend  (web-server)  m1.foll…`, which names neither machine
+/// nor app. The device parenthetical goes first when room runs out, then the
+/// folder name is shortened.
+fn flutter_headline(
+    folder: &str,
+    device: &str,
+    host: &str,
+    port: Option<u16>,
+    width: usize,
+) -> String {
+    let host = short_host(host);
+    let endpoint = match port {
+        Some(port) => format!("  {host}:{port}"),
+        None => format!("  {host}"),
+    };
+    let endpoint_width = char_width(&endpoint);
+
+    let with_device = format!("{folder}  ({device})");
+    if char_width(&with_device) + endpoint_width <= width {
+        return format!("{with_device}{endpoint}");
+    }
+    if char_width(folder) + endpoint_width <= width {
+        return format!("{folder}{endpoint}");
+    }
+    let room = width.saturating_sub(endpoint_width);
+    format!("{}{}", truncate_str(folder, room), endpoint)
+}
+
+fn build_flutter_lines(app: &App, idx: usize, width: usize) -> Vec<(String, Style)> {
     let fl = &app.flutter_apps[idx];
     let mut lines = Vec::new();
 
@@ -1353,12 +1397,8 @@ fn build_flutter_lines(app: &App, idx: usize) -> Vec<(String, Style)> {
     // built twice. An app found locally reports no host, so it gets this
     // machine's name: "not remote" is a fact about this machine, not a blank.
     let host = fl.host.clone().unwrap_or_else(local_hostname);
-    let where_ = match fl.web_port {
-        Some(port) => format!("  {host}:{port}"),
-        None => format!("  {host}"),
-    };
     lines.push((
-        format!("{}  ({}){}", fl.folder_name, device, where_),
+        flutter_headline(&fl.folder_name, device, &host, fl.web_port, width),
         Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
     ));
 
@@ -2405,6 +2445,41 @@ async fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report: a long URL hides the port. `truncate_str` cuts the tail, and
+    /// the tail is `:5305` — the only thing distinguishing two copies of one app
+    /// on two machines.
+    #[test]
+    fn the_endpoint_survives_a_narrow_column() {
+        // Comfortable: everything shown, FQDN shortened to the machine name.
+        assert_eq!(
+            flutter_headline("frontend", "web-server", "m1.follow-ionian.ts.net", Some(5305), 60),
+            "frontend  (web-server)  m1:5305",
+        );
+
+        // Tight: the device goes, the endpoint stays.
+        let narrow = flutter_headline(
+            "resume-parser-frontend",
+            "web-server",
+            "m1.follow-ionian.ts.net",
+            Some(5305),
+            30,
+        );
+        assert!(narrow.ends_with("m1:5305"), "{narrow}");
+        assert!(char_width(&narrow) <= 30, "{narrow} is {} wide", char_width(&narrow));
+
+        // Brutal: the name is cut, the endpoint is still whole.
+        let tiny = flutter_headline("a-very-long-worktree-name", "chrome", "mini", Some(8087), 18);
+        assert!(tiny.ends_with("mini:8087"), "{tiny}");
+        assert!(char_width(&tiny) <= 18, "{tiny}");
+    }
+
+    #[test]
+    fn an_ip_address_is_not_a_hostname_to_shorten() {
+        assert_eq!(short_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(short_host("mini.follow-ionian.ts.net"), "mini");
+        assert_eq!(short_host("localhost"), "localhost");
+    }
 
     fn sess(port: Option<u16>, name: &str, cwd: &str) -> AgentSession {
         AgentSession {
