@@ -294,18 +294,90 @@ class GitHubIssueService {
   /// A markdown environment section for the issue body, mirroring the labels.
   static String _buildEnvSection() {
     final meta = metadataProvider?.call() ?? const {};
-    if (meta.isEmpty) return '';
     final buf = StringBuffer()
       ..writeln('### Environment')
       ..writeln();
+    // The page at the moment of filing. An error report has no queued
+    // message to carry a URL, so this is the only place it gets one.
+    final page = _currentPageUrl();
+    if (page != null) buf.writeln('- **filed from:** $page');
     for (final e in meta.entries) {
       if (e.key == 'breadcrumb') continue;
       if (e.value.trim().isEmpty) continue;
       buf.writeln('- **${e.key}:** ${e.value}');
     }
+    for (final e in _clientContext().entries) {
+      buf.writeln('- **${e.key}:** ${e.value}');
+    }
     buf.writeln();
     return buf.toString();
   }
+
+  /// The message's own page: its URL (absolute, so it can be clicked) and the
+  /// route stack when it says something the URL does not.
+  static String _pageSection(Map<String, dynamic>? data) {
+    final url = data?['url']?.toString().trim() ?? '';
+    final stack = data?['routeStack']?.toString().trim() ?? '';
+    if (url.isEmpty && stack.isEmpty) return '';
+    final buf = StringBuffer();
+    if (url.isNotEmpty) buf.writeln('**Page:** ${_absolute(url)}');
+    if (stack.isNotEmpty && stack != url) {
+      buf.writeln('**Route stack:** `$stack`');
+    }
+    buf.writeln();
+    return buf.toString();
+  }
+
+  /// A router path ("/s/job/42") made into a link on web, where the page has
+  /// an origin to put in front of it. Off the web it stays as the path.
+  static String _absolute(String url) {
+    if (!url.startsWith('/') || !kIsWeb) return url;
+    try {
+      return '${Uri.base.origin}$url';
+    } catch (_) {
+      return url;
+    }
+  }
+
+  static String? _currentPageUrl() {
+    if (!kIsWeb) return null;
+    try {
+      final base = Uri.base.toString();
+      return base.isEmpty ? null : base;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// What the reporter's screen looked like: the window size (layout bugs
+  /// are usually width bugs), light or dark, locale and platform. Nothing
+  /// that identifies the person.
+  static Map<String, String> _clientContext() {
+    final out = <String, String>{};
+    try {
+      final dispatcher = PlatformDispatcher.instance;
+      final view = dispatcher.views.firstOrNull;
+      if (view != null) {
+        final ratio = view.devicePixelRatio;
+        final size = view.physicalSize / ratio;
+        out['window'] = '${size.width.round()}x${size.height.round()} '
+            '@${ratio.toStringAsFixed(ratio == ratio.roundToDouble() ? 0 : 2)}x';
+      }
+      out['theme'] = dispatcher.platformBrightness.name;
+      out['locale'] = dispatcher.locale.toLanguageTag();
+    } catch (_) {
+      // Best effort: a missing view must not stop an issue being filed.
+    }
+    out['platform'] = kIsWeb
+        ? 'web (${defaultTargetPlatform.name})'
+        : defaultTargetPlatform.name;
+    return out;
+  }
+
+  /// The issue body for [messages], as [createIssueFromMessages] sends it.
+  @visibleForTesting
+  static String buildBodyForTest(List<Map<String, dynamic>> messages) =>
+      _buildBody(messages);
 
   static String _buildBody(List<Map<String, dynamic>> messages) {
     final buf = StringBuffer();
@@ -324,6 +396,11 @@ class GitHubIssueService {
         buf.writeln(text);
         buf.writeln();
       }
+
+      // Where it was reported from. Every queued message carries this (the
+      // overlay's _NavContext), and the issue used to drop it: a bug report
+      // that does not say which page it is about.
+      buf.write(_pageSection(msg['data'] as Map<String, dynamic>?));
 
       // Error details
       if (type == 'error') {

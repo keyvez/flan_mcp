@@ -49,4 +49,36 @@ void main() {
       );
     });
   });
+
+  group('issue body', () {
+    test('names the page each message was reported from', () {
+      final body = GitHubIssueService.buildBodyForTest([
+        {
+          'type': 'user_message',
+          'text': 'standardize these pills',
+          'data': {
+            'url': '/s/application?open=42',
+            'routeStack': 'shell / applications',
+          },
+        },
+      ]);
+      expect(body, contains('**Page:** /s/application?open=42'));
+      expect(body, contains('**Route stack:** `shell / applications`'));
+    });
+
+    test('a message without a page writes no page line', () {
+      final body = GitHubIssueService.buildBodyForTest([
+        {'type': 'user_message', 'text': 'hello', 'data': <String, dynamic>{}},
+      ]);
+      expect(body, isNot(contains('**Page:**')));
+    });
+
+    test('the environment says what the screen was like', () {
+      final body = GitHubIssueService.buildBodyForTest([
+        {'type': 'user_message', 'text': 'x'},
+      ]);
+      expect(body, contains('### Environment'));
+      expect(body, contains('- **platform:**'));
+    });
+  });
 }
