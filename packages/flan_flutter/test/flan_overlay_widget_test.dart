@@ -180,8 +180,11 @@ void main() {
 
     /// `flutter run -d web-server` owns no browser, so the host compiles and the
     /// page keeps running the old build — "Recompile complete. No client
-    /// connected." The refresh is the last step and only the app can take it.
-    testWidgets('a recompile that reached no client offers a page refresh',
+    /// connected." The refresh is the last step and only the app can take it,
+    /// so it takes it: the injected debug client only attaches with the Dart
+    /// Debug Extension, and without one a reload is never reaching this page.
+    /// Offering a button only put a click in front of the single answer.
+    testWidgets('a recompile that reached no client refreshes the page',
         (tester) async {
       var refreshed = 0;
       PageReloader.debugOverride = () => refreshed++;
@@ -212,12 +215,12 @@ void main() {
         await Future<void>.delayed(const Duration(milliseconds: 50));
       });
 
-      expect(find.textContaining('No client connected'), findsOneWidget);
-      expect(refreshed, 0, reason: 'a reload must not refresh behind your back');
-
-      await tester.tap(find.text('Refresh page'));
-      await tester.pump();
-      expect(refreshed, 1);
+      expect(refreshed, 1,
+          reason: 'the page is the only thing that can finish it');
+      // And it says so, rather than reporting the relay's "failed" over a
+      // recompile that succeeded and a refresh that is already happening.
+      expect(find.textContaining('refreshing the page'), findsOneWidget);
+      expect(find.text('Hot reload failed'), findsNothing);
     });
 
     testWidgets('a hot restart is reported as a restart, not a reload',
@@ -524,7 +527,11 @@ void main() {
       // Add a message to the queue
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 60, height: 40, text: 'queued',
+          x: 10,
+          y: 10,
+          width: 60,
+          height: 40,
+          text: 'queued',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -532,7 +539,7 @@ void main() {
       // Open queue panel
       await tester.tap(find.text('Q'));
       await tester.pumpAndSettle();
-      expect(find.textContaining('Queued messages'), findsOneWidget);
+      expect(find.textContaining('Queued ('), findsOneWidget);
 
       // Trigger an error and open error panel
       _installInterceptorSafely(errorInterceptor);
@@ -547,7 +554,7 @@ void main() {
       // Error panel visible, queue panel dismissed
       expect(find.text('1 error'), findsOneWidget);
       // Queue panel header should be gone (queue badge still shows "Q")
-      expect(find.textContaining('Queued messages'), findsNothing);
+      expect(find.textContaining('Queued ('), findsNothing);
     });
   });
 
@@ -585,7 +592,11 @@ void main() {
       // Add annotation while mode is on, then disable
       annotationService.enable();
       annotationService.addAnnotationProgrammatically(
-        x: 50, y: 50, width: 100, height: 60, text: 'persist',
+        x: 50,
+        y: 50,
+        width: 100,
+        height: 60,
+        text: 'persist',
       );
       await tester.pumpAndSettle();
 
@@ -616,7 +627,11 @@ void main() {
       // Add a message to the queue
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 60, height: 40, text: 'queued',
+          x: 10,
+          y: 10,
+          width: 60,
+          height: 40,
+          text: 'queued',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -651,7 +666,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 60, height: 40, text: 'msg',
+          x: 10,
+          y: 10,
+          width: 60,
+          height: 40,
+          text: 'msg',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -659,12 +678,12 @@ void main() {
       // Open
       await tester.tap(find.text('Q'));
       await tester.pumpAndSettle();
-      expect(find.textContaining('Queued messages'), findsOneWidget);
+      expect(find.textContaining('Queued ('), findsOneWidget);
 
       // Close
       await tester.tap(find.text('Q'));
       await tester.pumpAndSettle();
-      expect(find.textContaining('Queued messages'), findsNothing);
+      expect(find.textContaining('Queued ('), findsNothing);
     });
 
     testWidgets('opening queue panel closes error panel', (tester) async {
@@ -685,7 +704,11 @@ void main() {
       // Add a message and open queue panel
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 60, height: 40, text: 'item',
+          x: 10,
+          y: 10,
+          width: 60,
+          height: 40,
+          text: 'item',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -694,7 +717,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // Queue panel open, error panel closed
-      expect(find.textContaining('Queued messages'), findsOneWidget);
+      expect(find.textContaining('Queued ('), findsOneWidget);
       expect(find.text('1 error'), findsNothing);
     });
 
@@ -704,7 +727,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 60, height: 40, text: 'flush me',
+          x: 10,
+          y: 10,
+          width: 60,
+          height: 40,
+          text: 'flush me',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -721,7 +748,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 60, height: 40, text: 'clear me',
+          x: 10,
+          y: 10,
+          width: 60,
+          height: 40,
+          text: 'clear me',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -744,7 +775,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 60, height: 40, text: 'deletable',
+          x: 10,
+          y: 10,
+          width: 60,
+          height: 40,
+          text: 'deletable',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -987,7 +1022,11 @@ void main() {
       // Add annotation which creates a draft
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'draft ann',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'draft ann',
         );
         await Future<void>.delayed(const Duration(milliseconds: 300));
       });
@@ -1012,7 +1051,11 @@ void main() {
       // Add annotation with specific text
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 50, y: 50, width: 100, height: 60, text: 'Bug here',
+          x: 50,
+          y: 50,
+          width: 100,
+          height: 60,
+          text: 'Bug here',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1031,10 +1074,18 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'First',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'First',
         );
         annotationService.addAnnotationProgrammatically(
-          x: 100, y: 100, width: 50, height: 30, text: 'Second',
+          x: 100,
+          y: 100,
+          width: 50,
+          height: 30,
+          text: 'Second',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1057,7 +1108,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 20, y: 20, width: 80, height: 50, text: 'Draft test',
+          x: 20,
+          y: 20,
+          width: 80,
+          height: 50,
+          text: 'Draft test',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1076,7 +1131,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 20, y: 20, width: 80, height: 50, text: 'Original',
+          x: 20,
+          y: 20,
+          width: 80,
+          height: 50,
+          text: 'Original',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1101,7 +1160,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 20, y: 20, width: 80, height: 50, text: 'Will clear',
+          x: 20,
+          y: 20,
+          width: 80,
+          height: 50,
+          text: 'Will clear',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1126,7 +1189,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'to delete',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'to delete',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1152,7 +1219,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'editable',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'editable',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1187,8 +1258,7 @@ void main() {
       });
 
       // A message should have been sent
-      expect(userMessageService.pendingMessageCount,
-          greaterThan(countBefore));
+      expect(userMessageService.pendingMessageCount, greaterThan(countBefore));
     });
   });
 
@@ -1255,7 +1325,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 50, y: 50, width: 100, height: 60, text: 'Label A',
+          x: 50,
+          y: 50,
+          width: 100,
+          height: 60,
+          text: 'Label A',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1293,14 +1367,17 @@ void main() {
   });
 
   group('Queue panel remove message', () {
-    testWidgets('removing annotation draft clears annotations',
-        (tester) async {
+    testWidgets('removing annotation draft clears annotations', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'remove draft',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'remove draft',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1330,7 +1407,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'clear all draft',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'clear all draft',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1380,7 +1461,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'done test',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'done test',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1652,7 +1737,8 @@ void main() {
   });
 
   group('Q badge interaction when inspector active', () {
-    testWidgets('tapping Q with no messages and inspector active disables inspector',
+    testWidgets(
+        'tapping Q with no messages and inspector active disables inspector',
         (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
@@ -1685,7 +1771,8 @@ void main() {
       await tester.tap(find.text('1').first);
       await tester.pumpAndSettle();
 
-      expect(find.textContaining('detailed error message here'), findsOneWidget);
+      expect(
+          find.textContaining('detailed error message here'), findsOneWidget);
     });
 
     testWidgets('adding error to queue dismisses it', (tester) async {
@@ -1738,7 +1825,11 @@ void main() {
       // Add a message to the queue
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 60, height: 40, text: 'esc test',
+          x: 10,
+          y: 10,
+          width: 60,
+          height: 40,
+          text: 'esc test',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1746,7 +1837,7 @@ void main() {
       // Open queue panel
       await tester.tap(find.text('Q'));
       await tester.pumpAndSettle();
-      expect(find.textContaining('Queued messages'), findsOneWidget);
+      expect(find.textContaining('Queued ('), findsOneWidget);
 
       // Note: Escape doesn't directly close the queue panel in this impl,
       // but it should close the annotation mode if active
@@ -1794,6 +1885,24 @@ void main() {
       // Badge should still show Q
       expect(find.text('Q'), findsOneWidget);
     });
+
+    testWidgets('spins a ring around the badge while the agent works',
+        (tester) async {
+      await tester.pumpWidget(_app());
+      await tester.pumpAndSettle();
+      final idleSpinners = find.byType(RotationTransition).evaluate().length;
+
+      userMessageService.isAgentWorking = true;
+      // pump(), not pumpAndSettle(): the ring repeats until the agent stops.
+      await tester.pump();
+      expect(find.byType(RotationTransition).evaluate().length,
+          idleSpinners + 1);
+
+      userMessageService.isAgentWorking = false;
+      await tester.pumpAndSettle();
+      expect(
+          find.byType(RotationTransition).evaluate().length, idleSpinners);
+    });
   });
 
   group('Agent listening state', () {
@@ -1820,10 +1929,18 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'Keep',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'Keep',
         );
         annotationService.addAnnotationProgrammatically(
-          x: 100, y: 100, width: 50, height: 30, text: 'Remove',
+          x: 100,
+          y: 100,
+          width: 50,
+          height: 30,
+          text: 'Remove',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1888,7 +2005,11 @@ void main() {
       // Add annotation
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'from annotation mode',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'from annotation mode',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -1898,7 +2019,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // Queue panel should be visible
-      expect(find.textContaining('Queued messages'), findsOneWidget);
+      expect(find.textContaining('Queued ('), findsOneWidget);
     });
   });
 
@@ -2012,8 +2133,7 @@ void main() {
   });
 
   group('Queued messages panel Send button', () {
-    testWidgets('Send button text appears when messages exist',
-        (tester) async {
+    testWidgets('Send button text appears when messages exist', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
@@ -2067,8 +2187,7 @@ void main() {
   });
 
   group('Text message submitted callback', () {
-    testWidgets('overlay shows send message title',
-        (tester) async {
+    testWidgets('overlay shows send message title', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
@@ -2104,7 +2223,11 @@ void main() {
       // Add annotation which creates a draft
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'consume test',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'consume test',
         );
         await Future<void>.delayed(const Duration(milliseconds: 300));
       });
@@ -2158,7 +2281,11 @@ void main() {
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 10, y: 10, width: 50, height: 30, text: 'chip delete',
+          x: 10,
+          y: 10,
+          width: 50,
+          height: 30,
+          text: 'chip delete',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -2324,7 +2451,11 @@ void main() {
       // Also add an annotation
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 50, y: 50, width: 60, height: 40, text: 'keep this',
+          x: 50,
+          y: 50,
+          width: 60,
+          height: 40,
+          text: 'keep this',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -2439,8 +2570,7 @@ void main() {
   });
 
   group('Text message submission', () {
-    testWidgets('text overlay has EditableText for user input',
-        (tester) async {
+    testWidgets('text overlay has EditableText for user input', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
       await _runAsyncAndSettle(tester, () async {
@@ -2565,8 +2695,7 @@ void main() {
   });
 
   group('Annotation overlay text input', () {
-    testWidgets('annotation mode has CustomPaint and Listener',
-        (tester) async {
+    testWidgets('annotation mode has CustomPaint and Listener', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
@@ -2766,8 +2895,7 @@ void main() {
       expect(inspectorService.enabled, isTrue);
     });
 
-    testWidgets('Ctrl+Shift+H disables inspector when active',
-        (tester) async {
+    testWidgets('Ctrl+Shift+H disables inspector when active', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
@@ -2797,7 +2925,11 @@ void main() {
       // Add an annotation which triggers auto-draft in the queue
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 100, y: 100, width: 80, height: 40, text: 'draft me',
+          x: 100,
+          y: 100,
+          width: 80,
+          height: 40,
+          text: 'draft me',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -2857,13 +2989,13 @@ void main() {
       await tester.tap(find.text('Q'));
       await tester.pumpAndSettle();
 
-      expect(find.textContaining('Queued messages'), findsOneWidget);
+      expect(find.textContaining('Queued ('), findsOneWidget);
 
       // Close queue panel by tapping Q again
       await tester.tap(find.text('Q'));
       await tester.pumpAndSettle();
 
-      expect(find.textContaining('Queued messages'), findsNothing);
+      expect(find.textContaining('Queued ('), findsNothing);
     });
   });
 
@@ -2905,7 +3037,11 @@ void main() {
       await _runAsyncAndSettle(tester, () async {
         annotationService.enable();
         annotationService.addAnnotationProgrammatically(
-          x: 100, y: 100, width: 80, height: 40, text: 'test',
+          x: 100,
+          y: 100,
+          width: 80,
+          height: 40,
+          text: 'test',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -3111,14 +3247,22 @@ void main() {
       // Add multiple annotations
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 50, y: 50, width: 60, height: 40, text: 'chip 1',
+          x: 50,
+          y: 50,
+          width: 60,
+          height: 40,
+          text: 'chip 1',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
 
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 200, y: 200, width: 60, height: 40, text: 'chip 2',
+          x: 200,
+          y: 200,
+          width: 60,
+          height: 40,
+          text: 'chip 2',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -3145,11 +3289,19 @@ void main() {
       // Add two annotations
       await _runAsyncAndSettle(tester, () async {
         annotationService.addAnnotationProgrammatically(
-          x: 50, y: 50, width: 60, height: 40, text: 'keep',
+          x: 50,
+          y: 50,
+          width: 60,
+          height: 40,
+          text: 'keep',
         );
         await Future<void>.delayed(const Duration(milliseconds: 100));
         annotationService.addAnnotationProgrammatically(
-          x: 200, y: 200, width: 60, height: 40, text: 'remove',
+          x: 200,
+          y: 200,
+          width: 60,
+          height: 40,
+          text: 'remove',
         );
         await Future<void>.delayed(const Duration(milliseconds: 200));
       });
@@ -3286,6 +3438,301 @@ void main() {
 
       // Messages should be cleared
       expect(userMessageService.peekMessages(), isEmpty);
+    });
+  });
+
+  group('Queue panel sent items', () {
+    testWidgets(
+        'a sent message stays in the queue with what the agent says, '
+        'and the filters split it from what is waiting', (tester) async {
+      final relay = FlanServerClient(
+        serverUrl: 'http://relay.test',
+        appId: 'app-a',
+        httpClient: http_testing.MockClient((request) async {
+          if (request.url.path == '/api/flush') {
+            return http.Response(
+              jsonEncode({
+                'accepted': true,
+                'delivered': true,
+                'agent_turn': {'agent_pid': 9, 'delivered_at_ms': 1000},
+              }),
+              200,
+            );
+          }
+          if (request.url.path == '/api/agent-turn') {
+            return http.Response(
+              jsonEncode({'alive': true, 'finished': false, 'status': 'busy'}),
+              200,
+            );
+          }
+          return http.Response('{}', 200);
+        }),
+      );
+
+      await tester.pumpWidget(_app(serverClient: relay));
+      await tester.pumpAndSettle();
+      await _runAsyncAndSettle(tester, () async {
+        await userMessageService.ensureHydrated();
+        userMessageService
+            .sendMessage({'type': 'user_feedback', 'text': 'fix the header'});
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+
+      await tester.tap(find.text('Q'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Send'));
+      for (var i = 0; i < 3; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      // Sent, and still in the open panel as the agent's work.
+      expect(userMessageService.peekMessages(), isEmpty);
+      expect(find.text('fix the header'), findsOneWidget);
+      expect(find.text('Working'), findsOneWidget);
+
+      const turn = FlanAgentTurn(agentPid: 9, deliveredAtMs: 1000);
+      userMessageService.recordAgentProgress(
+        turn,
+        const FlanAgentTurnState(
+          alive: true,
+          finished: false,
+          messages: [
+            FlanAgentMessage(atMs: 1200, text: 'Reading the header code.'),
+          ],
+        ),
+      );
+      await _runAsyncAndSettle(tester, () async {
+        userMessageService
+            .sendMessage({'type': 'user_feedback', 'text': 'then the footer'});
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      expect(find.text('Reading the header code.'), findsOneWidget);
+      expect(find.text('then the footer'), findsOneWidget);
+      expect(find.text('All (2)'), findsOneWidget);
+
+      // Active: the one being worked on and the one waiting.
+      await tester.tap(find.byKey(const ValueKey('flan-queue-filter-active')));
+      await tester.pump();
+      expect(find.text('Active (2)'), findsOneWidget);
+      expect(find.text('fix the header'), findsOneWidget);
+      expect(find.text('then the footer'), findsOneWidget);
+
+      await tester
+          .tap(find.byKey(const ValueKey('flan-queue-filter-notStarted')));
+      await tester.pump();
+      expect(find.text('fix the header'), findsNothing);
+      expect(find.text('then the footer'), findsOneWidget);
+
+      await tester
+          .tap(find.byKey(const ValueKey('flan-queue-filter-completed')));
+      await tester.pump();
+      expect(find.text('Nothing completed yet.'), findsOneWidget);
+
+      userMessageService.recordAgentProgress(
+        turn,
+        const FlanAgentTurnState(
+          alive: true,
+          finished: true,
+          messages: [
+            FlanAgentMessage(atMs: 1200, text: 'Reading the header code.'),
+            FlanAgentMessage(
+              atMs: 1500,
+              text: '## **The header is fixed** now, after moving the '
+                  '`Padding` out of the `Row`.\n\nDetails follow.',
+            ),
+          ],
+        ),
+      );
+      await tester.pump();
+      expect(find.text('fix the header'), findsOneWidget);
+      expect(find.text('Done'), findsOneWidget);
+      // One line, saying what it did; the rest on a tap.
+      const oneLine = 'The header is fixed now, after moving the Padding out '
+          'of the Row.';
+      expect(find.text(oneLine), findsOneWidget);
+      await tester.tap(find.text(oneLine));
+      await tester.pump();
+      expect(find.textContaining('Details follow.'), findsOneWidget);
+      expect(find.text('then the footer'), findsNothing);
+
+      // Once it is done, Active is only what is still waiting.
+      await tester.tap(find.byKey(const ValueKey('flan-queue-filter-active')));
+      await tester.pump();
+      expect(find.text('fix the header'), findsNothing);
+      expect(find.text('then the footer'), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox());
+      userMessageService.markDone();
+      // Stops its polling of the turn still being worked on.
+      userMessageService.dispose();
+    });
+  });
+
+  group('Queue panel auto-drain', () {
+    testWidgets(
+        'sends one task at a time, and the next when the agent finishes',
+        (tester) async {
+      final flushed = <String>[];
+      var turnFinished = false;
+      final relay = FlanServerClient(
+        serverUrl: 'http://relay.test',
+        appId: 'app-a',
+        httpClient: http_testing.MockClient((request) async {
+          if (request.url.path == '/api/flush') {
+            final body = jsonDecode(request.body) as Map<String, dynamic>;
+            final messages = body['messages'] as List;
+            flushed.addAll(messages.map((m) => (m as Map)['text'] as String));
+            return http.Response(
+              jsonEncode({
+                'accepted': true,
+                'delivered': true,
+                'agent_turn': {
+                  'agent_pid': 4242,
+                  'delivered_at_ms': 1000 + flushed.length,
+                  'host': null,
+                },
+              }),
+              200,
+            );
+          }
+          if (request.url.path == '/api/agent-turn') {
+            expect(request.url.queryParameters['pid'], '4242');
+            return http.Response(
+              jsonEncode({'alive': true, 'finished': turnFinished}),
+              200,
+            );
+          }
+          return http.Response('{}', 200);
+        }),
+      );
+
+      await tester.pumpWidget(_app(serverClient: relay));
+      await tester.pumpAndSettle();
+      await _runAsyncAndSettle(tester, () async {
+        await userMessageService.ensureHydrated();
+        userMessageService
+            .sendMessage({'type': 'user_feedback', 'text': 'one'});
+        userMessageService
+            .sendMessage({'type': 'user_feedback', 'text': 'two'});
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+
+      await tester.tap(find.text('Q'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('flan-auto-drain-toggle')));
+      await tester.pumpAndSettle();
+      expect(userMessageService.autoDrain, isTrue);
+      expect(find.text('Auto-drain on'), findsOneWidget);
+
+      // Switching it on starts the queue: no agent has a turn open, so the
+      // oldest task goes out by itself — once.
+      for (var i = 0; i < 3; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(flushed, ['one']);
+      expect(
+        userMessageService.peekMessages().map((m) => m['text']),
+        ['two'],
+      );
+
+      // Still working: a poll leaves the rest queued.
+      await tester.pump(const Duration(seconds: 2));
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 50)),
+      );
+      await tester.pump();
+      expect(flushed, ['one']);
+
+      // The turn ends: the next task goes out on its own.
+      turnFinished = true;
+      await tester.pump(const Duration(seconds: 2));
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 100)),
+      );
+      await tester.pump();
+      expect(flushed, ['one', 'two']);
+      expect(userMessageService.peekMessages(), isEmpty);
+
+      // Tear down the poll timer the second task started, and the service's
+      // working timeout.
+      await tester.pumpWidget(const SizedBox());
+      userMessageService.markDone();
+      // Stops its polling of the turn still being worked on.
+      userMessageService.dispose();
+    });
+  });
+
+  group('Queue panel auto-drain, sends', () {
+    testWidgets('a Send mid-task goes out at once, and nothing goes twice',
+        (tester) async {
+      final flushed = <String>[];
+      final relay = FlanServerClient(
+        serverUrl: 'http://relay.test',
+        appId: 'app-a',
+        httpClient: http_testing.MockClient((request) async {
+          if (request.url.path == '/api/flush') {
+            final body = jsonDecode(request.body) as Map<String, dynamic>;
+            flushed.addAll((body['messages'] as List)
+                .map((m) => (m as Map)['text'] as String));
+            return http.Response(
+              jsonEncode({
+                'accepted': true,
+                'delivered': true,
+                'agent_turn': {'agent_pid': 7, 'delivered_at_ms': 1000},
+              }),
+              200,
+            );
+          }
+          if (request.url.path == '/api/agent-turn') {
+            // Busy for the whole test: nothing goes out on its own.
+            return http.Response(
+              jsonEncode({'alive': true, 'finished': false, 'status': 'busy'}),
+              200,
+            );
+          }
+          return http.Response('{}', 200);
+        }),
+      );
+
+      await tester.pumpWidget(_app(serverClient: relay));
+      await tester.pumpAndSettle();
+      await _runAsyncAndSettle(tester, () async {
+        await userMessageService.ensureHydrated();
+        for (final t in ['one', 'two', 'three']) {
+          userMessageService.sendMessage({'type': 'user_feedback', 'text': t});
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+
+      await tester.tap(find.text('Q'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('flan-auto-drain-toggle')));
+      await tester.pump();
+      // Pressed while the drain's own send of 'one' may still be out.
+      await tester.tap(find.text('Send'));
+      for (var i = 0; i < 3; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      expect(flushed, ['one', 'two']);
+      expect(
+        userMessageService.peekMessages().map((m) => m['text']),
+        ['three'],
+      );
+
+      await tester.pumpWidget(const SizedBox());
+      userMessageService.markDone();
+      // Stops its polling of the turn still being worked on.
+      userMessageService.dispose();
     });
   });
 
@@ -3456,8 +3903,7 @@ void main() {
   });
 
   group('Annotation overlay pointer down/move/up', () {
-    testWidgets('drag creates pending rect in annotation mode',
-        (tester) async {
+    testWidgets('drag creates pending rect in annotation mode', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
@@ -3486,8 +3932,7 @@ void main() {
       }
     });
 
-    testWidgets('tap on existing annotation enters edit mode',
-        (tester) async {
+    testWidgets('tap on existing annotation enters edit mode', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
@@ -3495,7 +3940,11 @@ void main() {
 
       // Add an annotation programmatically
       annotationService.addAnnotationProgrammatically(
-        x: 100, y: 100, width: 100, height: 60, text: 'existing',
+        x: 100,
+        y: 100,
+        width: 100,
+        height: 60,
+        text: 'existing',
       );
       await tester.pumpAndSettle();
 
@@ -3762,15 +4211,18 @@ void main() {
       expect(annotationService.enabled, isFalse);
     });
 
-    testWidgets(
-        'Escape cancels editing existing annotation but stays in mode',
+    testWidgets('Escape cancels editing existing annotation but stays in mode',
         (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
       annotationService.enable();
       annotationService.addAnnotationProgrammatically(
-        x: 10, y: 10, width: 80, height: 60, text: 'existing',
+        x: 10,
+        y: 10,
+        width: 80,
+        height: 60,
+        text: 'existing',
       );
       await tester.pumpAndSettle();
 
@@ -4039,8 +4491,7 @@ void main() {
   });
 
   group('Error dot tap opens/closes panel', () {
-    testWidgets('tapping error dot opens panel then closes it',
-        (tester) async {
+    testWidgets('tapping error dot opens panel then closes it', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
@@ -4315,14 +4766,17 @@ void main() {
   });
 
   group('Annotation edit existing text', () {
-    testWidgets('tapping existing annotation enters edit mode',
-        (tester) async {
+    testWidgets('tapping existing annotation enters edit mode', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
       annotationService.enable();
       annotationService.addAnnotationProgrammatically(
-        x: 100, y: 100, width: 120, height: 60, text: 'edit existing',
+        x: 100,
+        y: 100,
+        width: 120,
+        height: 60,
+        text: 'edit existing',
       );
       await tester.pumpAndSettle();
 
@@ -4331,8 +4785,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // Should be in editingExisting state
-      if (annotationService.drawState ==
-          AnnotationDrawState.editingExisting) {
+      if (annotationService.drawState == AnnotationDrawState.editingExisting) {
         // EditableText should be present for editing
         final editables = find.byType(EditableText);
         expect(editables, findsAtLeastNWidgets(1));
@@ -4350,8 +4803,7 @@ void main() {
   });
 
   group('Text overlay drawing text tool', () {
-    testWidgets('text tool creates floating text input on tap',
-        (tester) async {
+    testWidgets('text tool creates floating text input on tap', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
 
@@ -4451,7 +4903,11 @@ void main() {
 
       annotationService.enable();
       annotationService.addAnnotationProgrammatically(
-        x: 100, y: 100, width: 120, height: 60, text: 'delete from edit',
+        x: 100,
+        y: 100,
+        width: 120,
+        height: 60,
+        text: 'delete from edit',
       );
       await tester.pumpAndSettle();
 
@@ -4459,8 +4915,7 @@ void main() {
       await tester.tapAt(const Offset(160, 130));
       await tester.pumpAndSettle();
 
-      if (annotationService.drawState ==
-          AnnotationDrawState.editingExisting) {
+      if (annotationService.drawState == AnnotationDrawState.editingExisting) {
         // Delete icon should be visible in the edit field
         final deleteIcon = find.byIcon(Icons.delete_outline);
         if (deleteIcon.evaluate().isNotEmpty) {
@@ -4720,7 +5175,8 @@ void main() {
   });
 
   group('Inline message text editing', () {
-    testWidgets('editing a queued message loads raw userMessage, not the '
+    testWidgets(
+        'editing a queued message loads raw userMessage, not the '
         '"User message:" display label', (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
@@ -4794,7 +5250,8 @@ void main() {
   });
 
   group('Queue message with inspector selection and annotations', () {
-    testWidgets('message with inspectorSelection and annotations shows in queue',
+    testWidgets(
+        'message with inspectorSelection and annotations shows in queue',
         (tester) async {
       await tester.pumpWidget(_app());
       await tester.pumpAndSettle();
@@ -5258,14 +5715,12 @@ void main() {
       // _handleSubmit calls widget.onSubmitted which is _onTextMessageSubmitted
       // Check that a user_feedback message was queued
       final messages = userMessageService.peekMessages();
-      final feedbackMessages = messages
-          .where((m) => m['type'] == 'user_feedback')
-          .toList();
+      final feedbackMessages =
+          messages.where((m) => m['type'] == 'user_feedback').toList();
       expect(feedbackMessages, isNotEmpty);
     });
 
-    testWidgets(
-        'submitting empty text from overlay dismisses without sending',
+    testWidgets('submitting empty text from overlay dismisses without sending',
         (tester) async {
       await tester.pumpWidget(_app(useMaterialApp: true));
       await tester.pumpAndSettle();
@@ -5294,9 +5749,8 @@ void main() {
 
       // No message should have been sent (empty text, no drawing)
       final messages = userMessageService.peekMessages();
-      final feedbackMessages = messages
-          .where((m) => m['type'] == 'user_feedback')
-          .toList();
+      final feedbackMessages =
+          messages.where((m) => m['type'] == 'user_feedback').toList();
       expect(feedbackMessages, isEmpty);
     });
 
@@ -5510,9 +5964,8 @@ void main() {
 
           // Error should be dismissed and message queued
           final messages = userMessageService.peekMessages();
-          final errorMessages = messages
-              .where((m) => m['type'] == 'app_error')
-              .toList();
+          final errorMessages =
+              messages.where((m) => m['type'] == 'app_error').toList();
           expect(errorMessages, isNotEmpty);
           expect(
             errorMessages.first['text']?.toString() ?? '',
@@ -5607,15 +6060,17 @@ void main() {
       await tester.pumpAndSettle();
 
       final container = tester.widget<Container>(
-        find.descendant(
-          of: find.byType(Stack),
-          matching: find.byWidgetPredicate(
-            (w) =>
-                w is Container &&
-                w.decoration is BoxDecoration &&
-                (w.decoration as BoxDecoration).border != null,
-          ),
-        ).first,
+        find
+            .descendant(
+              of: find.byType(Stack),
+              matching: find.byWidgetPredicate(
+                (w) =>
+                    w is Container &&
+                    w.decoration is BoxDecoration &&
+                    (w.decoration as BoxDecoration).border != null,
+              ),
+            )
+            .first,
       );
       final decoration = container.decoration! as BoxDecoration;
       final border = decoration.border! as Border;
@@ -5631,15 +6086,17 @@ void main() {
       await tester.pumpAndSettle();
 
       final container = tester.widget<Container>(
-        find.descendant(
-          of: find.byType(Stack),
-          matching: find.byWidgetPredicate(
-            (w) =>
-                w is Container &&
-                w.decoration is BoxDecoration &&
-                (w.decoration as BoxDecoration).border != null,
-          ),
-        ).first,
+        find
+            .descendant(
+              of: find.byType(Stack),
+              matching: find.byWidgetPredicate(
+                (w) =>
+                    w is Container &&
+                    w.decoration is BoxDecoration &&
+                    (w.decoration as BoxDecoration).border != null,
+              ),
+            )
+            .first,
       );
       final decoration = container.decoration! as BoxDecoration;
       final border = decoration.border! as Border;
@@ -5666,15 +6123,17 @@ void main() {
       await tester.pumpAndSettle();
 
       final container = tester.widget<Container>(
-        find.descendant(
-          of: find.byType(Stack),
-          matching: find.byWidgetPredicate(
-            (w) =>
-                w is Container &&
-                w.decoration is BoxDecoration &&
-                (w.decoration as BoxDecoration).border != null,
-          ),
-        ).first,
+        find
+            .descendant(
+              of: find.byType(Stack),
+              matching: find.byWidgetPredicate(
+                (w) =>
+                    w is Container &&
+                    w.decoration is BoxDecoration &&
+                    (w.decoration as BoxDecoration).border != null,
+              ),
+            )
+            .first,
       );
       final decoration = container.decoration! as BoxDecoration;
       final border = decoration.border! as Border;
@@ -5705,15 +6164,17 @@ void main() {
       await tester.pumpAndSettle();
 
       final container = tester.widget<Container>(
-        find.descendant(
-          of: find.byType(Stack),
-          matching: find.byWidgetPredicate(
-            (w) =>
-                w is Container &&
-                w.decoration is BoxDecoration &&
-                (w.decoration as BoxDecoration).border != null,
-          ),
-        ).first,
+        find
+            .descendant(
+              of: find.byType(Stack),
+              matching: find.byWidgetPredicate(
+                (w) =>
+                    w is Container &&
+                    w.decoration is BoxDecoration &&
+                    (w.decoration as BoxDecoration).border != null,
+              ),
+            )
+            .first,
       );
       final decoration = container.decoration! as BoxDecoration;
       final border = decoration.border! as Border;

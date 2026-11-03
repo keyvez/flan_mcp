@@ -50,6 +50,51 @@ When adding a new feature that bridges Flutter and MCP:
 - Queue persists to SharedPreferences across hot reload/restart
 - `process_queue` signals `setAgentListening(true)` to block Flutter UI interactions while agent is consuming
 
+### Auto-drain (queue panel toggle)
+
+Off, Send hands the agent the whole queue as one batch. On (persisted as
+`flan.auto_drain.v1`), Send hands over only the oldest message, and each later
+one goes out by itself when the agent finishes the one before. A Send the user
+presses always goes out at once, even mid-task: only the automatic follow-on
+waits, so a misread agent state can delay the queue but never swallow a send.
+
+"Finished" comes from Claude Code's own session registry, not from a hook or
+from the agent remembering to call anything: `~/.claude/sessions/<pid>.json`
+flips `status` to `busy` when a turn starts and back to `idle` when it ends,
+with `statusUpdatedAt`. A channel delivery answers the flush with
+`agent_turn: {agent_pid, delivered_at_ms, host}`, and the app polls
+`GET /api/agent-turn?pid=&since=[&host=]` every 2s. `finished` is a resting
+status — `idle`, or `shell` (turn over, a background shell still running; a
+session with a dev server in the background rests there and never says
+`idle`) — stamped AFTER `delivered_at_ms` — the stamp is what separates the end of this
+turn from the idle the agent was sitting in when the message arrived. Both
+times are the agent host's clock: a flush relayed to a peer gets its
+`agent_turn` from that peer with `host` set, and the app's own relay forwards
+the question there. An agent with no registry entry (Codex, an old Claude)
+returns no `agent_turn`, and auto-drain says so instead of stalling silently.
+
+### Sent messages stay in the queue
+
+A message the relay accepts is not deleted: `consumeMessagesById` moves it to
+`UserMessageService.sentMessages` (persisted as `flan.sent_user_messages.v1`,
+full screenshots dropped, the last 50 finished kept) with a `status` —
+`working`, `done`, `sent` (nothing can say when the agent finishes) or
+`stopped` (the agent exited). The panel lists work in progress first, then
+what is waiting, then what is finished, under an All / Active / Not started
+/ Completed filter (All is the default; Active is in progress plus waiting).
+
+While a message is `working` the service polls `/api/agent-turn` for its turn,
+and the relay answers with `messages`: what the agent has said in plain
+English since the delivery. For Claude Code that is the text blocks of
+main-thread assistant entries in `~/.claude/projects/<slug>/<sessionId>.jsonl`
+(the session id comes from the registry); for Codex it is the assistant
+`output_text` of the rollout file, and `task_started` / `task_complete` there
+say whether the turn is over — so a Codex flush now answers with an
+`agent_turn` too, carrying `thread`. The relay reads only the transcript's
+last 1 MB. It answers "everything since"; the app cuts a turn's messages off
+where the next send to the same agent begins. Messages the agent pulled over
+MCP (`process_queue`) have no turn and follow `agent_status` instead.
+
 ## Watched ports (server/flan_server/src/watch.rs)
 
 Non-Flutter web dev servers get into the TUI by being named: `flan-tui --watch <port>`,

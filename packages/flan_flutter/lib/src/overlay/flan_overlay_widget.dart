@@ -286,7 +286,6 @@ _NavContext _collectNavigationContext(BuildContext? context) {
   );
 }
 
-
 Size _resolveViewportSize(BuildContext context) {
   final mediaSize = MediaQuery.maybeSizeOf(context);
   if (mediaSize != null && mediaSize.width > 0 && mediaSize.height > 0) {
@@ -325,9 +324,12 @@ Future<void> _attachScreenshotAndQueueThumbnail({
         // Send a cropped region to the agent instead of the full screen.
         // Match the output aspect ratio to the annotation bounds so no
         // padding is added, capped at 800px on the longest side.
-        final cropAspect = previewBounds.width / previewBounds.height.clamp(1.0, double.infinity);
-        final agentW = (cropAspect >= 1.0 ? 800 : (800 * cropAspect).round()).clamp(1, 800);
-        final agentH = (cropAspect >= 1.0 ? (800 / cropAspect).round() : 800).clamp(1, 800);
+        final cropAspect = previewBounds.width /
+            previewBounds.height.clamp(1.0, double.infinity);
+        final agentW = (cropAspect >= 1.0 ? 800 : (800 * cropAspect).round())
+            .clamp(1, 800);
+        final agentH = (cropAspect >= 1.0 ? (800 / cropAspect).round() : 800)
+            .clamp(1, 800);
         final cropped = await _buildQueueThumbnailFromScreenshot(
           screenshotBase64: cleanScreenshot,
           targetBounds: previewBounds,
@@ -369,9 +371,12 @@ Future<void> _attachScreenshotAndQueueThumbnail({
     return;
   }
 
-  final cropAspect = previewBounds.width / previewBounds.height.clamp(1.0, double.infinity);
-  final agentW = (cropAspect >= 1.0 ? 800 : (800 * cropAspect).round()).clamp(1, 800);
-  final agentH = (cropAspect >= 1.0 ? (800 / cropAspect).round() : 800).clamp(1, 800);
+  final cropAspect =
+      previewBounds.width / previewBounds.height.clamp(1.0, double.infinity);
+  final agentW =
+      (cropAspect >= 1.0 ? 800 : (800 * cropAspect).round()).clamp(1, 800);
+  final agentH =
+      (cropAspect >= 1.0 ? (800 / cropAspect).round() : 800).clamp(1, 800);
   for (final screenshot in screenshots) {
     final cropped = await _buildQueueThumbnailFromScreenshot(
       screenshotBase64: screenshot,
@@ -435,20 +440,97 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// when no error is showing.
   String? _flushErrorMessage;
   int _flushErrorGeneration = 0;
+
   /// The badge's right-click menu.
   bool _showBadgeMenu = false;
   String? _reloadBannerMessage;
   bool _reloadBannerOk = true;
+
   /// Which of the two the banner is reporting. A restart said "Hot reload" in
   /// its own title before this existed.
   bool _reloadBannerRestart = false;
+
   /// The code is compiled and only the page is behind — offer the refresh.
-  bool _reloadBannerOffersRefresh = false;
   Timer? _reloadBannerTimer;
+
   /// A second reload while one is in flight would be ignored by flutter_tools
   /// anyway ("Ignoring signal: we are busy"), and two banners would race.
   bool _hotReloadInFlight = false;
   List<Map<String, dynamic>> _queuedMessagesSnapshot = const [];
+
+  /// The agent turn the last accepted flush started, while the agent is still
+  /// on it. In auto-drain mode the rest of the queue waits for it to finish.
+  FlanAgentTurn? _agentTurn;
+
+  /// Queue ids handed to the relay and not yet answered. A message stays in
+  /// the queue until the relay accepts it, so without this a second send
+  /// started meanwhile — a Send press while the drain is mid-flush — picks the
+  /// same message up again and the agent gets it twice.
+  final Set<int> _inFlightQueueIds = {};
+  Timer? _agentTurnTimer;
+  bool _agentTurnPollInFlight = false;
+  static const _agentTurnPollInterval = Duration(seconds: 2);
+
+  /// Starts a queue that no flush of ours began. Auto-drain used to move only
+  /// when a task IT had sent finished, so a queue built while the agent was
+  /// idle — or one left behind by a reload, which forgets the turn it was
+  /// watching — sat there until somebody pressed Send. While auto-drain is on
+  /// and real tasks are waiting, this asks the relay whether the agent that
+  /// took the last task is idle, and sends the oldest one when it is.
+  Timer? _drainKickTimer;
+  bool _drainKickInFlight = false;
+
+  /// The agent that took the last task, kept after its turn ends so the kick
+  /// can ask after it. Null before anything was sent, or once it has exited:
+  /// then the kick simply sends, as Send would.
+  FlanAgentTurn? _lastAgent;
+
+  /// Kept across reloads and restarts — which wipe every field here — so a
+  /// freshly started app asks whether that agent is busy before it sends,
+  /// instead of handing it a task mid-turn.
+  static const _lastAgentKey = 'flan.auto_drain.last_agent.v1';
+  bool _lastAgentLoaded = false;
+
+  Future<void> _loadLastAgent() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_lastAgentKey);
+      if (raw != null && _lastAgent == null) {
+        _lastAgent = FlanAgentTurn.fromJson(jsonDecode(raw));
+      }
+    } catch (_) {
+      // Best effort: without it the first send after a restart is immediate.
+    }
+    _lastAgentLoaded = true;
+    _syncDrainKick();
+  }
+
+  void _rememberAgent(FlanAgentTurn? agent) {
+    _lastAgent = agent;
+    unawaited(() async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        if (agent == null) {
+          await prefs.remove(_lastAgentKey);
+        } else {
+          await prefs.setString(_lastAgentKey, jsonEncode(agent.toJson()));
+        }
+      } catch (_) {}
+    }());
+  }
+
+  /// Set when a kicked send could not be delivered (no agent linked), so the
+  /// kick does not retry — and re-show that error — every two seconds. Cleared
+  /// when the queue or the switch changes.
+  String? _drainKickPausedOn;
+
+  /// When the annotation draft last changed. The draft is the boxes on
+  /// screen, and it stays a draft until something sends it — so for
+  /// auto-drain, "finished" has to be inferred: every box labelled, and no
+  /// change for [_draftSettle]. Without this a queue of annotations could
+  /// never drain on its own, because the newest one is always a draft.
+  DateTime _annotationDraftChangedAt = DateTime.now();
+  static const _draftSettle = Duration(seconds: 3);
   int? _annotationDraftQueueId;
   String _lastQueuedAnnotationsSignature = '';
 
@@ -490,7 +572,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   late Widget _appContent;
   late final FlanServerClient _serverClient;
 
-
   /// Monotonically increasing counter to detect stale async thumbnail
   /// completions. Incremented every time a new draft thumbnail is started.
   int _draftThumbnailGeneration = 0;
@@ -518,7 +599,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   /// Drag offset for the queue badge button. null = default (top-right) position.
   Offset? _badgeDragOffset;
   bool _isDraggingBadge = false;
-  Offset? _badgeDragStartOffset; // value of _badgeDragOffset when long press started
+  Offset?
+      _badgeDragStartOffset; // value of _badgeDragOffset when long press started
 
   static const _badgeDxKey = 'flan.badge_offset_dx';
   static const _badgeDyKey = 'flan.badge_offset_dy';
@@ -540,6 +622,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     widget.inspectorService.addListener(_onServiceChanged);
     widget.annotationService.addListener(_onAnnotationServiceChanged);
     widget.userMessageService.addListener(_onUserMessageServiceChanged);
+    widget.userMessageService.addListener(_syncDrainKick);
+    unawaited(_loadLastAgent());
     widget.errorInterceptor.addListener(_onServiceChanged);
     widget.macroRecorderService.addListener(_onServiceChanged);
     HardwareKeyboard.instance.addHandler(_handleGlobalKey);
@@ -547,7 +631,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     _appContent = RepaintBoundary(key: _appContentKey, child: widget.child);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _onAnnotationServiceChanged(); // safe: runs after first frame
+      if (mounted)
+        _onAnnotationServiceChanged(); // safe: runs after first frame
     });
 
     _loadBadgeOffset();
@@ -613,6 +698,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   @override
   void dispose() {
     _reloadBannerTimer?.cancel();
+    _agentTurnTimer?.cancel();
+    _drainKickTimer?.cancel();
+    widget.userMessageService.removeListener(_syncDrainKick);
     HardwareKeyboard.instance.removeHandler(_handleGlobalKey);
     widget.inspectorService.removeListener(_onServiceChanged);
     widget.annotationService.removeListener(_onAnnotationServiceChanged);
@@ -651,6 +739,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   }
 
   void _upsertQueuedAnnotationDraft(List<Map<String, dynamic>> annotations) {
+    _annotationDraftChangedAt = DateTime.now();
+    _syncDrainKick();
     if (annotations.isEmpty) {
       final queueId = _annotationDraftQueueId;
       if (queueId != null) {
@@ -718,7 +808,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       return a is List && a.isNotEmpty;
     });
     if (existingAnnotationIdx != -1) {
-      final existingQueueId = _queueIdOf(existingMessages[existingAnnotationIdx]);
+      final existingQueueId =
+          _queueIdOf(existingMessages[existingAnnotationIdx]);
       if (existingQueueId != null) {
         _annotationDraftQueueId = existingQueueId;
         widget.userMessageService.updateMessageByQueueId(existingQueueId, {
@@ -748,8 +839,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     }
     // Attach a cropped thumbnail asynchronously.
     if (_annotationDraftQueueId != null) {
-      _attachDraftThumbnail(
-          _annotationDraftQueueId!, enrichedAnnotations);
+      _attachDraftThumbnail(_annotationDraftQueueId!, enrichedAnnotations);
     }
   }
 
@@ -809,8 +899,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
     // Detect whether the agent just consumed messages. If so, clear
     // annotations so the draft isn't immediately re-created.
-    final currentGeneration =
-        widget.userMessageService.agentConsumeGeneration;
+    final currentGeneration = widget.userMessageService.agentConsumeGeneration;
     if (currentGeneration != _lastSeenConsumeGeneration) {
       _lastSeenConsumeGeneration = currentGeneration;
       _annotationDraftQueueId = null;
@@ -851,7 +940,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       _queuedMessagesSnapshot = pendingMessages
           .map((message) => Map<String, dynamic>.from(message))
           .toList();
-      if (_queuedMessagesSnapshot.isEmpty) {
+      if (!_queuePanelHasContent) {
         _showQueuedMessagesPanel = false;
       }
     }
@@ -998,7 +1087,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     // in a deployed/markup build, where there is no `flutter run` to ask.
     if (event.logicalKey == LogicalKeyboardKey.keyL &&
         !FlanBinding.agentDisabled) {
-      unawaited(_hotReload(fullRestart: HardwareKeyboard.instance.isAltPressed));
+      unawaited(
+          _hotReload(fullRestart: HardwareKeyboard.instance.isAltPressed));
       return true;
     }
 
@@ -1080,8 +1170,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
     widget.userMessageService.sendMessage({
       'type': 'user_feedback',
-      'text':
-          'I recorded an integration test flow in the app.\n'
+      'text': 'I recorded an integration test flow in the app.\n'
           'Please:\n'
           '1. Save the code below as a new file in the integration_test/ directory '
           'with a descriptive snake_case filename.\n'
@@ -1328,8 +1417,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
         _createIssueFromError(error); // fire-and-forget; dismisses on success
       } else {
         _showNoReceiverError(
-          reason:
-              'Cannot file an issue — sign in (and connect GitHub) first, '
+          reason: 'Cannot file an issue — sign in (and connect GitHub) first, '
               'then try again.',
         );
       }
@@ -1347,9 +1435,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
   void _sendErrorToAgent(InterceptedError error) {
     final lines = error.details.split('\n');
-    final truncated = lines.length > 20
-        ? '${lines.take(20).join('\n')}…'
-        : error.details;
+    final truncated =
+        lines.length > 20 ? '${lines.take(20).join('\n')}…' : error.details;
     final data = <String, dynamic>{
       'kind': 'app_error',
       'summary': error.summary,
@@ -1384,8 +1471,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     // Messages queued with annotations may already carry a screenshot
     // taken at annotation time — those should be preserved.
     try {
-      final screenshots =
-          await widget.screenshotService.takeScreenshots();
+      final screenshots = await widget.screenshotService.takeScreenshots();
       debugPrint(
         '[Flan] Screenshot capture: ${screenshots.length} image(s), '
         'first ${screenshots.firstOrNull?.length ?? 0} bytes',
@@ -1478,9 +1564,29 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     _queuedMessagesSnapshot = _queuedMessagesSnapshot
         .where((message) => _queueIdOf(message) != queueId)
         .toList();
-    if (_queuedMessagesSnapshot.isEmpty) {
+    if (!_queuePanelHasContent) {
       _showQueuedMessagesPanel = false;
     }
+    _safeSetState();
+  }
+
+  /// Whether the queue panel has anything to show: messages waiting to go,
+  /// or ones already sent — the agent's work in progress and its history.
+  bool get _queuePanelHasContent =>
+      _queuedMessagesSnapshot.isNotEmpty ||
+      widget.userMessageService.hasSentMessages;
+
+  void _removeSentMessage(int queueId) {
+    widget.userMessageService.removeSentMessageByQueueId(queueId);
+    if (!mounted) return;
+    if (!_queuePanelHasContent) _showQueuedMessagesPanel = false;
+    _safeSetState();
+  }
+
+  void _clearCompletedMessages() {
+    widget.userMessageService.clearCompletedMessages();
+    if (!mounted) return;
+    if (!_queuePanelHasContent) _showQueuedMessagesPanel = false;
     _safeSetState();
   }
 
@@ -1497,7 +1603,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     _isSendingToAgent = false;
     if (!mounted) return;
     _queuedMessagesSnapshot = const [];
-    _showQueuedMessagesPanel = false;
+    if (!_queuePanelHasContent) _showQueuedMessagesPanel = false;
     _safeSetState();
   }
 
@@ -1533,10 +1639,31 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
   Future<void> _flushToServer({
     List<Map<String, dynamic>>? messages,
     bool clearOnAcceptance = false,
+    int? skipQueueId,
   }) async {
     final wsUri = await _vmServiceWsUri();
 
-    final msgs = messages ?? widget.userMessageService.peekMessages();
+    var msgs = messages ??
+        widget.userMessageService
+            .peekMessages()
+            .where((m) => !_inFlightQueueIds.contains(_queueIdOf(m)))
+            .toList();
+    // Auto-drain hands the agent one task at a time: the oldest message now,
+    // each later one when the agent finishes the one before (see
+    // [_pollAgentTurn]).
+    //
+    // A send the user asked for always goes out, even while the agent is on
+    // the last task — only the automatic follow-on waits. Holding it until the
+    // turn read as finished made every send hang on reading the agent's state
+    // right, and when that read was wrong (a "shell" status it did not count
+    // as done) each send after the first was swallowed without a word.
+    final draining = messages == null && widget.userMessageService.autoDrain;
+    if (draining && msgs.isNotEmpty) {
+      msgs = msgs
+          .where((m) => skipQueueId == null || _queueIdOf(m) != skipQueueId)
+          .take(1)
+          .toList();
+    }
     debugPrint(
       '[flan] flushing ${msgs.length} message(s), vm_service_uri=$wsUri',
     );
@@ -1545,11 +1672,21 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
 
     final origin = _pageOrigin();
 
-    final result = await _serverClient.flush(
-      messages: msgs,
-      vmServiceUri: wsUri,
-      origin: origin,
-    );
+    final sending = {
+      for (final m in msgs)
+        if (_queueIdOf(m) case final int id) id,
+    };
+    _inFlightQueueIds.addAll(sending);
+    final FlanFlushResult result;
+    try {
+      result = await _serverClient.flush(
+        messages: msgs,
+        vmServiceUri: wsUri,
+        origin: origin,
+      );
+    } finally {
+      _inFlightQueueIds.removeAll(sending);
+    }
     debugPrint(
       '[flan] relay response: accepted=${result.accepted} '
       'delivered=${result.delivered} error=${result.error}',
@@ -1565,9 +1702,179 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       // The relay now owns the batch. A connected agent means genuine active
       // work; an accepted-but-not-yet-delivered batch must not start the long
       // working timeout that previously made the overlay appear stuck.
-      widget.userMessageService.consumeMessages(
-        markAgentWorking: result.delivered,
+      if (draining) {
+        // Only what was sent: the rest of the queue is still waiting its turn.
+        widget.userMessageService.consumeMessagesById(
+          {for (final m in msgs) m['queueId'] as int},
+          markAgentWorking: result.delivered,
+          agentTurn: result.agentTurn,
+        );
+      } else {
+        // By id, not the whole queue: anything queued — or sent by another
+        // flush — while this one was out is not this batch's to take.
+        widget.userMessageService.consumeMessagesById(
+          sending,
+          markAgentWorking: result.delivered,
+          agentTurn: result.agentTurn,
+        );
+      }
+    }
+    _watchAgentTurn(result.agentTurn, draining: draining);
+  }
+
+  /// Follows the agent through the turn a flush started, so the next queued
+  /// task can go out the moment it ends. Watched in either mode — turning
+  /// auto-drain on while the agent is busy with a batch should still pick up
+  /// from where that batch ends.
+  void _watchAgentTurn(FlanAgentTurn? turn, {required bool draining}) {
+    _agentTurnTimer?.cancel();
+    _agentTurnTimer = null;
+    _agentTurn = turn;
+    if (turn != null) _rememberAgent(turn);
+    _syncDrainKick();
+    if (turn == null) {
+      if (draining) {
+        _showNoReceiverError(
+          reason: 'Sent the first queued task, but the relay cannot say when '
+              'the agent finishes it, so the rest will not go out on their '
+              'own. Update flan-server, or send them by hand.',
+        );
+      }
+      return;
+    }
+    _agentTurnTimer = Timer.periodic(
+      _agentTurnPollInterval,
+      (_) => unawaited(_pollAgentTurn()),
+    );
+  }
+
+  Future<void> _pollAgentTurn() async {
+    final turn = _agentTurn;
+    if (turn == null || _agentTurnPollInFlight) return;
+    _agentTurnPollInFlight = true;
+    final state = await _serverClient.getAgentTurn(turn);
+    _agentTurnPollInFlight = false;
+    // A newer flush replaced the turn while this one was asking.
+    if (!mounted || !identical(turn, _agentTurn)) return;
+    // Unreachable relay is not an answer — ask again on the next tick.
+    if (state == null) return;
+    if (!state.alive) {
+      _watchAgentTurn(null, draining: false);
+      widget.userMessageService.markDone();
+      if (widget.userMessageService.autoDrain &&
+          widget.userMessageService.hasPendingMessages) {
+        _showNoReceiverError(
+          reason: 'The agent working through the queue has exited. '
+              'The rest of the queue is still here — send it to another '
+              'agent when one is linked.',
+        );
+      }
+      return;
+    }
+    if (!state.finished) return;
+    _watchAgentTurn(null, draining: false);
+    widget.userMessageService.markDone();
+    if (widget.userMessageService.autoDrain &&
+        widget.userMessageService.hasPendingMessages) {
+      debugPrint('[flan] auto-drain: agent finished; sending the next task');
+      // An annotation still being drawn waits for the kick, which sends it
+      // once it settles.
+      await _flushToServer(
+        clearOnAcceptance: true,
+        skipQueueId: _draftReady ? null : _annotationDraftQueueId,
       );
+    }
+  }
+
+  /// The annotation draft looks finished: every box carries its label and
+  /// nothing has moved for [_draftSettle].
+  bool get _draftReady {
+    if (_annotationDraftQueueId == null) return false;
+    final annotations = widget.annotationService.getAnnotationsData();
+    if (annotations.isEmpty) return false;
+    final labelled = annotations.every(
+      (a) => (a['text'] as String? ?? '').trim().isNotEmpty,
+    );
+    return labelled &&
+        DateTime.now().difference(_annotationDraftChangedAt) >= _draftSettle;
+  }
+
+  /// Queued tasks the kick may send: everything but an annotation that is
+  /// still being drawn or labelled.
+  List<Map<String, dynamic>> get _queuedTasks {
+    final draftReady = _draftReady;
+    return [
+      for (final m in widget.userMessageService.peekMessages())
+        if (_queueIdOf(m) != _annotationDraftQueueId || draftReady) m,
+    ];
+  }
+
+  String get _queueSignature => '${widget.userMessageService.autoDrain}:'
+      '${_queuedTasks.map(_queueIdOf).join(',')}';
+
+  /// The timer runs while ANYTHING is queued, a draft included, because a
+  /// draft becomes sendable by settling — with no event to say so.
+  bool get _drainKickWanted =>
+      widget.userMessageService.autoDrain &&
+      _agentTurn == null &&
+      widget.userMessageService.hasPendingMessages &&
+      _drainKickPausedOn != _queueSignature;
+
+  /// Runs the kick's timer exactly while there is something for it to do.
+  void _syncDrainKick() {
+    if (!mounted) return;
+    if (_drainKickPausedOn != null && _drainKickPausedOn != _queueSignature) {
+      _drainKickPausedOn = null;
+    }
+    if (_drainKickWanted) {
+      if (_drainKickTimer != null) return;
+      _drainKickTimer = Timer.periodic(
+        _agentTurnPollInterval,
+        (_) => unawaited(_drainKick()),
+      );
+      unawaited(_drainKick());
+    } else {
+      _drainKickTimer?.cancel();
+      _drainKickTimer = null;
+    }
+  }
+
+  Future<void> _drainKick() async {
+    if (_drainKickInFlight || _isSendingToAgent || !_drainKickWanted) return;
+    if (!_lastAgentLoaded || _queuedTasks.isEmpty) return;
+    _drainKickInFlight = true;
+    try {
+      final last = _lastAgent;
+      if (last != null) {
+        final state = await _serverClient.getAgentTurn(
+          FlanAgentTurn(
+            agentPid: last.agentPid,
+            deliveredAtMs: 0,
+            host: last.host,
+            thread: last.thread,
+          ),
+        );
+        // Unreachable relay is not an answer; busy is a "not yet".
+        if (state == null || (state.alive && !state.idle)) return;
+        if (!state.alive) _rememberAgent(null);
+      }
+      if (!mounted || !_drainKickWanted) return;
+      debugPrint('[flan] auto-drain: agent is idle; sending the next task');
+      await _flushToServer(
+        clearOnAcceptance: true,
+        skipQueueId: _draftReady ? null : _annotationDraftQueueId,
+      );
+      // No turn to follow — nothing took it, or the relay could not say who
+      // did. Either way, sending the next one now would empty the queue in a
+      // burst, which is the thing auto-drain exists to prevent; wait for the
+      // queue or the switch to change instead. (The flush has already said
+      // why in its banner.)
+      if (mounted && _agentTurn == null) {
+        _drainKickPausedOn = _queueSignature;
+      }
+    } finally {
+      _drainKickInFlight = false;
+      _syncDrainKick();
     }
   }
 
@@ -1583,8 +1890,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     if (!mounted) return;
     _flushErrorMessage = reason ??
         'Your message was not sent because no Claude Code agent is '
-        'connected to receive it.\n\n'
-        'The message is still queued — connect an agent, then send again.';
+            'connected to receive it.\n\n'
+            'The message is still queued — connect an agent, then send again.';
     final generation = ++_flushErrorGeneration;
     _safeSetState();
     // Auto-dismiss after a while so a stale banner doesn't linger, but only if
@@ -1627,11 +1934,19 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     //
     // The exception is a web page with no debug client: the host compiled the
     // new code and the page is still running the old one. A refresh is the last
-    // step, the app is the only thing that can take it, and for a RESTART it
-    // costs nothing — losing the state is what a restart does. A reload gets a
-    // button instead, because somebody asking for a reload asked to keep it.
+    // step and the app is the only thing that can take it, so it takes it —
+    // for a reload as well as a restart.
+    //
+    // A reload used to get a BUTTON here, on the reasoning that somebody
+    // asking for a reload asked to keep their state. That reasoning does not
+    // survive `-d web-server`: flutter owns no browser there, the injected
+    // client only attaches with the Dart Debug Extension, and without one a
+    // reload is NEVER going to reach this page. So the choice was never
+    // "state or no state" — it was stale code or a refresh, with a click in
+    // between that answered nothing. The route lives in the URL and comes
+    // back; unsent typing does not, which is the honest cost of the trade.
     final canRefresh = result.needsPageRefresh && PageReloader.isSupported;
-    if (canRefresh && fullRestart) {
+    if (canRefresh) {
       _showReloadBanner(
         'Recompiled on the host — refreshing the page to pick it up.',
         ok: true,
@@ -1645,7 +1960,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
       result.detail,
       ok: result.ok,
       fullRestart: fullRestart,
-      offerRefresh: canRefresh,
     );
     debugPrint(
       '[flan] hot reload: ok=${result.ok} via=${result.via} '
@@ -1672,13 +1986,11 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
     required bool ok,
     required bool fullRestart,
     bool sticky = false,
-    bool offerRefresh = false,
   }) {
     if (!mounted) return;
     _reloadBannerMessage = message;
     _reloadBannerOk = ok;
     _reloadBannerRestart = fullRestart;
-    _reloadBannerOffersRefresh = offerRefresh;
     // A real Timer rather than a Future.delayed, because this one has to be
     // cancellable: a pending timer that outlives the widget fires into a
     // disposed state — and in a test suite, into whichever test is running by
@@ -2033,7 +2345,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                             padding: const EdgeInsets.symmetric(
                                 horizontal: 6, vertical: 2),
                             decoration: BoxDecoration(
-                              color: const Color(0xFFFF3B30).withValues(alpha: 0.2),
+                              color: const Color(0xFFFF3B30)
+                                  .withValues(alpha: 0.2),
                               borderRadius: BorderRadius.circular(4),
                             ),
                             child: const Row(
@@ -2214,7 +2527,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                   _safeSetState();
                   return;
                 }
-                if (pendingMessages.isEmpty) {
+                if (pendingMessages.isEmpty &&
+                    !widget.userMessageService.hasSentMessages) {
                   // Nothing queued — enter annotation mode.
                   if (!widget.annotationService.enabled) {
                     if (widget.inspectorService.enabled) {
@@ -2227,7 +2541,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 }
                 _queuedMessagesSnapshot =
                     List<Map<String, dynamic>>.from(pendingMessages);
-                _showQueuedMessagesPanel = _queuedMessagesSnapshot.isNotEmpty;
+                _showQueuedMessagesPanel = _queuePanelHasContent;
                 _safeSetState();
               },
               onLongPressStart: (_) {
@@ -2256,8 +2570,8 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
               },
               onPanUpdate: (details) {
                 if (!_isDraggingBadge) return;
-                _badgeDragOffset = (_badgeDragOffset ?? Offset.zero) +
-                    details.delta;
+                _badgeDragOffset =
+                    (_badgeDragOffset ?? Offset.zero) + details.delta;
                 _safeSetState();
               },
               onPanEnd: (_) {
@@ -2273,10 +2587,9 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 count: displayCount,
                 pushConnected:
                     widget.userMessageService.isPushCapableHostConnected,
-                serverLinked:
-                    widget.userMessageService.hasServerAssociation,
-                linkedLabel:
-                    widget.userMessageService.linkedLabel,
+                serverLinked: widget.userMessageService.hasServerAssociation,
+                linkedLabel: widget.userMessageService.linkedLabel,
+                agentWorking: widget.userMessageService.isAgentWorking,
               ),
             ),
           ),
@@ -2296,12 +2609,15 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 },
               ),
             ),
-          if (_showQueuedMessagesPanel && _queuedMessagesSnapshot.isNotEmpty)
+          if (_showQueuedMessagesPanel && _queuePanelHasContent)
             Positioned(
               top: badgeTop + 40,
               right: badgeRight,
               child: _QueuedMessagesPanel(
                 messages: _queuedMessagesSnapshot,
+                sentMessages: widget.userMessageService.sentMessages,
+                onDeleteSentMessage: _removeSentMessage,
+                onClearCompleted: _clearCompletedMessages,
                 onDeleteMessage: _removeQueuedMessage,
                 onClearAll: _clearQueuedMessages,
                 onStartRecording: () {
@@ -2321,9 +2637,14 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                     widget.annotationService.disable();
                   }
                   unawaited(_flushToServer(clearOnAcceptance: true));
-                  _showQueuedMessagesPanel = false;
-                  _queuedMessagesSnapshot = const [];
+                  // The panel stays open: what was sent stays in it, as the
+                  // agent's work in progress.
                   _annotationDraftQueueId = null;
+                  _safeSetState();
+                },
+                autoDrain: widget.userMessageService.autoDrain,
+                onAutoDrainChanged: (value) {
+                  widget.userMessageService.autoDrain = value;
                   _safeSetState();
                 },
                 onSaveAnnotation: _applyQueuedAnnotationEdit,
@@ -2332,8 +2653,7 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 onCreateIssue: GitHubIssueService.isConfigured
                     ? _createIssueFromQueue
                     : null,
-                isAnnotationModeActive:
-                    widget.annotationService.enabled,
+                isAnnotationModeActive: widget.annotationService.enabled,
                 onExitAnnotationMode: () {
                   widget.annotationService.disable();
                 },
@@ -2361,12 +2681,6 @@ class _FlanOverlayWidgetState extends State<FlanOverlayWidget> {
                 message: _reloadBannerMessage!,
                 ok: _reloadBannerOk,
                 fullRestart: _reloadBannerRestart,
-                onRefreshPage: _reloadBannerOffersRefresh
-                    ? () {
-                        _dismissReloadBanner();
-                        PageReloader.reload();
-                      }
-                    : null,
                 onDismiss: _dismissReloadBanner,
               ),
             ),
@@ -3225,8 +3539,10 @@ class _TextMessageOverlay extends StatefulWidget {
 
   final bool visible;
   final VoidCallback onDismiss;
+
   /// Called on Enter — queues the message.
   final void Function(String text, String? drawingBase64) onSubmitted;
+
   /// Called on Cmd+Enter — queues and immediately sends.
   final void Function(String text, String? drawingBase64)? onSubmittedAndSent;
   final UserMessageService userMessageService;
@@ -3262,11 +3578,10 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
     // The floating drawing-label field is a bare EditableText too, so wire its
     // clipboard shortcuts (Cmd+V/C/X/A) the same way.
     _floatingTextFocusNode = FocusNode(
-      onKeyEvent: (node, event) =>
-          handleClipboardShortcut(event, _floatingEditableKey,
-                  _floatingTextController)
-              ? KeyEventResult.handled
-              : KeyEventResult.ignored,
+      onKeyEvent: (node, event) => handleClipboardShortcut(
+              event, _floatingEditableKey, _floatingTextController)
+          ? KeyEventResult.handled
+          : KeyEventResult.ignored,
     );
     widget.userMessageService.addListener(_onServiceChanged);
     _drawingService.addListener(_onDrawingChanged);
@@ -3404,144 +3719,145 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
       child: SizedBox.expand(
         child: LayoutBuilder(
           builder: (context, constraints) {
-          const dialogWidth = 480.0;
-          final maxDialogHeight = _showShortcuts ? 560.0 : 300.0;
-          _lastConstraints = constraints;
+            const dialogWidth = 480.0;
+            final maxDialogHeight = _showShortcuts ? 560.0 : 300.0;
+            _lastConstraints = constraints;
 
-          // Default to centered if no offset set yet.
-          final offset = _offset ??
-              Offset(
-                (constraints.maxWidth - dialogWidth) / 2,
-                (constraints.maxHeight - maxDialogHeight) / 2,
-              );
+            // Default to centered if no offset set yet.
+            final offset = _offset ??
+                Offset(
+                  (constraints.maxWidth - dialogWidth) / 2,
+                  (constraints.maxHeight - maxDialogHeight) / 2,
+                );
 
-          final isMarkupMode = activeTool != DrawingTool.none;
+            final isMarkupMode = activeTool != DrawingTool.none;
 
-          return Stack(
-            children: [
-              // 1. Dark background + drawing canvas combined.
-              // When no tool is active, tap-to-dismiss works.
-              // When a tool is active (markup mode), taps route to the tool.
-              Positioned.fill(
-                child: GestureDetector(
-                  onTap: isWaiting || isMarkupMode ? null : widget.onDismiss,
-                  behavior: HitTestBehavior.opaque,
-                  child: Listener(
-                    behavior: HitTestBehavior.opaque,
-                    onPointerDown: isWaiting || !isMarkupMode
-                        ? null
-                        : (event) {
-                            switch (activeTool) {
-                              case DrawingTool.none:
-                                break;
-                              case DrawingTool.pencil:
-                                _drawingService.startStroke(event.position);
-                              case DrawingTool.text:
-                                _drawingService
-                                    .startTextPlacement(event.position);
-                                _floatingTextController.clear();
-                                WidgetsBinding.instance
-                                    .addPostFrameCallback((_) {
-                                  _floatingTextFocusNode.requestFocus();
-                                });
-                              case DrawingTool.eraser:
-                                setState(
-                                    () => _eraserPosition = event.position);
-                                _drawingService.eraseAt(event.position, 16.0);
-                              case DrawingTool.move:
-                                _drawingService.startMove(event.position);
-                            }
-                          },
-                    onPointerMove: isWaiting || !isMarkupMode
-                        ? null
-                        : (event) {
-                            switch (activeTool) {
-                              case DrawingTool.none:
-                                break;
-                              case DrawingTool.pencil:
-                                _drawingService.addPoint(event.position);
-                              case DrawingTool.text:
-                                break;
-                              case DrawingTool.eraser:
-                                setState(
-                                    () => _eraserPosition = event.position);
-                                _drawingService.eraseAt(event.position, 16.0);
-                              case DrawingTool.move:
-                                _drawingService.updateMove(event.position);
-                            }
-                          },
-                    onPointerUp: isWaiting || !isMarkupMode
-                        ? null
-                        : (event) {
-                            switch (activeTool) {
-                              case DrawingTool.none:
-                                break;
-                              case DrawingTool.pencil:
-                                _drawingService.finishStroke();
-                              case DrawingTool.text:
-                                break;
-                              case DrawingTool.eraser:
-                                setState(() => _eraserPosition = null);
-                              case DrawingTool.move:
-                                _drawingService.finishMove();
-                            }
-                          },
-                    child: CustomPaint(
-                      foregroundPainter: DrawingPainter(
-                        strokes: _drawingService.strokes,
-                        textLabels: _drawingService.textLabels,
-                        currentPoints: _drawingService.currentPoints,
-                        activeTool: activeTool,
-                        eraserPosition: _eraserPosition,
-                        pendingTextPosition:
-                            _drawingService.pendingTextPosition,
-                        movingStrokeId: _drawingService.movingStrokeId,
-                        movingLabelId: _drawingService.movingLabelId,
-                      ),
-                      child: const ColoredBox(color: Color(0x88000000)),
-                    ),
-                  ),
-                ),
-              ),
-
-              // 2. Dialog
-              Positioned(
-                left: offset.dx,
-                top: offset.dy,
-                child: Opacity(
-                  opacity: _isDragging ? 0.5 : 1.0,
+            return Stack(
+              children: [
+                // 1. Dark background + drawing canvas combined.
+                // When no tool is active, tap-to-dismiss works.
+                // When a tool is active (markup mode), taps route to the tool.
+                Positioned.fill(
                   child: GestureDetector(
-                    onTap: () {}, // prevent dismiss when tapping the box
-                    child: Container(
-                      width: dialogWidth,
-                      constraints: BoxConstraints(maxHeight: maxDialogHeight),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF1A1A2E),
-                        borderRadius: BorderRadius.circular(12),
-                        boxShadow: const [
-                          BoxShadow(
-                            color: Color(0x88000000),
-                            blurRadius: 24,
-                            offset: Offset(0, 8),
-                          ),
-                        ],
-                        border: Border.all(
-                          color: const Color(0xFF00AAFF),
-                          width: 1.5,
+                    onTap: isWaiting || isMarkupMode ? null : widget.onDismiss,
+                    behavior: HitTestBehavior.opaque,
+                    child: Listener(
+                      behavior: HitTestBehavior.opaque,
+                      onPointerDown: isWaiting || !isMarkupMode
+                          ? null
+                          : (event) {
+                              switch (activeTool) {
+                                case DrawingTool.none:
+                                  break;
+                                case DrawingTool.pencil:
+                                  _drawingService.startStroke(event.position);
+                                case DrawingTool.text:
+                                  _drawingService
+                                      .startTextPlacement(event.position);
+                                  _floatingTextController.clear();
+                                  WidgetsBinding.instance
+                                      .addPostFrameCallback((_) {
+                                    _floatingTextFocusNode.requestFocus();
+                                  });
+                                case DrawingTool.eraser:
+                                  setState(
+                                      () => _eraserPosition = event.position);
+                                  _drawingService.eraseAt(event.position, 16.0);
+                                case DrawingTool.move:
+                                  _drawingService.startMove(event.position);
+                              }
+                            },
+                      onPointerMove: isWaiting || !isMarkupMode
+                          ? null
+                          : (event) {
+                              switch (activeTool) {
+                                case DrawingTool.none:
+                                  break;
+                                case DrawingTool.pencil:
+                                  _drawingService.addPoint(event.position);
+                                case DrawingTool.text:
+                                  break;
+                                case DrawingTool.eraser:
+                                  setState(
+                                      () => _eraserPosition = event.position);
+                                  _drawingService.eraseAt(event.position, 16.0);
+                                case DrawingTool.move:
+                                  _drawingService.updateMove(event.position);
+                              }
+                            },
+                      onPointerUp: isWaiting || !isMarkupMode
+                          ? null
+                          : (event) {
+                              switch (activeTool) {
+                                case DrawingTool.none:
+                                  break;
+                                case DrawingTool.pencil:
+                                  _drawingService.finishStroke();
+                                case DrawingTool.text:
+                                  break;
+                                case DrawingTool.eraser:
+                                  setState(() => _eraserPosition = null);
+                                case DrawingTool.move:
+                                  _drawingService.finishMove();
+                              }
+                            },
+                      child: CustomPaint(
+                        foregroundPainter: DrawingPainter(
+                          strokes: _drawingService.strokes,
+                          textLabels: _drawingService.textLabels,
+                          currentPoints: _drawingService.currentPoints,
+                          activeTool: activeTool,
+                          eraserPosition: _eraserPosition,
+                          pendingTextPosition:
+                              _drawingService.pendingTextPosition,
+                          movingStrokeId: _drawingService.movingStrokeId,
+                          movingLabelId: _drawingService.movingLabelId,
                         ),
+                        child: const ColoredBox(color: Color(0x88000000)),
                       ),
-                      child:
-                          isWaiting ? _buildWaitingState() : _buildInputState(),
                     ),
                   ),
                 ),
-              ),
 
-              // 3. Floating text input at pending text position
-              if (_drawingService.pendingTextPosition != null)
-                _buildFloatingTextInput(_drawingService.pendingTextPosition!),
-            ],
-          );
+                // 2. Dialog
+                Positioned(
+                  left: offset.dx,
+                  top: offset.dy,
+                  child: Opacity(
+                    opacity: _isDragging ? 0.5 : 1.0,
+                    child: GestureDetector(
+                      onTap: () {}, // prevent dismiss when tapping the box
+                      child: Container(
+                        width: dialogWidth,
+                        constraints: BoxConstraints(maxHeight: maxDialogHeight),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1A1A2E),
+                          borderRadius: BorderRadius.circular(12),
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Color(0x88000000),
+                              blurRadius: 24,
+                              offset: Offset(0, 8),
+                            ),
+                          ],
+                          border: Border.all(
+                            color: const Color(0xFF00AAFF),
+                            width: 1.5,
+                          ),
+                        ),
+                        child: isWaiting
+                            ? _buildWaitingState()
+                            : _buildInputState(),
+                      ),
+                    ),
+                  ),
+                ),
+
+                // 3. Floating text input at pending text position
+                if (_drawingService.pendingTextPosition != null)
+                  _buildFloatingTextInput(_drawingService.pendingTextPosition!),
+              ],
+            );
           },
         ),
       ),
@@ -3833,8 +4149,7 @@ class _TextMessageOverlayState extends State<_TextMessageOverlay> {
                       label: 'Inspector')),
               Expanded(
                   child: _ShortcutRow(
-                      keyCaps: [ctrlKey, ctrlKey],
-                      label: 'Annotate')),
+                      keyCaps: [ctrlKey, ctrlKey], label: 'Annotate')),
             ],
           ),
           const SizedBox(height: 8),
@@ -3966,6 +4281,7 @@ class _QueuedMessagesBadge extends StatelessWidget {
     required this.pushConnected,
     this.serverLinked = false,
     this.linkedLabel,
+    this.agentWorking = false,
   });
 
   final int count;
@@ -3973,13 +4289,18 @@ class _QueuedMessagesBadge extends StatelessWidget {
   final bool serverLinked;
   final String? linkedLabel;
 
+  /// Spins a ring around the badge while the agent works on what was sent.
+  final bool agentWorking;
+
   @override
   Widget build(BuildContext context) {
     final text = count > 99 ? '99+' : '$count';
     // Show a label pill when linked and a label is available.
-    final showLabel = serverLinked && linkedLabel != null && linkedLabel!.isNotEmpty;
+    final showLabel =
+        serverLinked && linkedLabel != null && linkedLabel!.isNotEmpty;
     // Use just the last path component for a compact label.
-    final labelText = linkedLabel?.split('/').where((s) => s.isNotEmpty).last ?? '';
+    final labelText =
+        linkedLabel?.split('/').where((s) => s.isNotEmpty).last ?? '';
 
     return Row(
       mainAxisSize: MainAxisSize.min,
@@ -4008,6 +4329,16 @@ class _QueuedMessagesBadge extends StatelessWidget {
         Stack(
           clipBehavior: Clip.none,
           children: [
+            // Outside the badge's own box, so starting and stopping it never
+            // moves the badge.
+            if (agentWorking)
+              const Positioned(
+                left: -5,
+                top: -5,
+                right: -5,
+                bottom: -5,
+                child: IgnorePointer(child: _WorkingRing()),
+              ),
             Container(
               width: 28,
               height: 28,
@@ -4052,7 +4383,8 @@ class _QueuedMessagesBadge extends StatelessWidget {
                 decoration: BoxDecoration(
                   color: const Color(0xFFE53935),
                   borderRadius: BorderRadius.circular(999),
-                  border: Border.all(color: const Color(0xFFFFFFFF), width: 1.5),
+                  border:
+                      Border.all(color: const Color(0xFFFFFFFF), width: 1.5),
                 ),
                 child: Text(
                   text,
@@ -4073,9 +4405,83 @@ class _QueuedMessagesBadge extends StatelessWidget {
   }
 }
 
+/// A comet-tailed arc that circles the queue badge while the agent works.
+class _WorkingRing extends StatefulWidget {
+  const _WorkingRing();
+
+  @override
+  State<_WorkingRing> createState() => _WorkingRingState();
+}
+
+class _WorkingRingState extends State<_WorkingRing>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RotationTransition(
+      turns: _ctrl,
+      child: const CustomPaint(painter: _WorkingRingPainter()),
+    );
+  }
+}
+
+class _WorkingRingPainter extends CustomPainter {
+  const _WorkingRingPainter();
+
+  static const _strokeWidth = 2.5;
+  static const _sweep = 4.4; // radians: most of the way round, leaving a gap
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = (Offset.zero & size).deflate(_strokeWidth / 2);
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = _strokeWidth
+      ..strokeCap = StrokeCap.round
+      ..shader = const SweepGradient(
+        endAngle: _sweep,
+        colors: [Color(0x0038D76A), Color(0xFF38D76A), Color(0xFFB8FFD0)],
+        stops: [0, 0.85, 1],
+      ).createShader(rect);
+    canvas.drawArc(rect, 0, _sweep, false, paint);
+  }
+
+  @override
+  bool shouldRepaint(_WorkingRingPainter oldDelegate) => false;
+}
+
+/// Which of the queue's items the panel lists.
+enum _QueueFilter {
+  all,
+
+  /// What is still to be done: being worked on, or not sent yet.
+  active,
+  notStarted,
+  completed,
+}
+
 class _QueuedMessagesPanel extends StatefulWidget {
   _QueuedMessagesPanel({
     required this.messages,
+    this.sentMessages = const [],
+    this.onDeleteSentMessage,
+    this.onClearCompleted,
     required this.onDeleteMessage,
     required this.onClearAll,
     required this.onSend,
@@ -4086,9 +4492,24 @@ class _QueuedMessagesPanel extends StatefulWidget {
     this.onExitAnnotationMode,
     this.isAnnotationModeActive = false,
     this.onStartRecording,
+    this.autoDrain = false,
+    this.onAutoDrainChanged,
   });
 
+  /// Messages not yet sent.
   final List<Map<String, dynamic>> messages;
+
+  /// Messages already handed to the agent, oldest first — the work in
+  /// progress and the history after it. See
+  /// [UserMessageService.sentMessages].
+  final List<Map<String, dynamic>> sentMessages;
+  final void Function(int queueId)? onDeleteSentMessage;
+  final VoidCallback? onClearCompleted;
+
+  /// Whether the queue sends itself one task at a time as the agent finishes
+  /// each. See [UserMessageService.autoDrain].
+  final bool autoDrain;
+  final ValueChanged<bool>? onAutoDrainChanged;
   final void Function(int queueId) onDeleteMessage;
   final VoidCallback onClearAll;
   final VoidCallback onSend;
@@ -4109,6 +4530,13 @@ class _QueuedMessagesPanel extends StatefulWidget {
 }
 
 class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
+  _QueueFilter _filter = _QueueFilter.all;
+
+  /// Sent items whose full list of agent messages is showing, not just the
+  /// latest few.
+  final Set<int> _expandedProgress = {};
+  static const _collapsedProgressCount = 4;
+
   /// Key for the item currently being edited inline.
   /// Annotation edits: "ann:queueId:annotationId"
   /// Message text edits: "msg:queueId"
@@ -4188,8 +4616,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
         _editFocusNode.removeListener(setSelectionOnFocus);
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (_editController.text.isNotEmpty) {
-            _editController.selection =
-                TextSelection.collapsed(offset: offset);
+            _editController.selection = TextSelection.collapsed(offset: offset);
           }
         });
       }
@@ -4279,8 +4706,14 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
   /// "Queued (1)" next to 4 rows, which looks like a counting bug. We label
   /// the message count explicitly and, when annotations outnumber messages,
   /// spell out the row count so the mismatch reads as intentional.
-  static String _queuedHeaderLabel(List<Map<String, dynamic>> messages) {
+  static String _queuedHeaderLabel(
+    List<Map<String, dynamic>> messages, {
+    int working = 0,
+  }) {
     final messageCount = messages.length;
+    if (messageCount == 0) {
+      return working > 0 ? 'Agent working · ' : 'Queue · ';
+    }
     var annotationCount = 0;
     for (final m in messages) {
       final data = m['data'];
@@ -4310,7 +4743,9 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
       final bytes = base64Decode(base64Data.substring(0, 32));
       if (bytes.length < 24) return 1600;
       // Verify PNG signature (first 4 bytes: 0x89 P N G).
-      if (bytes[0] != 0x89 || bytes[1] != 0x50 || bytes[2] != 0x4E ||
+      if (bytes[0] != 0x89 ||
+          bytes[1] != 0x50 ||
+          bytes[2] != 0x4E ||
           bytes[3] != 0x47) {
         return 1600;
       }
@@ -4325,9 +4760,51 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     }
   }
 
+  static bool _isWorking(Map<String, dynamic> m) =>
+      m['status'] == UserMessageService.sentWorking;
+
+  /// What the list shows, top to bottom: the work in progress, then what is
+  /// waiting to go, then what is finished, newest first.
+  List<({Map<String, dynamic> message, bool sent})> get _entries {
+    final working = [
+      for (final m in widget.sentMessages)
+        if (_isWorking(m)) m,
+    ];
+    final finished = [
+      for (final m in widget.sentMessages.reversed)
+        if (!_isWorking(m)) m,
+    ];
+    final showWorking =
+        _filter == _QueueFilter.all || _filter == _QueueFilter.active;
+    final showWaiting = _filter != _QueueFilter.completed;
+    final showFinished =
+        _filter == _QueueFilter.all || _filter == _QueueFilter.completed;
+    return [
+      if (showWorking)
+        for (final m in working) (message: m, sent: true),
+      if (showWaiting)
+        for (final m in widget.messages) (message: m, sent: false),
+      if (showFinished)
+        for (final m in finished) (message: m, sent: true),
+    ];
+  }
+
   @override
   Widget build(BuildContext context) {
     final estimatedTokens = _estimateTokens(widget.messages);
+    final entries = _entries;
+    // A batch sent together is one turn: its narration is shown once, under
+    // the first of its messages.
+    final narrated = <String>{};
+    final showsProgress = [
+      for (final e in entries)
+        e.sent &&
+            narrated.add(e.message['agentTurn'] != null
+                ? jsonEncode(e.message['agentTurn'])
+                : 'sent:${e.message['sentAt']}:${e.message['queueId']}'),
+    ];
+    final completedCount =
+        widget.sentMessages.where((m) => !_isWorking(m)).length;
 
     return Container(
       width: 480,
@@ -4360,21 +4837,27 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                         TextSpan(
                           children: [
                             TextSpan(
-                              text: _queuedHeaderLabel(widget.messages),
-                            ),
-                            TextSpan(
-                              text: estimatedTokens >= 1000
-                                  ? '~${(estimatedTokens / 1000).toStringAsFixed(1)}k tokens'
-                                  : '~$estimatedTokens tokens',
-                              style: TextStyle(
-                                color: estimatedTokens > 3000
-                                    ? const Color(0xFFFF9500)
-                                    : const Color(0xFF888899),
-                                fontWeight: estimatedTokens > 3000
-                                    ? FontWeight.w600
-                                    : FontWeight.w400,
+                              text: _queuedHeaderLabel(
+                                widget.messages,
+                                working: widget.sentMessages
+                                    .where(_isWorking)
+                                    .length,
                               ),
                             ),
+                            if (widget.messages.isNotEmpty)
+                              TextSpan(
+                                text: estimatedTokens >= 1000
+                                    ? '~${(estimatedTokens / 1000).toStringAsFixed(1)}k tokens'
+                                    : '~$estimatedTokens tokens',
+                                style: TextStyle(
+                                  color: estimatedTokens > 3000
+                                      ? const Color(0xFFFF9500)
+                                      : const Color(0xFF888899),
+                                  fontWeight: estimatedTokens > 3000
+                                      ? FontWeight.w600
+                                      : FontWeight.w400,
+                                ),
+                              ),
                           ],
                         ),
                         style: const TextStyle(
@@ -4523,6 +5006,63 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                   // markup/deployed no agent ever connects (agentDisabled), so
                   // hide it there — "Create Issue" is the only valid path.
                   if (!FlanBinding.agentDisabled) ...[
+                    if (widget.onAutoDrainChanged != null) ...[
+                      const SizedBox(width: 4),
+                      // Semantics, not Tooltip: this panel sits above the
+                      // app's WidgetsApp, so there is no Overlay to show one in.
+                      Semantics(
+                        label: widget.autoDrain
+                            ? 'Auto-drain on: Send hands the agent one task, '
+                                'and the next goes out when it finishes'
+                            : 'Auto-drain off: Send hands the agent the whole '
+                                'queue at once',
+                        child: GestureDetector(
+                          key: const ValueKey('flan-auto-drain-toggle'),
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () =>
+                              widget.onAutoDrainChanged!(!widget.autoDrain),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: widget.autoDrain
+                                  ? const Color(0xFFBB86FC)
+                                      .withValues(alpha: 0.3)
+                                  : Colors.transparent,
+                              border: Border.all(
+                                color: const Color(0xFFBB86FC)
+                                    .withValues(alpha: 0.6),
+                              ),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  widget.autoDrain
+                                      ? Icons.playlist_play
+                                      : Icons.playlist_add_check,
+                                  size: 12,
+                                  color: const Color(0xFFD7B8FF),
+                                ),
+                                const SizedBox(width: 3),
+                                Text(
+                                  widget.autoDrain
+                                      ? 'Auto-drain on'
+                                      : 'Auto-drain',
+                                  style: const TextStyle(
+                                    color: Color(0xFFD7B8FF),
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w600,
+                                    decoration: TextDecoration.none,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                     const SizedBox(width: 4),
                     GestureDetector(
                       behavior: HitTestBehavior.opaque,
@@ -4554,12 +5094,42 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
             ),
           ),
           const Divider(height: 1, color: Color(0xFF333344)),
+          _buildFilterBar(completedCount: completedCount),
+          const Divider(height: 1, color: Color(0xFF333344)),
+          if (entries.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                switch (_filter) {
+                  _QueueFilter.completed => 'Nothing completed yet.',
+                  _QueueFilter.notStarted => 'Nothing waiting to be sent.',
+                  _QueueFilter.active => 'Nothing in progress or waiting.',
+                  _QueueFilter.all => 'The queue is empty.',
+                },
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Color(0xFF888899),
+                  fontSize: 12,
+                  decoration: TextDecoration.none,
+                ),
+              ),
+            ),
           Flexible(
             child: ListView.separated(
               padding: const EdgeInsets.symmetric(vertical: 8),
               shrinkWrap: true,
               itemBuilder: (context, index) {
-                final message = widget.messages[index];
+                final entry = entries[index];
+                final message = entry.message;
+                if (entry.sent) {
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: _buildSentItem(
+                      message,
+                      showProgress: showsProgress[index],
+                    ),
+                  );
+                }
                 final summary = _summarizeMessage(message);
                 final previewBytes = _previewBytesForMessage(message);
                 final queueId = _queueIdOf(message);
@@ -4575,8 +5145,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
                         queueId: queueId,
                         previewBytes: previewBytes,
                         summary: summary,
-                        editableText:
-                            _editableTextForMessage(message, summary),
+                        editableText: _editableTextForMessage(message, summary),
                       );
 
                 return Padding(
@@ -4586,12 +5155,257 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
               },
               separatorBuilder: (_, __) =>
                   const Divider(height: 12, color: Color(0xFF2A2A3A)),
-              itemCount: widget.messages.length,
+              itemCount: entries.length,
             ),
           ),
         ],
       ),
     );
+  }
+
+  Widget _buildFilterBar({required int completedCount}) {
+    final notStarted = widget.messages.length;
+    final total = widget.sentMessages.length + notStarted;
+    Widget chip(_QueueFilter filter, String label) {
+      final selected = _filter == filter;
+      return GestureDetector(
+        key: ValueKey('flan-queue-filter-${filter.name}'),
+        behavior: HitTestBehavior.opaque,
+        onTap: () => setState(() => _filter = filter),
+        child: Container(
+          margin: const EdgeInsets.only(right: 4),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(
+            color: selected
+                ? const Color(0xFF00AAFF).withValues(alpha: 0.25)
+                : Colors.transparent,
+            border: Border.all(
+              color: const Color(0xFF00AAFF)
+                  .withValues(alpha: selected ? 0.8 : 0.3),
+            ),
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              color:
+                  selected ? const Color(0xFFFFFFFF) : const Color(0xFF9FB8CC),
+              fontSize: 10,
+              fontWeight: FontWeight.w600,
+              decoration: TextDecoration.none,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+      child: Row(
+        children: [
+          // Wraps rather than overflows when the counts grow or the panel is
+          // narrow.
+          Expanded(
+            child: Wrap(
+              runSpacing: 4,
+              children: [
+                chip(_QueueFilter.all, 'All ($total)'),
+                chip(
+                  _QueueFilter.active,
+                  'Active (${total - completedCount})',
+                ),
+                chip(_QueueFilter.notStarted, 'Not started ($notStarted)'),
+                chip(_QueueFilter.completed, 'Completed ($completedCount)'),
+              ],
+            ),
+          ),
+          if (completedCount > 0 && widget.onClearCompleted != null)
+            GestureDetector(
+              key: const ValueKey('flan-queue-clear-completed'),
+              behavior: HitTestBehavior.opaque,
+              onTap: widget.onClearCompleted,
+              child: const Text(
+                'Clear completed',
+                style: TextStyle(
+                  color: Color(0xFF888899),
+                  fontSize: 10,
+                  decoration: TextDecoration.none,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// A message the agent already has: where it stands, and — on the first
+  /// message of its turn — what the agent has said while working on it.
+  Widget _buildSentItem(
+    Map<String, dynamic> message, {
+    required bool showProgress,
+  }) {
+    final queueId = _queueIdOf(message);
+    final status = message['status'];
+    final (IconData icon, Color color, String label) = switch (status) {
+      UserMessageService.sentWorking => (
+          Icons.pending,
+          const Color(0xFF00AAFF),
+          'Working',
+        ),
+      UserMessageService.sentDone => (
+          Icons.check_circle,
+          const Color(0xFF38D76A),
+          'Done',
+        ),
+      UserMessageService.sentStopped => (
+          Icons.error_outline,
+          const Color(0xFFFF9500),
+          'Agent exited',
+        ),
+      _ => (Icons.send, const Color(0xFF888899), 'Sent'),
+    };
+    final said = [
+      for (final m in (message['agentMessages'] as List? ?? const []))
+        if (m is Map && m['text'] is String) m['text'] as String,
+    ];
+    final expanded = queueId != null && _expandedProgress.contains(queueId);
+    final hidden = expanded ? 0 : said.length - _collapsedProgressCount;
+    final shown = hidden > 0 ? said.sublist(hidden) : said;
+    final working = status == UserMessageService.sentWorking;
+    final previewBytes = _previewBytesForMessage(message);
+
+    return Column(
+      key: ValueKey('flan-sent-item-$queueId'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Icon(icon, size: 14, color: color),
+            const SizedBox(width: 6),
+            if (previewBytes != null) ...[
+              _QueueMessageThumbnail(bytes: previewBytes),
+              const SizedBox(width: 8),
+            ],
+            Expanded(
+              child: Text(
+                _summarizeMessage(message),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: working
+                      ? const Color(0xFFE0E0E0)
+                      : const Color(0xFFA0A0B0),
+                  fontSize: 13,
+                  height: 1.4,
+                  decoration: TextDecoration.none,
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: TextStyle(
+                color: color,
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                decoration: TextDecoration.none,
+              ),
+            ),
+            if (queueId != null && widget.onDeleteSentMessage != null) ...[
+              const SizedBox(width: 6),
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => widget.onDeleteSentMessage!(queueId),
+                child: const Padding(
+                  padding: EdgeInsets.all(2),
+                  child: Icon(Icons.close, size: 13, color: Color(0xFF888899)),
+                ),
+              ),
+            ],
+          ],
+        ),
+        if (showProgress && said.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(left: 20, top: 4),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (hidden > 0)
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () =>
+                        setState(() => _expandedProgress.add(queueId!)),
+                    child: Padding(
+                      padding: const EdgeInsets.only(bottom: 2),
+                      child: Text(
+                        'Show $hidden earlier',
+                        style: const TextStyle(
+                          color: Color(0xFF00AAFF),
+                          fontSize: 11,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                for (var i = 0; i < shown.length; i++)
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    // One line each — what the agent is doing — and the
+                    // whole of what it said on a tap.
+                    onTap: queueId == null
+                        ? null
+                        : () => setState(() {
+                              if (!_expandedProgress.remove(queueId)) {
+                                _expandedProgress.add(queueId);
+                              }
+                            }),
+                    child: Padding(
+                      padding: const EdgeInsets.only(bottom: 3),
+                      child: Text(
+                        expanded ? shown[i] : _oneLine(shown[i]),
+                        maxLines: expanded ? null : 1,
+                        overflow: expanded
+                            ? TextOverflow.clip
+                            : TextOverflow.ellipsis,
+                        style: TextStyle(
+                          // The latest thing a working agent said is what it is
+                          // doing now.
+                          color: working && i == shown.length - 1
+                              ? const Color(0xFFD0D8E8)
+                              : const Color(0xFF9090A8),
+                          fontSize: 11,
+                          height: 1.35,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  /// What an agent message says it is doing, in one line: its first
+  /// sentence, without the markdown that reads as noise in a single line.
+  static String _oneLine(String text) {
+    final firstLine = text.split('\n').map((l) => l.trim()).firstWhere(
+        (l) => l.isNotEmpty && !l.startsWith('```'),
+        orElse: () => text.trim());
+    final plain = firstLine
+        .replaceAll(RegExp(r'^(#+|[-*>]|\d+\.)\s+'), '')
+        .replaceAll(RegExp(r'\*\*|__|`'), '')
+        .replaceAllMapped(
+            RegExp(r'\[([^\]]*)\]\([^)]*\)'), (m) => m.group(1) ?? '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    // The first sentence, when there is a sentence break that isn't a
+    // file name or a version number.
+    final end = RegExp(r'[.!?:](\s|$)').firstMatch(plain);
+    if (end != null && end.start > 12) return plain.substring(0, end.start + 1);
+    return plain;
   }
 
   Widget _buildInlineTextField() {
@@ -4632,8 +5446,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         for (int i = 0; i < annotations.length; i++) ...[
-          if (i > 0)
-            const Divider(height: 8, color: Color(0xFF2A2A3A)),
+          if (i > 0) const Divider(height: 8, color: Color(0xFF2A2A3A)),
           _buildSingleAnnotationRow(
             queueId: queueId,
             annotation: annotations[i],
@@ -4724,8 +5537,7 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     required String summary,
     required String editableText,
   }) {
-    final isEditing =
-        queueId != null && _editingKey == 'msg:$queueId';
+    final isEditing = queueId != null && _editingKey == 'msg:$queueId';
     // Clicking a character only maps to a cursor offset when the displayed
     // label IS the editable text. When they differ (the label carries a
     // "User message: " prefix / selection lines that editing strips), the
@@ -4886,7 +5698,6 @@ class _QueuedMessagesPanelState extends State<_QueuedMessagesPanel> {
     if (raw is String) return int.tryParse(raw);
     return null;
   }
-
 }
 
 class _QueueMessageThumbnail extends StatelessWidget {
@@ -5060,6 +5871,7 @@ class _SubmitOnEnterFormatter extends TextInputFormatter {
   _SubmitOnEnterFormatter({required this.onSubmit, this.onCmdSubmit});
 
   final VoidCallback onSubmit;
+
   /// Called on Cmd/Ctrl+Enter. If null, falls through to [onSubmit].
   final VoidCallback? onCmdSubmit;
 
@@ -5096,7 +5908,8 @@ class _SubmitOnEnterFormatter extends TextInputFormatter {
       // Strip the newline and schedule submission.
       final isCmdHeld = HardwareKeyboard.instance.isMetaPressed ||
           HardwareKeyboard.instance.isControlPressed;
-      final callback = (isCmdHeld && onCmdSubmit != null) ? onCmdSubmit! : onSubmit;
+      final callback =
+          (isCmdHeld && onCmdSubmit != null) ? onCmdSubmit! : onSubmit;
       WidgetsBinding.instance.addPostFrameCallback((_) => callback());
       return oldValue;
     }
@@ -5566,8 +6379,7 @@ class _BadgeMenuItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color =
-        enabled ? const Color(0xFFE0E0E8) : const Color(0xFF666677);
+    final color = enabled ? const Color(0xFFE0E0E8) : const Color(0xFF666677);
     return Semantics(
       button: true,
       enabled: enabled,
@@ -5582,9 +6394,8 @@ class _BadgeMenuItem extends StatelessWidget {
               Icon(
                 icon,
                 size: 16,
-                color: enabled
-                    ? const Color(0xFF66CCFF)
-                    : const Color(0xFF445566),
+                color:
+                    enabled ? const Color(0xFF66CCFF) : const Color(0xFF445566),
               ),
               const SizedBox(width: 10),
               Expanded(
@@ -5624,11 +6435,7 @@ class _HotReloadBanner extends StatelessWidget {
     required this.ok,
     required this.fullRestart,
     required this.onDismiss,
-    this.onRefreshPage,
   });
-
-  /// Shown when the host compiled the new code and the page never received it.
-  final VoidCallback? onRefreshPage;
 
   final String message;
   final bool ok;
@@ -5674,7 +6481,8 @@ class _HotReloadBanner extends StatelessWidget {
                         ? (fullRestart ? Icons.restart_alt : Icons.bolt)
                         : Icons.error_outline,
                     size: 16,
-                    color: ok ? const Color(0xFF66CCFF) : const Color(0xFFFF6060),
+                    color:
+                        ok ? const Color(0xFF66CCFF) : const Color(0xFFFF6060),
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -5711,46 +6519,13 @@ class _HotReloadBanner extends StatelessWidget {
               child: Text(
                 message,
                 style: TextStyle(
-                  color: ok
-                      ? const Color(0xFFC8DCE0)
-                      : const Color(0xFFE0C8C8),
+                  color: ok ? const Color(0xFFC8DCE0) : const Color(0xFFE0C8C8),
                   fontSize: 12,
                   height: 1.35,
                   decoration: TextDecoration.none,
                 ),
               ),
             ),
-            if (onRefreshPage != null) ...[
-              const SizedBox(height: 8),
-              Padding(
-                padding: const EdgeInsets.only(left: 24),
-                child: Semantics(
-                  button: true,
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: onRefreshPage,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 10, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: const Color(0x3300AAFF),
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: const Color(0xFF00AAFF)),
-                      ),
-                      child: const Text(
-                        'Refresh page',
-                        style: TextStyle(
-                          color: Color(0xFF99DDFF),
-                          fontSize: 12,
-                          fontWeight: FontWeight.w700,
-                          decoration: TextDecoration.none,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ],
           ],
         ),
       ),

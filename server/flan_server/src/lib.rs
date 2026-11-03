@@ -743,6 +743,318 @@ fn read_session_registry() -> Vec<SessionRecord> {
         .collect()
 }
 
+/// Where an agent stands on the turn a flush started.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct AgentTurnState {
+    /// The agent process is still running.
+    pub alive: bool,
+    /// The registry's status: "busy", "idle", "shell", … `None` when the
+    /// agent keeps no registry entry (not Claude Code, or too old for one).
+    pub status: Option<String>,
+    pub status_updated_at_ms: Option<u64>,
+    /// The agent has stopped working since the flush was delivered — the task
+    /// is done.
+    pub finished: bool,
+    /// What the agent has said in plain English since the flush was
+    /// delivered — its narration between tool calls, not the tool calls —
+    /// oldest first, so the queue can show the work as it happens.
+    pub messages: Vec<AgentMessage>,
+}
+
+/// One thing an agent said while working, stamped with this host's clock.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentMessage {
+    pub at_ms: u64,
+    pub text: String,
+}
+
+/// The most of a transcript read per question. The app asks every two
+/// seconds and a long session's transcript runs to tens of megabytes; a
+/// turn's narration is in its tail. ([transcript_index] reads incrementally
+/// instead, because what it wants is stated once and early.)
+const TRANSCRIPT_TAIL_BYTES: u64 = 1 << 20;
+/// Messages kept per answer, newest kept, and characters kept per message.
+const AGENT_MESSAGES_MAX: usize = 40;
+const AGENT_MESSAGE_CHARS: usize = 1200;
+
+/// Has agent `pid` finished the turn a flush delivered at `since_ms` started?
+///
+/// Claude Code rewrites `~/.claude/sessions/<pid>.json` on every change of
+/// state, flipping `status` to "busy" when a turn starts and back to "idle"
+/// when it ends — or to "shell" when it ends with a background shell still
+/// running, which is not working on anything either. Treating only "idle" as
+/// done held a drained queue forever behind a session with a dev server in
+/// the background. A resting status stamped AFTER the delivery is the end of
+/// that turn —
+/// the stamp is what tells it apart from the idle the agent was already
+/// sitting in when the message arrived. Both clocks are this host's: the
+/// delivery time is taken by the server beside the channel, never by the app.
+pub fn agent_turn_state(pid: u32, since_ms: u64) -> AgentTurnState {
+    let alive = pid_is_alive(pid);
+    let record = std::env::var("HOME").ok().and_then(|home| {
+        let path = PathBuf::from(home).join(".claude").join("sessions").join(format!("{pid}.json"));
+        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).ok()?).ok()
+    });
+    let status = record
+        .as_ref()
+        .and_then(|r| r.get("status")?.as_str().map(str::to_string));
+    let updated = record.as_ref().and_then(|r| r.get("statusUpdatedAt")?.as_u64());
+    let mut state = turn_state_from(alive, status, updated, since_ms);
+    state.messages = record
+        .as_ref()
+        .and_then(claude_transcript_path)
+        .and_then(|path| read_tail(&path, TRANSCRIPT_TAIL_BYTES))
+        .map(|tail| claude_messages_since(&tail, since_ms))
+        .unwrap_or_default();
+    state
+}
+
+/// The transcript a Claude Code session is writing:
+/// `~/.claude/projects/<project slug>/<sessionId>.jsonl`.
+/// Falls back to looking in every project folder, for a session that has
+/// since moved directory.
+fn claude_transcript_path(record: &serde_json::Value) -> Option<PathBuf> {
+    let session = record.get("sessionId")?.as_str()?;
+    let projects = PathBuf::from(std::env::var("HOME").ok()?).join(".claude").join("projects");
+    let file = format!("{session}.jsonl");
+    if let Some(cwd) = record.get("cwd").and_then(|c| c.as_str()) {
+        let path = projects.join(claude_project_slug(cwd)).join(&file);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    std::fs::read_dir(&projects)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join(&file))
+        .find(|path| path.is_file())
+}
+
+/// Up to the last `max` bytes of a file, starting at a line boundary.
+fn read_tail(path: &std::path::Path, max: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if start > 0 {
+        // The first line was cut in half.
+        text = text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default();
+    }
+    Some(text)
+}
+
+/// The text blocks of a Claude Code transcript's assistant entries stamped
+/// after `since_ms` — what the agent said, without its tool calls, thinking
+/// or subagents' chatter.
+fn claude_messages_since(transcript: &str, since_ms: u64) -> Vec<AgentMessage> {
+    let mut out = Vec::new();
+    for line in transcript.lines() {
+        if !line.contains("\"assistant\"") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if entry.get("type").and_then(|t| t.as_str()) != Some("assistant")
+            || entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+        {
+            continue;
+        }
+        let Some(at_ms) = entry.get("timestamp").and_then(|t| t.as_str()).and_then(parse_iso8601_ms)
+        else {
+            continue;
+        };
+        if at_ms <= since_ms {
+            continue;
+        }
+        let Some(blocks) = entry.pointer("/message/content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) != Some("text") {
+                continue;
+            }
+            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                push_agent_message(&mut out, at_ms, text);
+            }
+        }
+    }
+    trim_agent_messages(out)
+}
+
+/// What a Codex thread said after `since_ms`, and where its last turn stands:
+/// `Some(true)` when the newest turn event after `since_ms` is a
+/// `task_complete`, `Some(false)` when it is a `task_started`, `None` when no
+/// turn event has been written since.
+fn codex_messages_since(rollout: &str, since_ms: u64) -> (Vec<AgentMessage>, Option<bool>) {
+    let mut out = Vec::new();
+    let mut complete = None;
+    for line in rollout.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Some(at_ms) = entry.get("timestamp").and_then(|t| t.as_str()).and_then(parse_iso8601_ms)
+        else {
+            continue;
+        };
+        if at_ms <= since_ms {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else { continue };
+        match (
+            entry.get("type").and_then(|t| t.as_str()),
+            payload.get("type").and_then(|t| t.as_str()),
+        ) {
+            (Some("event_msg"), Some("task_started")) => complete = Some(false),
+            (Some("event_msg"), Some("task_complete")) => complete = Some(true),
+            (Some("response_item"), Some("message"))
+                if payload.get("role").and_then(|r| r.as_str()) == Some("assistant") =>
+            {
+                for block in payload.get("content").and_then(|c| c.as_array()).into_iter().flatten() {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            push_agent_message(&mut out, at_ms, text);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (trim_agent_messages(out), complete)
+}
+
+fn push_agent_message(out: &mut Vec<AgentMessage>, at_ms: u64, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let text = if text.chars().count() > AGENT_MESSAGE_CHARS {
+        let cut: String = text.chars().take(AGENT_MESSAGE_CHARS).collect();
+        format!("{}…", cut.trim_end())
+    } else {
+        text.to_string()
+    };
+    out.push(AgentMessage { at_ms, text });
+}
+
+fn trim_agent_messages(mut out: Vec<AgentMessage>) -> Vec<AgentMessage> {
+    if out.len() > AGENT_MESSAGES_MAX {
+        out.drain(..out.len() - AGENT_MESSAGES_MAX);
+    }
+    out
+}
+
+/// Where a Codex thread stands on the turn a flush delivered at `since_ms`
+/// started. Codex keeps no session registry; its rollout file says when a
+/// turn starts and completes.
+pub fn codex_turn_state(pid: u32, thread: &str, since_ms: u64) -> AgentTurnState {
+    let alive = pid_is_alive(pid);
+    let rollout = codex_rollout_path(pid, thread);
+    let (messages, complete) = rollout
+        .as_deref()
+        .and_then(|path| read_tail(path, TRANSCRIPT_TAIL_BYTES))
+        .map(|tail| codex_messages_since(&tail, since_ms))
+        .unwrap_or_default();
+    let status = match complete {
+        Some(true) => Some("idle".to_string()),
+        Some(false) => Some("busy".to_string()),
+        None => None,
+    };
+    AgentTurnState {
+        alive,
+        finished: alive && complete == Some(true),
+        status,
+        status_updated_at_ms: None,
+        messages,
+    }
+}
+
+/// The rollout file of Codex thread `thread`: the one process `pid` has open,
+/// or failing that the newest match under `~/.codex/sessions`.
+fn codex_rollout_path(pid: u32, thread: &str) -> Option<PathBuf> {
+    if let Ok(out) = Command::new("lsof").args(["-p", &pid.to_string(), "-Fn"]).output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(path) = text
+            .lines()
+            .filter_map(|line| line.strip_prefix('n'))
+            .find(|path| codex_thread_from_rollout_path(path).as_deref() == Some(thread))
+        {
+            return Some(PathBuf::from(path));
+        }
+    }
+    let root = PathBuf::from(std::env::var("HOME").ok()?).join(".codex").join("sessions");
+    let suffix = format!("-{thread}.jsonl");
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().ends_with(&suffix) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Milliseconds since the epoch for an RFC 3339 UTC stamp such as
+/// `2026-10-16T21:55:05.274Z` — the form both transcripts write.
+fn parse_iso8601_ms(stamp: &str) -> Option<u64> {
+    let stamp = stamp.strip_suffix('Z')?;
+    let (date, time) = stamp.split_once('T')?;
+    let mut date = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (date.next()??, date.next()??, date.next()??);
+    let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
+    let mut hms = hms.split(':').map(|p| p.parse::<i64>().ok());
+    let (hh, mm, ss) = (hms.next()??, hms.next()??, hms.next()??);
+    let frac: String = frac.chars().chain("000".chars()).take(3).collect();
+    let ms = frac.parse::<i64>().ok()?;
+    // Days from civil (Howard Hinnant).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let total = ((days * 24 + hh) * 60 + mm) * 60 + ss;
+    u64::try_from(total * 1000 + ms).ok()
+}
+
+fn turn_state_from(
+    alive: bool,
+    status: Option<String>,
+    status_updated_at_ms: Option<u64>,
+    since_ms: u64,
+) -> AgentTurnState {
+    let finished = alive
+        && status.as_deref().is_some_and(is_resting_status)
+        && status_updated_at_ms.is_some_and(|at| at > since_ms);
+    AgentTurnState { alive, status, status_updated_at_ms, finished, messages: Vec::new() }
+}
+
+/// A registry status meaning no turn is in progress.
+pub fn is_resting_status(status: &str) -> bool {
+    matches!(status, "idle" | "shell")
+}
+
+/// The agent process that owns the flan-channel listening on `port`.
+pub fn agent_pid_for_channel_port(port: u16) -> Option<u32> {
+    discover_channel_processes(&process_table())
+        .into_iter()
+        .find(|c| c.port == port)
+        .and_then(|c| c.agent_pid)
+}
+
+pub fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// A flan-channel process found in the process table.
 #[derive(Debug, Clone)]
 pub struct ChannelProcess {
@@ -1812,7 +2124,8 @@ mod server {
                 // same hop for flushes, an app and the agent it is linked to
                 // can see each other and still never exchange a word.
                 if body.relayed_from.is_none() {
-                    if let Some((peer, outcome)) = relay_flush_to_peers(&body, &load_peers()).await
+                    if let Some((peer, outcome, turn)) =
+                        relay_flush_to_peers(&body, &load_peers()).await
                     {
                         let host = peer_host(&peer).unwrap_or_else(|| peer.clone());
                         state
@@ -1823,14 +2136,15 @@ mod server {
                                 true,
                             )
                             .await;
-                        return (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "accepted": outcome.accepted,
-                                "delivered": outcome.delivered,
-                                "relayed_to": peer,
-                            })),
-                        );
+                        let mut resp = serde_json::json!({
+                            "accepted": outcome.accepted,
+                            "delivered": outcome.delivered,
+                            "relayed_to": peer,
+                        });
+                        if let Some(turn) = turn {
+                            resp["agent_turn"] = turn;
+                        }
+                        return (StatusCode::OK, Json(resp));
                     }
                 }
                 let relay_note = if body.relayed_from.is_some() {
@@ -2004,6 +2318,7 @@ mod server {
 
             let (text, images) =
                 format_codex_message(messages, resolved_vm_uri.as_deref(), resolved_pid);
+            let delivered_at_ms = now_epoch_ms();
             let relay = {
                 let thread = thread.clone();
                 tokio::task::spawn_blocking(move || relay_codex_queue(&thread, &text, &images))
@@ -2027,6 +2342,15 @@ mod server {
                         .await;
                     resp["accepted"] = serde_json::Value::Bool(true);
                     resp["delivered"] = serde_json::Value::Bool(outcome.delivered);
+                    // Codex has no session registry, but its rollout says
+                    // when a turn completes and what it said on the way —
+                    // `thread` is what tells /api/agent-turn to read that.
+                    resp["agent_turn"] = serde_json::json!({
+                        "agent_pid": pid,
+                        "delivered_at_ms": delivered_at_ms,
+                        "host": serde_json::Value::Null,
+                        "thread": thread,
+                    });
                     return (StatusCode::OK, Json(resp));
                 }
                 Err(error) => {
@@ -2079,6 +2403,23 @@ mod server {
                 Ok(outcome) if outcome.accepted => {
                     resp["accepted"] = serde_json::Value::Bool(true);
                     resp["delivered"] = serde_json::Value::Bool(outcome.delivered);
+                    // Which agent took the batch, and when — so an app draining
+                    // its queue one task at a time can ask when this one is done.
+                    let delivered_at_ms = now_epoch_ms();
+                    let agent_pid = match surface_id.strip_prefix("sess:").and_then(|p| p.parse().ok()) {
+                        Some(pid) => Some(pid),
+                        None => tokio::task::spawn_blocking(move || agent_pid_for_channel_port(port))
+                            .await
+                            .ok()
+                            .flatten(),
+                    };
+                    if let Some(agent_pid) = agent_pid {
+                        resp["agent_turn"] = serde_json::json!({
+                            "agent_pid": agent_pid,
+                            "delivered_at_ms": delivered_at_ms,
+                            "host": serde_json::Value::Null,
+                        });
+                    }
                 }
                 Ok(_) => {
                     return (
@@ -2492,6 +2833,57 @@ mod server {
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     }
 
+    /// GET /api/agent-turn?pid=<agent pid>&since=<ms>[&host=<peer>][&thread=<codex
+    /// thread>] — has the agent that took a flush finished the turn it started,
+    /// and what has it said since?
+    ///
+    /// An app draining its queue one task at a time asks this between tasks.
+    /// `pid` and `since` come from the `agent_turn` its flush was answered
+    /// with; `host` is set when a peer delivered it, and then the question is
+    /// forwarded there — only the agent's own host can read its registry.
+    async fn get_agent_turn(
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        let Some(pid) = params.get("pid").and_then(|p| p.parse::<u32>().ok()) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "pid is required"})),
+            );
+        };
+        let since = params.get("since").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        // A Codex thread id: hex and dashes only, so it is safe in the path.
+        let thread = params
+            .get("thread")
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c == '-' || c.is_ascii_hexdigit()))
+            .cloned();
+        if let Some(host) = params.get("host").filter(|h| !h.is_empty() && !is_self_peer(h)) {
+            let host = host.clone();
+            let mut path = format!("/api/agent-turn?pid={pid}&since={since}");
+            if let Some(thread) = &thread {
+                path.push_str(&format!("&thread={thread}"));
+            }
+            let answer = tokio::task::spawn_blocking(move || peer_get_object(&host, &path))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
+            return match answer {
+                Some(value) => (StatusCode::OK, Json(value)),
+                None => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": "the agent's host did not answer"})),
+                ),
+            };
+        }
+        let turn = tokio::task::spawn_blocking(move || match thread {
+            Some(thread) => codex_turn_state(pid, &thread, since),
+            None => agent_turn_state(pid, since),
+        })
+            .await
+            .unwrap_or_default();
+        (StatusCode::OK, Json(serde_json::to_value(turn).unwrap_or_default()))
+    }
+
     async fn get_status(
         State(state): State<Arc<SharedState>>,
         Query(params): Query<std::collections::HashMap<String, String>>,
@@ -2822,6 +3214,7 @@ mod server {
             .route("/api/test-send", post(handle_test_send))
             .route("/api/register-channel", post(handle_register_channel))
             .route("/api/agents", get(get_agents))
+            .route("/api/agent-turn", get(get_agent_turn))
             .route("/api/rescan", post(handle_rescan))
             .route("/api/status", get(get_status))
             .route("/api/logs", get(get_activity_log))
@@ -3386,7 +3779,7 @@ fn fetch_peer_apps(peer: &str) -> Option<Vec<FlutterApp>> {
 pub async fn relay_flush_to_peers<T: Serialize>(
     body: &T,
     peers: &[String],
-) -> Option<(String, ChannelRelayOutcome)> {
+) -> Option<(String, ChannelRelayOutcome, Option<serde_json::Value>)> {
     if peers.is_empty() {
         return None;
     }
@@ -3401,8 +3794,8 @@ pub async fn relay_flush_to_peers<T: Serialize>(
             continue;
         };
         match result {
-            Ok((peer, outcome)) if outcome.accepted || outcome.delivered => {
-                return Some((peer, outcome));
+            Ok((peer, outcome, turn)) if outcome.accepted || outcome.delivered => {
+                return Some((peer, outcome, turn));
             }
             Ok(_) => continue,
             Err(error) => {
@@ -3427,17 +3820,30 @@ pub fn mark_relayed<T: Serialize>(body: &T) -> Option<String> {
 }
 
 /// POST a flush payload to one peer's `/api/flush`.
-fn post_peer_flush(peer: &str, payload: &str) -> Result<(String, ChannelRelayOutcome), String> {
+///
+/// Also hands back the peer's `agent_turn`, stamped with the peer's address:
+/// the agent is on that host, so that is where its turn has to be asked about.
+fn post_peer_flush(
+    peer: &str,
+    payload: &str,
+) -> Result<(String, ChannelRelayOutcome, Option<serde_json::Value>), String> {
     let (status, parsed) = post_peer_json(peer, "/api/flush", payload, PEER_RELAY_TIMEOUT)?;
     if status != 200 {
         return Err(format!("{peer}: no linked receiver there either"));
     }
+    let turn = parsed.get("agent_turn").filter(|t| t.is_object()).cloned().map(|mut t| {
+        if t.get("host").map_or(true, |h| h.is_null()) {
+            t["host"] = serde_json::json!(peer);
+        }
+        t
+    });
     Ok((
         peer.to_string(),
         ChannelRelayOutcome {
             accepted: parsed["accepted"].as_bool().unwrap_or(false),
             delivered: parsed["delivered"].as_bool().unwrap_or(false),
         },
+        turn,
     ))
 }
 
@@ -6487,6 +6893,70 @@ mod channel_relay_tests {
     }
 
     #[test]
+    fn parses_transcript_timestamps() {
+        assert_eq!(parse_iso8601_ms("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(parse_iso8601_ms("2026-10-16T21:55:05.274Z"), Some(1_792_187_705_274));
+        assert_eq!(parse_iso8601_ms("2026-10-16T21:55:05Z"), Some(1_792_187_705_000));
+        assert_eq!(parse_iso8601_ms("not a time"), None);
+    }
+
+    #[test]
+    fn claude_messages_are_the_assistant_text_after_delivery() {
+        let transcript = [
+            r#"{"type":"assistant","timestamp":"1970-01-01T00:00:01.000Z","message":{"content":[{"type":"text","text":"before"}]}}"#,
+            r#"{"type":"user","timestamp":"1970-01-01T00:00:03.000Z","message":{"content":"assistant"}}"#,
+            r#"{"type":"assistant","timestamp":"1970-01-01T00:00:03.000Z","message":{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"Reading the queue code."},{"type":"tool_use","name":"Bash"}]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"timestamp":"1970-01-01T00:00:04.000Z","message":{"content":[{"type":"text","text":"subagent"}]}}"#,
+            r#"{"type":"assistant","timestamp":"1970-01-01T00:00:05.000Z","message":{"content":[{"type":"text","text":"  Done.  "}]}}"#,
+        ]
+        .join("\n");
+        let got = claude_messages_since(&transcript, 2_000);
+        assert_eq!(
+            got,
+            vec![
+                AgentMessage { at_ms: 3_000, text: "Reading the queue code.".into() },
+                AgentMessage { at_ms: 5_000, text: "Done.".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_turn_completes_on_task_complete_after_delivery() {
+        let rollout = [
+            r#"{"timestamp":"1970-01-01T00:00:01.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+            r#"{"timestamp":"1970-01-01T00:00:03.000Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            r#"{"timestamp":"1970-01-01T00:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Fixing it."}]}}"#,
+        ];
+        let (messages, complete) = codex_messages_since(&rollout.join("\n"), 2_000);
+        assert_eq!(complete, Some(false));
+        assert_eq!(messages, vec![AgentMessage { at_ms: 4_000, text: "Fixing it.".into() }]);
+        let done = format!(
+            "{}\n{}",
+            rollout.join("\n"),
+            r#"{"timestamp":"1970-01-01T00:00:06.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+        );
+        assert_eq!(codex_messages_since(&done, 2_000).1, Some(true));
+        // Nothing since delivery: no answer either way.
+        assert_eq!(codex_messages_since(&rollout.join("\n"), 9_000).1, None);
+    }
+
+    #[test]
+    fn agent_turn_finishes_on_idle_stamped_after_delivery() {
+        let idle = || Some("idle".to_string());
+        // Already idle when the message arrived: not this turn's end.
+        assert!(!turn_state_from(true, idle(), Some(1_000), 2_000).finished);
+        // Working on it.
+        assert!(!turn_state_from(true, Some("busy".into()), Some(3_000), 2_000).finished);
+        // Went idle after the delivery: done.
+        assert!(turn_state_from(true, idle(), Some(3_000), 2_000).finished);
+        // Ended with a background shell still running: done too.
+        assert!(turn_state_from(true, Some("shell".into()), Some(3_000), 2_000).finished);
+        // A dead agent finishes nothing, and no registry entry decides nothing.
+        assert!(!turn_state_from(false, idle(), Some(3_000), 2_000).finished);
+        assert!(!turn_state_from(true, None, None, 2_000).finished);
+    }
+
+    #[test]
     fn relay_accepts_chunked_queued_response() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -7577,3 +8047,4 @@ dart:core                                            _Array.first
         server.join().unwrap();
     }
 }
+

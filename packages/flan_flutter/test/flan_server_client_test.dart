@@ -41,6 +41,100 @@ void main() {
     expect(result.delivered, isTrue);
   });
 
+  test('flush reports the agent turn it started, and asks about it',
+      () async {
+    final requests = <Uri>[];
+    final relay = FlanServerClient(
+      serverUrl: 'http://relay.test',
+      appId: 'app-a',
+      httpClient: http_testing.MockClient((request) async {
+        requests.add(request.url);
+        if (request.url.path == '/api/agent-turn') {
+          return http.Response(
+            jsonEncode({'alive': true, 'finished': true, 'status': 'idle'}),
+            200,
+          );
+        }
+        return http.Response(
+          jsonEncode({
+            'accepted': true,
+            'delivered': true,
+            'relayed_to': 'http://m1:4050',
+            'agent_turn': {
+              'agent_pid': 77,
+              'delivered_at_ms': 1792000000000,
+              'host': 'http://m1:4050',
+            },
+          }),
+          200,
+        );
+      }),
+    );
+
+    final result = await relay.flush(messages: [
+      {'text': 'task'},
+    ]);
+    final turn = result.agentTurn!;
+    expect(turn.agentPid, 77);
+    expect(turn.deliveredAtMs, 1792000000000);
+    expect(turn.host, 'http://m1:4050');
+
+    final state = await relay.getAgentTurn(turn);
+    expect(state!.finished, isTrue);
+    expect(requests.last.queryParameters, {
+      'pid': '77',
+      'since': '1792000000000',
+      'host': 'http://m1:4050',
+    });
+  });
+
+  test('an agent resting in "shell" has finished, even on an older relay',
+      () async {
+    // An older relay only counted "idle" as done, and said finished=false.
+    final relay = FlanServerClient(
+      serverUrl: 'http://relay.test',
+      appId: 'app-a',
+      httpClient: http_testing.MockClient(
+        (_) async => http.Response(
+          jsonEncode({
+            'alive': true,
+            'finished': false,
+            'status': 'shell',
+            'status_updated_at_ms': 2000,
+          }),
+          200,
+        ),
+      ),
+    );
+    final state = await relay.getAgentTurn(
+      const FlanAgentTurn(agentPid: 1, deliveredAtMs: 1000),
+    );
+    expect(state!.finished, isTrue);
+    expect(state.idle, isTrue);
+
+    final before = await relay.getAgentTurn(
+      const FlanAgentTurn(agentPid: 1, deliveredAtMs: 3000),
+    );
+    expect(before!.finished, isFalse, reason: 'rested before our delivery');
+  });
+
+  test('a relay that names no agent turn reports none', () async {
+    final relay = FlanServerClient(
+      serverUrl: 'http://relay.test',
+      appId: 'app-a',
+      httpClient: http_testing.MockClient(
+        (_) async => http.Response(
+          jsonEncode({'accepted': true, 'delivered': true}),
+          200,
+        ),
+      ),
+    );
+    final result = await relay.flush(messages: [
+      {'text': 'task'},
+    ]);
+    expect(result.agentTurn, isNull);
+  });
+
   test('accepted queued batch is not reported as delivered', () async {
     final relay = FlanServerClient(
       serverUrl: 'http://relay.test',

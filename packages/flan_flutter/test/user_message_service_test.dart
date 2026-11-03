@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flan_flutter/src/services/flan_server_client.dart';
 import 'package:flan_flutter/src/services/user_message_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -88,6 +89,237 @@ void main() {
       service.addListener(() => notifications++);
       service.clearMessages();
       expect(notifications, 0);
+    });
+  });
+
+  group('auto-drain', () {
+    test('consumeMessagesById takes only the sent task', () async {
+      final service = UserMessageService();
+      await service.ensureHydrated();
+      service.sendMessage({'type': 'test', 'text': 'one'});
+      service.sendMessage({'type': 'test', 'text': 'two'});
+      final first = service.peekMessages().first['queueId'] as int;
+      final generation = service.agentConsumeGeneration;
+
+      final consumed = service.consumeMessagesById({first});
+
+      expect(consumed.map((m) => m['text']), ['one']);
+      expect(service.peekMessages().map((m) => m['text']), ['two']);
+      expect(service.agentConsumeGeneration, generation + 1);
+      expect(service.isAgentWorking, isTrue);
+      service.dispose();
+    });
+
+    test('the setting survives a restart', () async {
+      final first = UserMessageService();
+      await first.ensureHydrated();
+      expect(first.autoDrain, isFalse);
+      first.autoDrain = true;
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+
+      final second = UserMessageService();
+      await second.ensureHydrated();
+      expect(second.autoDrain, isTrue);
+    });
+  });
+
+  group('sent messages', () {
+    const turn = FlanAgentTurn(agentPid: 42, deliveredAtMs: 1000);
+
+    test('stay in the queue as work in progress, then as done', () async {
+      final service = UserMessageService();
+      await service.ensureHydrated();
+      service.sendMessage({
+        'type': 'test',
+        'text': 'fix the button',
+        'data': {'screenshot': 'big', 'queueThumbnail': 'small'},
+      });
+      final id = service.peekMessages().single['queueId'] as int;
+
+      service.consumeMessagesById({id}, agentTurn: turn);
+
+      expect(service.peekMessages(), isEmpty);
+      final sent = service.sentMessages.single;
+      expect(sent['text'], 'fix the button');
+      expect(sent['status'], UserMessageService.sentWorking);
+      // History keeps the thumbnail, not the full screenshot.
+      expect(sent['data'], {'queueThumbnail': 'small'});
+      expect(service.workingTurns.single.sameAs(turn), isTrue);
+
+      service.recordAgentProgress(
+        turn,
+        const FlanAgentTurnState(
+          alive: true,
+          finished: false,
+          messages: [FlanAgentMessage(atMs: 1500, text: 'Reading it.')],
+        ),
+      );
+      expect(service.sentMessages.single['agentMessages'], [
+        {'at_ms': 1500, 'text': 'Reading it.'},
+      ]);
+
+      service.recordAgentProgress(
+        turn,
+        const FlanAgentTurnState(
+          alive: true,
+          finished: true,
+          messages: [
+            FlanAgentMessage(atMs: 1500, text: 'Reading it.'),
+            FlanAgentMessage(atMs: 1800, text: 'Fixed.'),
+          ],
+        ),
+      );
+      final done = service.sentMessages.single;
+      expect(done['status'], UserMessageService.sentDone);
+      expect((done['agentMessages'] as List).length, 2);
+      expect(service.workingTurns, isEmpty);
+      service.dispose();
+    });
+
+    test('a later send to the same agent takes the messages after it',
+        () async {
+      final service = UserMessageService();
+      await service.ensureHydrated();
+      service.sendMessage({'type': 'test', 'text': 'one'});
+      service.consumeMessagesById({service.lastQueueId}, agentTurn: turn);
+      service.sendMessage({'type': 'test', 'text': 'two'});
+      service.consumeMessagesById(
+        {service.lastQueueId},
+        agentTurn: const FlanAgentTurn(agentPid: 42, deliveredAtMs: 2000),
+      );
+
+      service.recordAgentProgress(
+        turn,
+        const FlanAgentTurnState(
+          alive: true,
+          finished: false,
+          messages: [
+            FlanAgentMessage(atMs: 1500, text: 'on one'),
+            FlanAgentMessage(atMs: 2500, text: 'on two'),
+          ],
+        ),
+      );
+      expect(service.sentMessages.first['agentMessages'], [
+        {'at_ms': 1500, 'text': 'on one'},
+      ]);
+      service.dispose();
+    });
+
+    test('without a turn they are kept as merely sent', () async {
+      final service = UserMessageService();
+      await service.ensureHydrated();
+      service.sendMessage({'type': 'test', 'text': 'one'});
+      service.consumeMessagesById({service.lastQueueId});
+      expect(
+        service.sentMessages.single['status'],
+        UserMessageService.sentUntracked,
+      );
+      expect(service.hasWorkingMessages, isFalse);
+    });
+
+    test('an agent that exits stops its messages', () async {
+      final service = UserMessageService();
+      await service.ensureHydrated();
+      service.sendMessage({'type': 'test', 'text': 'one'});
+      service.consumeMessagesById({service.lastQueueId}, agentTurn: turn);
+      service.recordAgentProgress(
+        turn,
+        const FlanAgentTurnState(alive: false, finished: false),
+      );
+      expect(
+        service.sentMessages.single['status'],
+        UserMessageService.sentStopped,
+      );
+      service.dispose();
+    });
+
+    test('MCP-consumed messages follow agent_status', () async {
+      final service = UserMessageService();
+      await service.ensureHydrated();
+      service.sendMessage({'type': 'test', 'text': 'one'});
+      service.consumeMessages();
+      service.updateAgentStatus('Looking at the layout');
+      expect(service.sentMessages.single['agentMessages'], [
+        isA<Map>().having((m) => m['text'], 'text', 'Looking at the layout'),
+      ]);
+      service.markDone(message: 'Fixed the padding');
+      final done = service.sentMessages.single;
+      expect(done['status'], UserMessageService.sentDone);
+      expect((done['agentMessages'] as List).last['text'], 'Fixed the padding');
+      service.dispose();
+    });
+
+    test('clearCompletedMessages keeps work in progress', () async {
+      final service = UserMessageService();
+      await service.ensureHydrated();
+      service.sendMessage({'type': 'test', 'text': 'done'});
+      service.consumeMessagesById({service.lastQueueId});
+      service.sendMessage({'type': 'test', 'text': 'working'});
+      service.consumeMessagesById({service.lastQueueId}, agentTurn: turn);
+
+      service.clearCompletedMessages();
+      expect(service.sentMessages.map((m) => m['text']), ['working']);
+      service.dispose();
+    });
+
+    test('survive a restart, and so does their queue id', () async {
+      final first = UserMessageService();
+      await first.ensureHydrated();
+      first.sendMessage({'type': 'test', 'text': 'one'});
+      final id = first.lastQueueId;
+      first.consumeMessagesById({id}, agentTurn: turn);
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      first.dispose();
+
+      final second = UserMessageService();
+      await second.ensureHydrated();
+      expect(second.sentMessages.single['text'], 'one');
+      expect(second.workingTurns.single.sameAs(turn), isTrue);
+      second.sendMessage({'type': 'test', 'text': 'two'});
+      expect(second.lastQueueId, greaterThan(id));
+      second.dispose();
+    });
+
+    test('pollAgentProgress asks the relay about each working turn', () async {
+      final asked = <Uri>[];
+      final client = http_testing.MockClient((request) async {
+        asked.add(request.url);
+        return http.Response(
+          jsonEncode({
+            'alive': true,
+            'finished': true,
+            'status': 'idle',
+            'messages': [
+              {'at_ms': 1200, 'text': 'All done.'},
+            ],
+          }),
+          200,
+        );
+      });
+      final service = UserMessageService(
+        httpClient: client,
+        serverUrl: 'http://relay.test',
+      );
+      await service.ensureHydrated();
+      service.sendMessage({'type': 'test', 'text': 'one'});
+      service.consumeMessagesById(
+        {service.lastQueueId},
+        agentTurn: const FlanAgentTurn(
+          agentPid: 7,
+          deliveredAtMs: 1000,
+          thread: '01a0ac66-1ae6-7c61-814e-5ca1911df5ad',
+        ),
+      );
+
+      await service.pollAgentProgress();
+
+      expect(asked.single.path, '/api/agent-turn');
+      expect(asked.single.queryParameters['thread'],
+          '01a0ac66-1ae6-7c61-814e-5ca1911df5ad');
+      final done = service.sentMessages.single;
+      expect(done['status'], UserMessageService.sentDone);
+      expect((done['agentMessages'] as List).single['text'], 'All done.');
+      service.dispose();
     });
   });
 
@@ -383,8 +615,7 @@ void main() {
   });
 
   group('message identity', () {
-    test('messages without queueId use timestamp+type+text identity',
-        () async {
+    test('messages without queueId use timestamp+type+text identity', () async {
       final service = UserMessageService();
       await service.ensureHydrated();
       // Send two messages with different text

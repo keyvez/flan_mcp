@@ -25,7 +25,8 @@ String resolveRelayUrl({
 }) {
   final explicit = configured.trim();
   final configuredUri = explicit.isEmpty ? null : Uri.tryParse(explicit);
-  final configuredIsLoopback = configuredUri == null || _isLoopback(configuredUri.host);
+  final configuredIsLoopback =
+      configuredUri == null || _isLoopback(configuredUri.host);
 
   if (explicit.isNotEmpty && !configuredIsLoopback) {
     return explicit;
@@ -33,7 +34,8 @@ String resolveRelayUrl({
 
   // Native apps run on the same machine as the relay, so loopback is right.
   if (isWeb && !_isLoopback(pageOrigin.host) && pageOrigin.host.isNotEmpty) {
-    final port = configuredUri?.hasPort == true ? configuredUri!.port : defaultPort;
+    final port =
+        configuredUri?.hasPort == true ? configuredUri!.port : defaultPort;
     // Deliberately http: the relay serves plain HTTP. A page served over https
     // will have this blocked as mixed content — set FLAN_SERVER_URL explicitly
     // to a TLS endpoint in that case.
@@ -57,12 +59,14 @@ class FlanFlushResult {
     required this.accepted,
     required this.delivered,
     this.error,
+    this.agentTurn,
   });
 
   const FlanFlushResult.failure(String message)
       : accepted = false,
         delivered = false,
-        error = message;
+        error = message,
+        agentTurn = null;
 
   /// Whether the relay took ownership of the messages.
   final bool accepted;
@@ -72,6 +76,110 @@ class FlanFlushResult {
 
   /// A user-facing diagnostic when [accepted] is false.
   final String? error;
+
+  /// The agent that took the batch and when, for asking later whether it has
+  /// finished. Null when the relay could not say (an older relay, an agent
+  /// with no session registry and no Codex rollout).
+  final FlanAgentTurn? agentTurn;
+}
+
+/// The turn a flush started in an agent: who took it, when, and on which host.
+class FlanAgentTurn {
+  const FlanAgentTurn({
+    required this.agentPid,
+    required this.deliveredAtMs,
+    this.host,
+    this.thread,
+  });
+
+  /// Parses the relay's `agent_turn` object, or returns null.
+  static FlanAgentTurn? fromJson(Object? json) {
+    if (json is! Map) return null;
+    final pid = json['agent_pid'];
+    final at = json['delivered_at_ms'];
+    if (pid is! int || at is! int) return null;
+    final host = json['host'];
+    final thread = json['thread'];
+    return FlanAgentTurn(
+      agentPid: pid,
+      deliveredAtMs: at,
+      host: host is String && host.isNotEmpty ? host : null,
+      thread: thread is String && thread.isNotEmpty ? thread : null,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'agent_pid': agentPid,
+        'delivered_at_ms': deliveredAtMs,
+        'host': host,
+        if (thread != null) 'thread': thread,
+      };
+
+  /// Two turns are the same when they name the same delivery.
+  bool sameAs(FlanAgentTurn other) =>
+      agentPid == other.agentPid &&
+      deliveredAtMs == other.deliveredAtMs &&
+      host == other.host &&
+      thread == other.thread;
+
+  final int agentPid;
+
+  /// The agent host's clock, never this app's — compared only against that
+  /// host's own session registry.
+  final int deliveredAtMs;
+
+  /// The peer relay the agent runs behind, when it is not the app's own.
+  final String? host;
+
+  /// The Codex thread the batch was queued into. Codex keeps no session
+  /// registry, so the relay reads the thread's rollout instead.
+  final String? thread;
+}
+
+/// Something the agent said while working on a turn — its plain-English
+/// narration between tool calls.
+class FlanAgentMessage {
+  const FlanAgentMessage({required this.atMs, required this.text});
+
+  static FlanAgentMessage? fromJson(Object? json) {
+    if (json is! Map) return null;
+    final at = json['at_ms'];
+    final text = json['text'];
+    if (at is! int || text is! String || text.isEmpty) return null;
+    return FlanAgentMessage(atMs: at, text: text);
+  }
+
+  /// The agent host's clock, like [FlanAgentTurn.deliveredAtMs].
+  final int atMs;
+  final String text;
+
+  Map<String, dynamic> toJson() => {'at_ms': atMs, 'text': text};
+}
+
+/// Whether a Claude Code session-registry status means no turn is running.
+bool isRestingAgentStatus(Object? status) =>
+    status == 'idle' || status == 'shell';
+
+/// Where an agent stands on a [FlanAgentTurn].
+class FlanAgentTurnState {
+  const FlanAgentTurnState({
+    required this.alive,
+    required this.finished,
+    this.idle = false,
+    this.messages = const [],
+  });
+
+  final bool alive;
+  final bool finished;
+
+  /// What the agent has said since the turn was delivered, oldest first.
+  /// Empty from a relay too old to read transcripts.
+  final List<FlanAgentMessage> messages;
+
+  /// The agent is at rest right now (`idle` or `shell`), whatever turn it was
+  /// asked about —
+  /// what auto-drain needs to start a queue that no flush of ours began.
+  final bool idle;
 }
 
 /// Result of asking the relay to hot reload this app.
@@ -176,6 +284,7 @@ class FlanServerClient {
         return FlanFlushResult(
           accepted: true,
           delivered: delivered,
+          agentTurn: FlanAgentTurn.fromJson(body['agent_turn']),
         );
       }
 
@@ -274,7 +383,8 @@ class FlanServerClient {
       // feature says.
       if (response.statusCode == 404) {
         return (
-          result: const FlanHotReloadResult.failure('No hot reload on this relay.'),
+          result:
+              const FlanHotReloadResult.failure('No hot reload on this relay.'),
           relayTooOld: true,
         );
       }
@@ -305,7 +415,8 @@ class FlanServerClient {
       );
     } catch (error) {
       return (
-        result: FlanHotReloadResult.failure('Flan relay is unavailable: $error'),
+        result:
+            FlanHotReloadResult.failure('Flan relay is unavailable: $error'),
         relayTooOld: false,
       );
     }
@@ -318,8 +429,8 @@ class FlanServerClient {
     if (configured == null || configured.host.isEmpty) return null;
     final port = configured.hasPort ? configured.port : kDefaultFlanRelayPort;
     if (port == kDefaultFlanRelayPort) return null;
-    return configured
-        .replace(port: kDefaultFlanRelayPort, path: '/api/hot-reload');
+    return configured.replace(
+        port: kDefaultFlanRelayPort, path: '/api/hot-reload');
   }
 
   Future<FlanServerStatus?> getStatus({int? processId}) async {
@@ -339,6 +450,50 @@ class FlanServerClient {
       return FlanServerStatus(
         hasAssociation: hasAssociation,
         linkedLabel: hasAssociation ? body['linked_label'] as String? : null,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Asks the relay whether the agent has finished the turn [turn] started.
+  /// Null when the relay could not be asked — not the same as "still working".
+  Future<FlanAgentTurnState?> getAgentTurn(FlanAgentTurn turn) async {
+    if (!isConfigured) return null;
+    final query = <String, String>{
+      'pid': '${turn.agentPid}',
+      'since': '${turn.deliveredAtMs}',
+      if (turn.host != null) 'host': turn.host!,
+      if (turn.thread != null) 'thread': turn.thread!,
+    };
+    try {
+      final response = await _httpClient
+          .get(_endpoint('api/agent-turn').replace(queryParameters: query))
+          .timeout(_requestTimeout);
+      if (response.statusCode != 200) return null;
+      final body = _decodeBody(response);
+      final alive = body['alive'] == true;
+      final updatedAt = body['status_updated_at_ms'];
+      // "shell" is a turn that ended with a background shell still running —
+      // not working on anything. A session with a dev server in the
+      // background rests there and never says "idle", so counting only "idle"
+      // held the queue behind it forever. Decided here too, not just taken
+      // from the relay, so an agent host on an older relay still moves.
+      final resting = isRestingAgentStatus(body['status']);
+      final finishedHere = alive &&
+          resting &&
+          updatedAt is int &&
+          updatedAt > turn.deliveredAtMs;
+      final messages = body['messages'];
+      return FlanAgentTurnState(
+        alive: alive,
+        finished: body['finished'] == true || finishedHere,
+        idle: resting,
+        messages: [
+          if (messages is List)
+            for (final m in messages)
+              if (FlanAgentMessage.fromJson(m) case final message?) message,
+        ],
       );
     } catch (_) {
       return null;

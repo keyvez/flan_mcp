@@ -33,11 +33,38 @@ class UserMessageService extends ChangeNotifier {
       'flan.pending_user_messages.v1';
   static const String _nextQueueIdStorageKey = 'flan.pending_queue_next_id.v1';
   static const String _agentStatusStorageKey = 'flan.agent_status.v1';
+  static const String _autoDrainStorageKey = 'flan.auto_drain.v1';
+  static const String _sentMessagesStorageKey = 'flan.sent_user_messages.v1';
+
+  /// Status of a sent message ([sentMessages]) while the agent is on it.
+  static const String sentWorking = 'working';
+
+  /// The agent finished the turn the message started.
+  static const String sentDone = 'done';
+
+  /// Handed over, but nothing can say when the agent finishes — an agent
+  /// with no session registry, or a relay too old to ask.
+  static const String sentUntracked = 'sent';
+
+  /// The agent exited before finishing.
+  static const String sentStopped = 'stopped';
+
+  /// Finished messages kept for the queue's history, newest kept.
+  static const int _sentHistoryLimit = 50;
+  static const _progressPollInterval = Duration(seconds: 2);
 
   static const _serverPollInterval = Duration(seconds: 10);
 
   final FlanServerClient _serverClient;
   final List<Map<String, dynamic>> _pendingMessages = [];
+
+  /// Messages handed to the agent, oldest first. They stay in the queue —
+  /// as work in progress, then as history — carrying `status`, `sentAt`,
+  /// the `agentTurn` they started and the `agentMessages` the agent has said
+  /// while on it.
+  final List<Map<String, dynamic>> _sentMessages = [];
+  Timer? _progressTimer;
+  bool _progressPollInFlight = false;
   int _nextQueueId = 1;
 
   /// When true, VM service extension events (`postEvent`) are suppressed.
@@ -60,6 +87,8 @@ class UserMessageService extends ChangeNotifier {
   String? _agentStatusMessage;
   Timer? _workingTimeoutTimer;
   Timer? _completionClearTimer;
+
+  bool _autoDrain = false;
 
   bool _hasServerAssociation = false;
   String? _linkedLabel;
@@ -109,6 +138,7 @@ class UserMessageService extends ChangeNotifier {
         if (_isAgentWorking) {
           _isAgentWorking = false;
           _agentStatusMessage = null;
+          _finishUntrackedSent(sentUntracked);
           _persistAgentStatus();
           notifyListeners();
         }
@@ -133,11 +163,13 @@ class UserMessageService extends ChangeNotifier {
 
     _isAgentWorking = true;
     _agentStatusMessage = message;
+    _appendUntrackedProgress(message);
 
     _workingTimeoutTimer = Timer(_workingTimeout, () {
       if (_isAgentWorking) {
         _isAgentWorking = false;
         _agentStatusMessage = null;
+        _finishUntrackedSent(sentUntracked);
         _persistAgentStatus();
         notifyListeners();
       }
@@ -155,6 +187,10 @@ class UserMessageService extends ChangeNotifier {
     _completionClearTimer = null;
 
     _isAgentWorking = false;
+    if (message != null && message.isNotEmpty) {
+      _appendUntrackedProgress(message);
+    }
+    _finishUntrackedSent(sentDone);
 
     if (message != null && message.isNotEmpty) {
       _agentStatusMessage = message;
@@ -168,6 +204,19 @@ class UserMessageService extends ChangeNotifier {
     }
 
     _persistAgentStatus();
+    notifyListeners();
+  }
+
+  /// Whether the queue drains itself one task at a time: send hands the agent
+  /// only the oldest message, and each later one goes out when the agent
+  /// finishes the one before. Off, send hands over the whole queue as a batch.
+  bool get autoDrain => _autoDrain;
+
+  set autoDrain(bool value) {
+    warmUp();
+    if (_autoDrain == value) return;
+    _autoDrain = value;
+    unawaited(_persistAutoDrain());
     notifyListeners();
   }
 
@@ -304,10 +353,46 @@ class UserMessageService extends ChangeNotifier {
   }) {
     warmUp();
     if (_pendingMessages.isEmpty) return [];
+    final consumed =
+        _pendingMessages.map((m) => Map<String, dynamic>.from(m)).toList();
+    _pendingMessages.clear();
+    // The agent pulled these over MCP and reports progress through
+    // agent_status, which [updateAgentStatus] and [markDone] route here.
+    _recordSent(consumed, status: sentWorking);
+    _agentConsumeGeneration++;
+    if (markAgentWorking) {
+      isAgentWorking = true;
+    }
+    unawaited(_persistQueueState());
+    notifyListeners();
+    return consumed;
+  }
+
+  /// Removes and returns the queued messages whose ids are in [queueIds] —
+  /// the ones a flush actually handed over, which in auto-drain mode is not
+  /// the whole queue.
+  ///
+  /// They move to [sentMessages]. With the [agentTurn] the flush started they
+  /// are followed until the agent finishes it, collecting what it says on
+  /// the way; without one nothing can say when it finishes, and they are
+  /// kept as merely sent.
+  List<Map<String, dynamic>> consumeMessagesById(
+    Set<int> queueIds, {
+    bool markAgentWorking = true,
+    FlanAgentTurn? agentTurn,
+  }) {
+    warmUp();
     final consumed = _pendingMessages
+        .where((m) => queueIds.contains(m['queueId']))
         .map((m) => Map<String, dynamic>.from(m))
         .toList();
-    _pendingMessages.clear();
+    if (consumed.isEmpty) return const [];
+    _pendingMessages.removeWhere((m) => queueIds.contains(m['queueId']));
+    _recordSent(
+      consumed,
+      status: agentTurn == null ? sentUntracked : sentWorking,
+      agentTurn: agentTurn,
+    );
     _agentConsumeGeneration++;
     if (markAgentWorking) {
       isAgentWorking = true;
@@ -334,6 +419,226 @@ class UserMessageService extends ChangeNotifier {
 
   /// No-op. Retained for API compatibility.
   void promoteDrafts() {}
+
+  /// Messages already handed to the agent, oldest first: the work in
+  /// progress (`status` [sentWorking]) and the history after it.
+  List<Map<String, dynamic>> get sentMessages {
+    warmUp();
+    return List.unmodifiable(
+      _sentMessages.map((m) => Map<String, dynamic>.from(m)),
+    );
+  }
+
+  /// Whether the queue holds anything already sent, finished or not.
+  bool get hasSentMessages => _sentMessages.isNotEmpty;
+
+  /// Whether any sent message is still being worked on.
+  bool get hasWorkingMessages =>
+      _sentMessages.any((m) => m['status'] == sentWorking);
+
+  void _recordSent(
+    List<Map<String, dynamic>> messages, {
+    required String status,
+    FlanAgentTurn? agentTurn,
+  }) {
+    final sentAt = DateTime.now().toIso8601String();
+    for (final m in messages) {
+      _sentMessages.add({
+        ..._withoutFullImages(m),
+        'status': status,
+        'sentAt': sentAt,
+        if (agentTurn != null) 'agentTurn': agentTurn.toJson(),
+        'agentMessages': const <Map<String, dynamic>>[],
+      });
+    }
+    _trimSentHistory();
+    _syncProgressPolling();
+  }
+
+  /// A history entry keeps the cropped thumbnail and drops the full-size
+  /// images: the agent already has them, and fifty screenshots in
+  /// SharedPreferences is megabytes rewritten on every change.
+  static Map<String, dynamic> _withoutFullImages(Map<String, dynamic> m) {
+    final data = m['data'];
+    if (data is! Map) return m;
+    return {
+      ...m,
+      'data': Map<String, dynamic>.from(data)
+        ..remove('screenshot')
+        ..remove('drawingImage'),
+    };
+  }
+
+  /// Drops the oldest finished messages beyond [_sentHistoryLimit]. Work in
+  /// progress is never dropped.
+  void _trimSentHistory() {
+    var excess = _sentMessages.length - _sentHistoryLimit;
+    _sentMessages.removeWhere((m) {
+      if (excess <= 0 || m['status'] == sentWorking) return false;
+      excess--;
+      return true;
+    });
+  }
+
+  static FlanAgentTurn? _turnOf(Map<String, dynamic> message) =>
+      FlanAgentTurn.fromJson(message['agentTurn']);
+
+  /// The distinct agent turns sent messages are still waiting on.
+  List<FlanAgentTurn> get workingTurns {
+    final out = <FlanAgentTurn>[];
+    for (final m in _sentMessages) {
+      if (m['status'] != sentWorking) continue;
+      final turn = _turnOf(m);
+      if (turn != null && !out.any(turn.sameAs)) out.add(turn);
+    }
+    return out;
+  }
+
+  /// Folds what the relay said about [turn] into the messages it carries:
+  /// what the agent has said so far, and whether it has finished.
+  ///
+  /// A later send to the same agent starts the next turn, so whatever the
+  /// agent said after that is the next message's, not this one's — the
+  /// relay answers "everything since", and the cut is made here.
+  void recordAgentProgress(FlanAgentTurn turn, FlanAgentTurnState state) {
+    int? nextDelivery;
+    for (final m in _sentMessages) {
+      final other = _turnOf(m);
+      if (other == null ||
+          other.agentPid != turn.agentPid ||
+          other.host != turn.host ||
+          other.thread != turn.thread ||
+          other.deliveredAtMs <= turn.deliveredAtMs) {
+        continue;
+      }
+      if (nextDelivery == null || other.deliveredAtMs < nextDelivery) {
+        nextDelivery = other.deliveredAtMs;
+      }
+    }
+    final said = [
+      for (final message in state.messages)
+        if (nextDelivery == null || message.atMs < nextDelivery)
+          message.toJson(),
+    ];
+    final status = !state.alive
+        ? sentStopped
+        : state.finished
+            ? sentDone
+            : sentWorking;
+
+    var changed = false;
+    for (var i = 0; i < _sentMessages.length; i++) {
+      final m = _sentMessages[i];
+      if (m['status'] != sentWorking) continue;
+      final mine = _turnOf(m);
+      if (mine == null || !mine.sameAs(turn)) continue;
+      final before = m['agentMessages'];
+      // A relay too old to read transcripts answers no messages; keep what
+      // was already collected rather than wiping it.
+      final keep = said.isEmpty && before is List && before.isNotEmpty;
+      final sameMessages = keep || jsonEncode(before) == jsonEncode(said);
+      if (sameMessages && status == sentWorking) continue;
+      _sentMessages[i] = {
+        ...m,
+        if (!keep) 'agentMessages': said,
+        'status': status,
+        if (status != sentWorking)
+          'completedAt': DateTime.now().toIso8601String(),
+      };
+      changed = true;
+    }
+    if (!changed) return;
+    _syncProgressPolling();
+    unawaited(_persistQueueState());
+    notifyListeners();
+  }
+
+  /// Progress reported through `agent_status` belongs to the messages the
+  /// agent pulled over MCP — the ones no agent turn follows.
+  void _appendUntrackedProgress(String text) {
+    final at = DateTime.now().millisecondsSinceEpoch;
+    var changed = false;
+    for (var i = 0; i < _sentMessages.length; i++) {
+      final m = _sentMessages[i];
+      if (m['status'] != sentWorking || m['agentTurn'] != null) continue;
+      final said = [
+        for (final e in (m['agentMessages'] as List? ?? const []))
+          Map<String, dynamic>.from(e as Map),
+      ];
+      if (said.isNotEmpty && said.last['text'] == text) continue;
+      said.add({'at_ms': at, 'text': text});
+      _sentMessages[i] = {...m, 'agentMessages': said};
+      changed = true;
+    }
+    if (changed) unawaited(_persistQueueState());
+  }
+
+  void _finishUntrackedSent(String status) {
+    var changed = false;
+    for (var i = 0; i < _sentMessages.length; i++) {
+      final m = _sentMessages[i];
+      if (m['status'] != sentWorking || m['agentTurn'] != null) continue;
+      _sentMessages[i] = {
+        ...m,
+        'status': status,
+        'completedAt': DateTime.now().toIso8601String(),
+      };
+      changed = true;
+    }
+    if (changed) unawaited(_persistQueueState());
+  }
+
+  /// Removes one sent message from the queue's history.
+  bool removeSentMessageByQueueId(int queueId) {
+    warmUp();
+    final before = _sentMessages.length;
+    _sentMessages.removeWhere((m) => m['queueId'] == queueId);
+    if (_sentMessages.length == before) return false;
+    _syncProgressPolling();
+    unawaited(_persistQueueState());
+    notifyListeners();
+    return true;
+  }
+
+  /// Clears every sent message the agent is no longer working on.
+  void clearCompletedMessages() {
+    warmUp();
+    final before = _sentMessages.length;
+    _sentMessages.removeWhere((m) => m['status'] != sentWorking);
+    if (_sentMessages.length == before) return;
+    unawaited(_persistQueueState());
+    notifyListeners();
+  }
+
+  /// Follows the agent turns sent messages are waiting on, exactly while
+  /// there are any.
+  void _syncProgressPolling() {
+    if (workingTurns.isEmpty || !_serverClient.isConfigured) {
+      _progressTimer?.cancel();
+      _progressTimer = null;
+      return;
+    }
+    _progressTimer ??= Timer.periodic(
+      _progressPollInterval,
+      (_) => unawaited(pollAgentProgress()),
+    );
+  }
+
+  /// Asks the relay once about every turn still being worked on.
+  @visibleForTesting
+  Future<void> pollAgentProgress() async {
+    if (_progressPollInFlight) return;
+    _progressPollInFlight = true;
+    try {
+      for (final turn in workingTurns) {
+        final state = await _serverClient.getAgentTurn(turn);
+        // Unreachable relay is not an answer — ask again next tick.
+        if (state != null) recordAgentProgress(turn, state);
+      }
+    } finally {
+      _progressPollInFlight = false;
+    }
+  }
 
   /// Merges [patch] into an existing queued message by queue id.
   /// Returns true if the message was found and updated.
@@ -410,6 +715,27 @@ class UserMessageService extends ChangeNotifier {
         _agentStatusMessage = persistedStatus;
       }
 
+      final persistedAutoDrain = prefs.getBool(_autoDrainStorageKey) ?? false;
+      if (persistedAutoDrain != _autoDrain) {
+        _autoDrain = persistedAutoDrain;
+        notifyListeners();
+      }
+
+      final persistedSent =
+          _decodePersistedMessages(prefs.getString(_sentMessagesStorageKey));
+      if (persistedSent.isNotEmpty) {
+        final known = {for (final m in _sentMessages) _messageIdentity(m)};
+        _sentMessages.insertAll(0, [
+          for (final m in persistedSent)
+            if (!known.contains(_messageIdentity(m))) m,
+        ]);
+        // Something sent before the restart and pulled over MCP has lost the
+        // connection that would have reported its end.
+        _finishUntrackedSent(sentUntracked);
+        _syncProgressPolling();
+        notifyListeners();
+      }
+
       final rawMessages = prefs.getString(_pendingMessagesStorageKey);
       final persistedQueue = _decodePersistedMessages(rawMessages);
       final persistedNextId = prefs.getInt(_nextQueueIdStorageKey) ??
@@ -438,7 +764,8 @@ class UserMessageService extends ChangeNotifier {
         ..clear()
         ..addAll(merged);
 
-      final inferredNextId = _inferNextQueueId(_pendingMessages);
+      final inferredNextId =
+          _inferNextQueueId([..._pendingMessages, ..._sentMessages]);
       _nextQueueId = _max3(_nextQueueId, persistedNextId, inferredNextId);
       notifyListeners();
       unawaited(_persistQueueState());
@@ -489,6 +816,9 @@ class UserMessageService extends ChangeNotifier {
         final queueSnapshot = _pendingMessages
             .map((m) => Map<String, dynamic>.from(m))
             .toList(growable: false);
+        final sentSnapshot = _sentMessages
+            .map((m) => Map<String, dynamic>.from(m))
+            .toList(growable: false);
         final nextQueueId = _nextQueueId;
 
         final prefs = await SharedPreferences.getInstance();
@@ -496,12 +826,25 @@ class UserMessageService extends ChangeNotifier {
           _pendingMessagesStorageKey,
           jsonEncode(queueSnapshot),
         );
+        await prefs.setString(
+          _sentMessagesStorageKey,
+          jsonEncode(sentSnapshot),
+        );
         await prefs.setInt(_nextQueueIdStorageKey, nextQueueId);
       } while (_persistRequested);
     } catch (_) {
       // Best-effort persistence: keep in-memory queue if persistence fails.
     } finally {
       _isPersisting = false;
+    }
+  }
+
+  Future<void> _persistAutoDrain() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_autoDrainStorageKey, _autoDrain);
+    } catch (_) {
+      // Best-effort persistence.
     }
   }
 
@@ -581,7 +924,8 @@ class UserMessageService extends ChangeNotifier {
   }
 
   void _setServerAssociation(bool value) {
-    if (_hasServerAssociation != value || (value == false && _linkedLabel != null)) {
+    if (_hasServerAssociation != value ||
+        (value == false && _linkedLabel != null)) {
       _hasServerAssociation = value;
       if (!value) _linkedLabel = null;
       notifyListeners();
@@ -594,6 +938,7 @@ class UserMessageService extends ChangeNotifier {
     _workingTimeoutTimer?.cancel();
     _completionClearTimer?.cancel();
     _serverPollTimer?.cancel();
+    _progressTimer?.cancel();
     super.dispose();
   }
 }
