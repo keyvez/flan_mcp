@@ -123,12 +123,29 @@ pub fn agent_name_from_comm(comm: &str) -> Option<&'static str> {
 
 // ── Models ──────────────────────────────────────────────────────────────
 
+/// One live agent process, as the process table and Claude Code's session
+/// registry together describe it.
+///
+/// Identity is the **pid**. These rows were once deduped by `cwd`, which
+/// dropped every session after the first in a shared directory and then
+/// labelled the survivor with whichever transcript in that directory was
+/// written last — so four agents in `~` showed up as one row describing a
+/// fifth. `AgentSession::entry_id` had already settled the question: the pid
+/// is "unique, constant for the life of the process", and "never the cwd,
+/// which sibling sessions share".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeProcess {
     pub pid: u32,
     pub cwd: String,
     pub folder_name: String,
     pub last_message_preview: Option<String>,
+    /// Claude Code's session id, when the registry has an entry for this pid.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The user's own name for the session ("outbound"), which is often the
+    /// only thing that tells sibling sessions in one directory apart on sight.
+    #[serde(default)]
+    pub session_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -814,10 +831,18 @@ pub fn agent_turn_state(pid: u32, since_ms: u64) -> AgentTurnState {
 /// Falls back to looking in every project folder, for a session that has
 /// since moved directory.
 fn claude_transcript_path(record: &serde_json::Value) -> Option<PathBuf> {
-    let session = record.get("sessionId")?.as_str()?;
+    session_transcript_path(
+        record.get("cwd").and_then(|c| c.as_str()),
+        record.get("sessionId")?.as_str()?,
+    )
+}
+
+/// The same lookup from typed parts, so a caller holding a `SessionRecord`
+/// need not rebuild the JSON to ask.
+fn session_transcript_path(cwd: Option<&str>, session_id: &str) -> Option<PathBuf> {
     let projects = PathBuf::from(std::env::var("HOME").ok()?).join(".claude").join("projects");
-    let file = format!("{session}.jsonl");
-    if let Some(cwd) = record.get("cwd").and_then(|c| c.as_str()) {
+    let file = format!("{session_id}.jsonl");
+    if let Some(cwd) = cwd {
         let path = projects.join(claude_project_slug(cwd)).join(&file);
         if path.is_file() {
             return Some(path);
@@ -3328,52 +3353,78 @@ pub fn new_association_id() -> String {
 
 // ── Discovery: Claude Processes ─────────────────────────────────────────
 
+/// Every live agent process on this host, one row each.
+///
+/// Keyed by pid, and each row's preview is read from that session's OWN
+/// transcript — see `ClaudeProcess` for what keying by `cwd` cost.
 pub fn discover_claude_processes() -> Vec<ClaudeProcess> {
-    let Ok(output) = Command::new("ps")
-        .args(["-eo", "pid=,tty=,comm="])
-        .output()
-    else {
-        return Vec::new();
-    };
+    let procs = process_table();
+    let registry: HashMap<u32, SessionRecord> =
+        read_session_registry().into_iter().map(|r| (r.pid, r)).collect();
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut seen_cwds = HashSet::new();
-    let mut processes = Vec::new();
+    let mut pids: Vec<u32> = procs
+        .iter()
+        .filter(|(_, (_, tty, comm))| is_agent_process(comm) && tty != "??" && !tty.is_empty())
+        .map(|(pid, _)| *pid)
+        .collect();
+    // A process table is a HashMap, so without this the rows arrive in a
+    // different order every tick.
+    pids.sort_unstable();
 
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.trim().splitn(3, char::is_whitespace).collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let pid: u32 = match parts[0].trim().parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let tty = parts[1].trim();
-        let comm = parts[2].trim();
+    // One lsof for every candidate at once. The loop this replaced spawned one
+    // per process, on a tick that reruns every few seconds.
+    let pid_csv = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let cwds = process_cwds(&pid_csv);
 
-        if !is_agent_process(comm) || tty == "??" {
-            continue;
-        }
+    claude_rows(&pids, &cwds, &registry, session_preview)
+}
 
-        let cwd = get_process_cwd(pid);
-        if cwd.is_empty() || seen_cwds.contains(&cwd) {
-            continue;
-        }
-        seen_cwds.insert(cwd.clone());
+/// The decisions, with the process table lifted out: which rows exist, what
+/// identifies them, and where each one's preview comes from.
+fn claude_rows(
+    pids: &[u32],
+    cwds: &HashMap<u32, String>,
+    registry: &HashMap<u32, SessionRecord>,
+    preview: impl Fn(Option<&SessionRecord>, &str) -> Option<String>,
+) -> Vec<ClaudeProcess> {
+    pids.iter()
+        .filter_map(|&pid| {
+            let record = registry.get(&pid);
+            // The registry's own cwd is the fallback: a session whose lsof read
+            // came back empty is still a session.
+            let cwd = cwds
+                .get(&pid)
+                .cloned()
+                .or_else(|| record.and_then(|r| r.cwd.clone()))
+                .filter(|c| !c.is_empty())?;
+            let folder_name = cwd.rsplit('/').next().unwrap_or(&cwd).to_string();
+            Some(ClaudeProcess {
+                pid,
+                last_message_preview: preview(record, &cwd),
+                folder_name,
+                cwd,
+                session_id: record.and_then(|r| r.session_id.clone()),
+                session_name: record.and_then(|r| r.name.clone()),
+            })
+        })
+        .collect()
+}
 
-        let folder_name = cwd.rsplit('/').next().unwrap_or(&cwd).to_string();
-        let last_msg = find_last_claude_message(&cwd);
-
-        processes.push(ClaudeProcess {
-            pid,
-            cwd,
-            folder_name,
-            last_message_preview: last_msg,
-        });
-    }
-
-    processes
+/// The last thing a session said, read from the transcript belonging to THAT
+/// session id.
+///
+/// With no registry entry there is no session id to go on, and the newest
+/// transcript in the folder is the best guess left — which is what every row
+/// used to get.
+fn session_preview(record: Option<&SessionRecord>, cwd: &str) -> Option<String> {
+    let path = match record.and_then(|r| r.session_id.as_deref()) {
+        Some(session_id) => session_transcript_path(
+            record.and_then(|r| r.cwd.as_deref()).or(Some(cwd)),
+            session_id,
+        ),
+        None => newest_transcript_in(cwd),
+    }?;
+    last_assistant_text(&read_tail(&path, TRANSCRIPT_TAIL_BYTES)?)
 }
 
 pub fn get_process_cwd(pid: u32) -> String {
@@ -3395,54 +3446,68 @@ pub fn get_process_cwd(pid: u32) -> String {
     String::new()
 }
 
+/// Characters of an agent's last message kept for a discovery row.
+const PREVIEW_CHARS: usize = 120;
+
+/// The last thing an agent said in `cwd`, whichever session that was.
+///
+/// Kept for callers holding only a directory; `session_preview` is the precise
+/// one.
 pub fn find_last_claude_message(cwd: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let project_name = cwd.replace('/', "-");
-    let project_dir = PathBuf::from(&home)
+    last_assistant_text(&read_tail(&newest_transcript_in(cwd)?, TRANSCRIPT_TAIL_BYTES)?)
+}
+
+/// The most recently written transcript in a directory's project folder.
+///
+/// The slug comes from `claude_project_slug`, which maps `_` and `.` to `-`
+/// the way Claude Code does. This used to spell its own
+/// `cwd.replace('/', "-")`, so every path containing `_` or `.` —
+/// `~/dev/flan_mcp` among them — looked in a folder that does not exist and
+/// silently had no preview at all.
+fn newest_transcript_in(cwd: &str) -> Option<PathBuf> {
+    let project_dir = PathBuf::from(std::env::var("HOME").ok()?)
         .join(".claude")
         .join("projects")
-        .join(&project_name);
+        .join(claude_project_slug(cwd));
 
-    if !project_dir.exists() {
-        return None;
-    }
-
-    let mut jsonl_files: Vec<_> = std::fs::read_dir(&project_dir)
+    let mut jsonl: Vec<_> = std::fs::read_dir(&project_dir)
         .ok()?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
+    jsonl.sort_by_key(|e| std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok())));
+    Some(jsonl.first()?.path())
+}
 
-    jsonl_files.sort_by_key(|e| {
-        std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok()))
-    });
-
-    let latest = jsonl_files.first()?;
-    let file = std::fs::File::open(latest.path()).ok()?;
-    let reader = BufReader::new(file);
-    let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
-
-    for line in lines.iter().rev() {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            if val.get("type").and_then(|t| t.as_str()) == Some("assistant") {
-                if let Some(content) = val
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_array())
-                {
-                    for item in content {
-                        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                let preview: String = text.chars().take(120).collect();
-                                return Some(preview);
-                            }
-                        }
-                    }
+/// The last assistant text block in a transcript.
+///
+/// Scans backwards over whole lines. A tail may begin mid-line, and that
+/// partial first line simply fails to parse — which is why this reads a tail
+/// rather than the whole file, as the transcripts run to megabytes and this
+/// is on a discovery tick.
+fn last_assistant_text(transcript: &str) -> Option<String> {
+    for line in transcript.lines().rev() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if val.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = val
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for item in content {
+            if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    return Some(text.chars().take(PREVIEW_CHARS).collect());
                 }
             }
         }
     }
-
     None
 }
 
@@ -8048,3 +8113,153 @@ dart:core                                            _Array.first
     }
 }
 
+#[cfg(test)]
+mod claude_row_identity_tests {
+    use super::*;
+
+    fn record(pid: u32, session_id: &str, name: &str, cwd: &str) -> SessionRecord {
+        serde_json::from_value(serde_json::json!({
+            "pid": pid,
+            "sessionId": session_id,
+            "name": name,
+            "cwd": cwd,
+            "status": "idle",
+        }))
+        .expect("a registry record")
+    }
+
+    /// Stands in for reading the transcript, naming the session it read from —
+    /// which is the whole question these rows used to get wrong.
+    fn preview_of_own_session(record: Option<&SessionRecord>, cwd: &str) -> Option<String> {
+        Some(match record.and_then(|r| r.session_id.as_deref()) {
+            Some(session_id) => format!("said by {session_id}"),
+            None => format!("newest in {cwd}"),
+        })
+    }
+
+    #[test]
+    fn sibling_sessions_in_one_directory_all_get_a_row() {
+        let registry: HashMap<u32, SessionRecord> = [
+            (5527, record(5527, "aaa", "direct", "/Users/g")),
+            (5528, record(5528, "bbb", "outbound", "/Users/g")),
+            (5539, record(5539, "ccc", "sim", "/Users/g")),
+        ]
+        .into_iter()
+        .collect();
+        let cwds: HashMap<u32, String> = [5527u32, 5528, 5539]
+            .into_iter()
+            .map(|pid| (pid, "/Users/g".to_string()))
+            .collect();
+
+        let rows = claude_rows(&[5527, 5528, 5539], &cwds, &registry, preview_of_own_session);
+
+        // Sessions sharing a directory used to collapse into a single row.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![5527, 5528, 5539]);
+        assert_eq!(
+            rows.iter().map(|r| r.session_name.as_deref()).collect::<Vec<_>>(),
+            vec![Some("direct"), Some("outbound"), Some("sim")],
+        );
+        // ...and the one survivor was labelled with whichever transcript in the
+        // folder was written last, which could belong to any of them.
+        assert_eq!(
+            rows.iter().map(|r| r.last_message_preview.as_deref()).collect::<Vec<_>>(),
+            vec![Some("said by aaa"), Some("said by bbb"), Some("said by ccc")],
+        );
+    }
+
+    #[test]
+    fn a_pid_with_no_registry_entry_is_still_a_row() {
+        let cwds: HashMap<u32, String> =
+            [(99u32, "/Users/g/dev/thing".to_string())].into_iter().collect();
+
+        let rows = claude_rows(&[99], &cwds, &HashMap::new(), preview_of_own_session);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, None);
+        assert_eq!(rows[0].folder_name, "thing");
+        assert_eq!(
+            rows[0].last_message_preview.as_deref(),
+            Some("newest in /Users/g/dev/thing"),
+        );
+    }
+
+    #[test]
+    fn an_unreadable_cwd_falls_back_to_the_registrys() {
+        let registry: HashMap<u32, SessionRecord> =
+            [(7u32, record(7, "ddd", "named", "/Users/g/from-registry"))]
+                .into_iter()
+                .collect();
+
+        let rows = claude_rows(&[7], &HashMap::new(), &registry, preview_of_own_session);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cwd, "/Users/g/from-registry");
+        assert_eq!(rows[0].folder_name, "from-registry");
+    }
+
+    #[test]
+    fn a_process_with_no_cwd_anywhere_is_dropped() {
+        let rows = claude_rows(&[7], &HashMap::new(), &HashMap::new(), preview_of_own_session);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn the_project_slug_is_not_a_slash_replace() {
+        // `cwd.replace('/', "-")` was the old spelling and it misses `_` and
+        // `.`, so sessions in this very repo never showed a preview at all.
+        assert_eq!(claude_project_slug("/Users/g/dev/flan_mcp"), "-Users-g-dev-flan-mcp");
+        assert_ne!(
+            claude_project_slug("/Users/g/dev/flan_mcp"),
+            "/Users/g/dev/flan_mcp".replace('/', "-"),
+        );
+    }
+
+    #[test]
+    fn the_last_assistant_text_wins_and_the_user_is_ignored() {
+        let transcript = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"a question"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"second"}]}}"#,
+            "\n",
+        );
+        assert_eq!(last_assistant_text(transcript).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn a_tool_use_block_is_not_something_the_agent_said() {
+        let transcript = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"words"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#,
+            "\n",
+        );
+        assert_eq!(last_assistant_text(transcript).as_deref(), Some("words"));
+    }
+
+    #[test]
+    fn a_tail_beginning_mid_line_loses_only_that_line() {
+        let transcript = concat!(
+            r#"ssage":{"content":[{"type":"text","text":"truncated"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"intact"}]}}"#,
+            "\n",
+        );
+        assert_eq!(last_assistant_text(transcript).as_deref(), Some("intact"));
+    }
+
+    #[test]
+    fn a_preview_is_capped() {
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "x".repeat(400)}]},
+        })
+        .to_string();
+        assert_eq!(
+            last_assistant_text(&line).map(|p| p.chars().count()),
+            Some(PREVIEW_CHARS),
+        );
+    }
+}
